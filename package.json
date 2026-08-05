@@ -1,0 +1,37 @@
+{
+  "name": "douyin-live-compliance-copilot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"tsx watch server/index.ts\" \"vite --host 0.0.0.0\"",
+    "build": "tsc --noEmit && vite build",
+    "start": "tsx server/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "6.0.5",
+    "cors": "2.8.6",
+    "dotenv": "17.4.2",
+    "express": "5.2.1",
+    "lucide-react": "1.28.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "vite": "8.2.0",
+    "ws": "8.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "@types/cors": "2.8.19",
+    "@types/node": "26.1.2",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@types/ws": "8.18.1",
+    "concurrently": "10.0.4",
+    "jsdom": "30.0.1",
+    "tsx": "4.23.8",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}
