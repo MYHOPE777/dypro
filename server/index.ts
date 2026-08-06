@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { existsSync } from 'node:fs';
+import { createReadStream, existsSync, statSync } from 'node:fs';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -8,6 +8,7 @@ import express from 'express';
 import cors from 'cors';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { LiveSession } from './session';
+import { FileTimelineStore } from './timelineStore';
 import { PRODUCTS } from '../src/shared/products';
 import type { ClientMessage } from '../src/shared/types';
 
@@ -18,6 +19,7 @@ const sessions = new Map<string, LiveSession>();
 const port = Number(process.env.PORT ?? 8787);
 const projectRoot = path.dirname(fileURLToPath(import.meta.url));
 const clientDir = path.resolve(projectRoot, '../dist/client');
+const timelineStore = new FileTimelineStore(process.env.TIMELINE_DATA_DIR ?? path.resolve(projectRoot, '../.data/timeline'));
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -25,7 +27,7 @@ app.use(express.json({ limit: '2mb' }));
 function getOrCreateSession(id?: string): LiveSession {
   const safeId = id && /^live-[a-z0-9-]{4,32}$/u.test(id) ? id : undefined;
   if (safeId && sessions.has(safeId)) return sessions.get(safeId)!;
-  const session = new LiveSession(safeId);
+  const session = new LiveSession(safeId, { timelineStore });
   sessions.set(session.id, session);
   return session;
 }
@@ -43,6 +45,8 @@ function isClientMessage(value: unknown): value is ClientMessage {
       return typeof message.productId === 'string' && message.productId.length <= 64;
     case 'audio':
       return typeof message.data === 'string' && message.data.length <= 2_000_000;
+    case 'audio.raw':
+      return typeof message.data === 'string' && message.data.length <= 6_000_000 && typeof message.sampleRate === 'number' && Number.isInteger(message.sampleRate) && message.sampleRate >= 8_000 && message.sampleRate <= 96_000;
     case 'demo.transcript':
       return typeof message.text === 'string' && message.text.trim().length > 0 && message.text.length <= 2_000;
     default:
@@ -77,6 +81,54 @@ app.get('/api/session/:id', (request, response) => {
   const session = sessions.get(request.params.id);
   if (!session) return response.status(404).json({ message: 'session not found' });
   return response.json(session.state);
+});
+
+app.get('/api/session/:id/timeline', (request, response) => {
+  const timeline = timelineStore.exportSession(request.params.id);
+  if (!timeline) return response.status(404).json({ message: 'timeline not found' });
+  return response.json(timeline);
+});
+
+app.get('/api/session/:id/timeline.jsonl', (request, response) => {
+  const jsonLines = timelineStore.toJsonLines(request.params.id);
+  if (!jsonLines) return response.status(404).json({ message: 'timeline not found' });
+  response.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  response.setHeader('Content-Disposition', `attachment; filename="${request.params.id}.timeline.jsonl"`);
+  return response.send(jsonLines);
+});
+
+function parseTrackIndex(value: unknown): number | null {
+  if (value === undefined) return 0;
+  if (typeof value !== 'string' || !/^\d+$/u.test(value)) return null;
+  const trackIndex = Number(value);
+  return Number.isSafeInteger(trackIndex) ? trackIndex : null;
+}
+
+function streamAudio(sessionId: string, asWav: boolean, source: boolean, response: express.Response, trackIndex = 0): express.Response | void {
+  if (sessions.get(sessionId)?.state.isListening) return response.status(409).json({ message: 'audio still recording' });
+  const audioPath = source ? timelineStore.getSourceAudioPath(sessionId, trackIndex) : timelineStore.getAudioPath(sessionId);
+  if (!audioPath) return response.status(404).json({ message: 'audio not found' });
+  const audioSize = statSync(audioPath).size;
+  response.setHeader('Content-Type', asWav ? 'audio/wav' : 'application/octet-stream');
+  response.setHeader('Content-Disposition', `attachment; filename="${sessionId}.${source ? `source-audio-${trackIndex}` : 'audio'}.${asWav ? 'wav' : 'pcm'}"`);
+  response.setHeader('Content-Length', String(audioSize + (asWav ? 44 : 0)));
+  if (asWav) {
+    const header = timelineStore.getWavHeader(sessionId, source, trackIndex);
+    if (!header) return response.status(404).end();
+    response.write(header);
+  }
+  createReadStream(audioPath).pipe(response);
+}
+
+app.get('/api/session/:id/audio.pcm', (request, response) => streamAudio(request.params.id, false, false, response));
+app.get('/api/session/:id/audio.wav', (request, response) => streamAudio(request.params.id, true, false, response));
+app.get('/api/session/:id/audio-source.pcm', (request, response) => {
+  const trackIndex = parseTrackIndex(request.query.track);
+  return trackIndex === null ? response.status(400).json({ message: 'invalid audio track' }) : streamAudio(request.params.id, false, true, response, trackIndex);
+});
+app.get('/api/session/:id/audio-source.wav', (request, response) => {
+  const trackIndex = parseTrackIndex(request.query.track);
+  return trackIndex === null ? response.status(400).json({ message: 'invalid audio track' }) : streamAudio(request.params.id, true, true, response, trackIndex);
 });
 
 if (existsSync(clientDir)) {
@@ -126,6 +178,9 @@ wsServer.on('connection', (socket: WebSocket) => {
           break;
         case 'audio':
           session.ingestAudio(Buffer.from(message.data, 'base64'));
+          break;
+        case 'audio.raw':
+          session.ingestSourceAudio(Buffer.from(message.data, 'base64'), message.sampleRate);
           break;
         case 'demo.transcript':
           session.ingestTranscript(message.text, true);

@@ -28,4 +28,22 @@ describe('Volc realtime speech frames', () => {
     const result = parseResponseFrame(Buffer.concat([header, sequence, size, payload]));
     expect(result).toEqual({ text: '最后一句', isFinal: true });
   });
+
+  it('preserves Volc utterance timing for recording alignment', () => {
+    const payload = gzipSync(Buffer.from(JSON.stringify({
+      result: { text: '带时间的一句', utterances: [{ text: '带时间的一句', definite: true, start_time: 240, end_time: 1680 }] },
+    })));
+    const header = Buffer.from([0x11, 0x91, 0x11, 0x00]);
+    const sequence = Buffer.alloc(4);
+    sequence.writeInt32BE(8, 0);
+    const size = Buffer.alloc(4);
+    size.writeUInt32BE(payload.length, 0);
+
+    expect(parseResponseFrame(Buffer.concat([header, sequence, size, payload]))).toEqual({
+      text: '带时间的一句',
+      isFinal: true,
+      startTimeMs: 240,
+      endTimeMs: 1680,
+    });
+  });
 });

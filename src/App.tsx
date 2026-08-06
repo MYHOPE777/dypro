@@ -144,6 +144,14 @@ function useMicrophone(send: (message: object) => void, isListening: boolean) {
       processor.onaudioprocess = (event) => {
         const input = event.inputBuffer.getChannelData(0);
         const ratio = context.sampleRate / 16000;
+        const rawOutput = new Int16Array(input.length);
+        for (let index = 0; index < rawOutput.length; index += 1) {
+          rawOutput[index] = Math.max(-1, Math.min(1, input[index])) * 0x7fff;
+        }
+        const rawBytes = new Uint8Array(rawOutput.buffer);
+        let rawBinary = '';
+        for (const byte of rawBytes) rawBinary += String.fromCharCode(byte);
+        send({ type: 'audio.raw', data: btoa(rawBinary), sampleRate: context.sampleRate });
         const output = new Int16Array(Math.floor(input.length / ratio));
         for (let index = 0; index < output.length; index += 1) {
           const value = input[Math.min(input.length - 1, Math.floor(index * ratio))];
@@ -176,6 +184,15 @@ function RiskIcon({ risk }: { risk: ComplianceResult['risk'] }) {
 
 function RiskLabel({ risk }: { risk: ComplianceResult['risk'] }) {
   return risk === 'blocked' ? '高风险 · 立即替换' : risk === 'warning' ? '需留意 · 建议替换' : '表达可继续';
+}
+
+function formatReplayOffset(offsetMs: number | null): string {
+  if (offsetMs === null) return '未建立时间基准';
+  const hours = Math.floor(offsetMs / 3_600_000);
+  const minutes = Math.floor((offsetMs % 3_600_000) / 60_000);
+  const seconds = Math.floor((offsetMs % 60_000) / 1_000);
+  const milliseconds = offsetMs % 1_000;
+  return `+${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${milliseconds.toString().padStart(3, '0')}`;
 }
 
 function AppHeader({ state, connected, status, mode }: { state: SessionState; connected: boolean; status: string; mode: Role }) {
@@ -237,7 +254,7 @@ function TranscriptStage({ state }: { state: SessionState }) {
   return <section className="stage-section transcript-stage">
     <div className="section-heading"><div><span className="section-kicker">实时转录 <span>VOLCENGINE ASR</span></span><h1>{state.partialTranscript || lastFinal?.text || '等待主播开口'}</h1></div><div className="asr-badge"><span className="signal-dot on" />{state.isListening ? 'STREAMING' : 'STANDBY'}</div></div>
     <Waveform active={state.isListening} />
-    <div className="transcript-feed">{state.transcriptHistory.slice(-4).map((segment, index) => <div className={`feed-line ${index === state.transcriptHistory.slice(-4).length - 1 ? 'current' : ''}`} key={segment.id}><time>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</time><span>{segment.text}</span></div>)}</div>
+    <div className="transcript-feed">{state.transcriptHistory.slice(-4).map((segment, index) => <div className={`feed-line ${index === state.transcriptHistory.slice(-4).length - 1 ? 'current' : ''}`} key={segment.id}><time><span>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span><em>{formatReplayOffset(segment.offsetMs)}</em></time><span>{segment.text}</span></div>)}</div>
   </section>;
 }
 
@@ -281,8 +298,9 @@ function OperatorScreen() {
 function DisplayScreen() {
   const session = useLiveSession('display');
   const result = session.state.latestCompliance;
+  const latestSegment = session.state.transcriptHistory.at(-1);
   const risk = result?.risk ?? 'safe';
-  return <div className={`app-shell display-shell risk-${risk}`}><AppHeader state={session.state} connected={session.connected} status={session.status} mode="display" /><main className="display-main"><div className="display-product"><img src={session.state.product.image} alt="" /><div><span className="eyebrow">ON AIR PRODUCT · {session.state.product.category}</span><h1>{session.state.product.name}</h1><strong>{session.state.product.price}</strong></div><div className="display-live"><span className="signal-dot on" />{session.state.isListening ? '正在收音' : '等待收音'}</div></div><section className="display-voice"><div className="display-voice-label"><Volume2 size={17} />主播刚刚说</div><div className="display-transcript">{session.state.partialTranscript || session.state.transcriptHistory.at(-1)?.text || '等待下一句转录…'}</div><Waveform active={session.state.isListening} /></section><section className={`display-alert ${risk}`}><div className="display-alert-head"><div className="display-risk-icon"><RiskIcon risk={risk} /></div><div><span className="eyebrow">{result ? '即时合规提醒' : '合规提词就绪'}</span><h2>{result ? <RiskLabel risk={risk} /> : '可以继续介绍当前商品'}</h2></div><span className="display-source">{result?.source === 'doubao' ? 'DOUBAO' : 'LOCAL GUARDRAIL'}</span></div><div className="display-divider" /><div className="display-prompt-label">{result && result.risk !== 'safe' ? '请立即替换为' : '推荐表达'}</div><p className="display-prompt">{result && result.risk !== 'safe' ? result.alternative : session.state.product.compliantPhrases[0]}</p>{result && result.risk !== 'safe' && <p className="display-reason"><AlertTriangle size={15} />{result.reason}</p>}</section></main><footer className="display-footer"><div><ShieldCheck size={15} />抖音直播合规实时预警</div><div className="display-footer-stats"><span>监测 {session.state.stats.words} 字</span><span>高风险 {session.state.stats.blockedCount}</span><span>需留意 {session.state.stats.warningCount}</span></div></footer></div>;
+  return <div className={`app-shell display-shell risk-${risk}`}><AppHeader state={session.state} connected={session.connected} status={session.status} mode="display" /><main className="display-main"><div className="display-product"><img src={session.state.product.image} alt="" /><div><span className="eyebrow">ON AIR PRODUCT · {session.state.product.category}</span><h1>{session.state.product.name}</h1><strong>{session.state.product.price}</strong></div><div className="display-live"><span className="signal-dot on" />{session.state.isListening ? '正在收音' : '等待收音'}</div></div><section className="display-voice"><div className="display-voice-label"><Volume2 size={17} />主播刚刚说 <span>{formatReplayOffset(latestSegment?.offsetMs ?? null)}</span></div><div className="display-transcript">{session.state.partialTranscript || latestSegment?.text || '等待下一句转录…'}</div><Waveform active={session.state.isListening} /></section><section className={`display-alert ${risk}`}><div className="display-alert-head"><div className="display-risk-icon"><RiskIcon risk={risk} /></div><div><span className="eyebrow">{result ? '即时合规提醒' : '合规提词就绪'}</span><h2>{result ? <RiskLabel risk={risk} /> : '可以继续介绍当前商品'}</h2></div><span className="display-source">{result?.source === 'doubao' ? 'DOUBAO' : 'LOCAL GUARDRAIL'}</span></div><div className="display-divider" /><div className="display-prompt-label">{result && result.risk !== 'safe' ? '请立即替换为' : '推荐表达'}</div><p className="display-prompt">{result && result.risk !== 'safe' ? result.alternative : session.state.product.compliantPhrases[0]}</p>{result && result.risk !== 'safe' && <p className="display-reason"><AlertTriangle size={15} />{result.reason}</p>}</section></main><footer className="display-footer"><div><ShieldCheck size={15} />抖音直播合规实时预警</div><div className="display-footer-stats"><span>监测 {session.state.stats.words} 字</span><span>高风险 {session.state.stats.blockedCount}</span><span>需留意 {session.state.stats.warningCount}</span></div></footer></div>;
 }
 
 export default function App() {

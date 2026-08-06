@@ -33,3 +33,20 @@ npm start
 ## 火山引擎参数
 
 实时语音连接使用 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel`，默认资源 ID 为 `volc.bigasr.sauc.duration`。服务端实现了官方协议中的 full client request、audio-only request、gzip 压缩和最终帧标记；如果账号开通的是其他资源 ID，只需修改 `VOLC_SPEECH_RESOURCE_ID`。
+
+## 时间线与原始音频
+
+点击“开始收音”时会建立直播时间基准。服务端在 `.data/timeline/<sessionId>/` 下保存：
+
+- `audio.source.json`：原始音频音轨清单；浏览器采样率变化时会自动分轨。
+- `audio.source.<track>.pcm`：浏览器采集到的原生采样率 PCM signed 16-bit little-endian、单声道，作为原始音频保留；`track` 从 0 开始。
+- `audio.pcm`：发送给火山实时语音的 16kHz PCM signed 16-bit little-endian、单声道副本。
+- `timeline.jsonl`：最终转录、商品切换、收音启停和合规结果。每条记录同时包含 UTC 绝对时间、`Asia/Shanghai` 时区标识、相对开播毫秒数及 PCM 采样位置。
+
+预留给后续复盘工具的只读接口：
+
+- `GET /api/session/:id/timeline`：结构化 JSON 时间线与音频元数据。
+- `GET /api/session/:id/timeline.jsonl`：原始 JSONL 事件流。
+- `GET /api/session/:id/audio.pcm`：发送给火山实时语音的 16kHz PCM 副本。
+- `GET /api/session/:id/audio.wav`：给 16kHz PCM 副本增加 WAV 文件头，采样数据保持不变，便于播放器直接打开。
+- `GET /api/session/:id/audio-source.pcm?track=N` 和 `GET /api/session/:id/audio-source.wav?track=N`：第 `N` 条浏览器原生采样率原始音轨及 WAV 封装。收音进行中下载会返回 `409`，结束收音后再下载以保证文件长度和 WAV 头一致。

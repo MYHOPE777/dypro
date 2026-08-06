@@ -15,6 +15,55 @@ export type TranscriptSegment = {
   text: string;
   isFinal: boolean;
   timestamp: number;
+  offsetMs: number | null;
+  startOffsetMs: number | null;
+  endOffsetMs: number | null;
+};
+
+export type TimelineEventType =
+  | 'session.created'
+  | 'capture.started'
+  | 'capture.stopped'
+  | 'capture.failed'
+  | 'product.selected'
+  | 'transcript.final'
+  | 'compliance.result';
+
+export type TimelineEvent = {
+  schemaVersion: 1;
+  id: string;
+  sessionId: string;
+  type: TimelineEventType;
+  occurredAt: number;
+  occurredAtIso: string;
+  timezone: 'Asia/Shanghai';
+  offsetMs: number | null;
+  productId: string | null;
+  payload: Record<string, unknown>;
+};
+
+export type TimelineAudioAsset = {
+  assetId: string;
+  encoding: 'pcm_s16le';
+  sampleRate: number;
+  channels: 1;
+  bitsPerSample: 16;
+  byteLength: number;
+  sampleCount: number;
+  durationMs: number;
+  pcmUrl: string;
+  wavUrl: string;
+};
+
+export type SessionTimelineExport = {
+  schemaVersion: 1;
+  sessionId: string;
+  timezone: 'Asia/Shanghai';
+  createdAt: number;
+  recordingStartedAt: number | null;
+  audio: TimelineAudioAsset | null;
+  sourceAudio: TimelineAudioAsset[];
+  events: TimelineEvent[];
 };
 
 export type ComplianceResult = {
@@ -57,6 +106,7 @@ export type ClientMessage =
   | { type: 'control.stop' }
   | { type: 'product.select'; productId: string }
   | { type: 'audio'; data: string }
+  | { type: 'audio.raw'; data: string; sampleRate: number }
   | { type: 'demo.transcript'; text: string };
 
 export type ServerMessage =

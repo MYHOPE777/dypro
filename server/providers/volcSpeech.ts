@@ -2,7 +2,7 @@ import { gzipSync, gunzipSync } from 'node:zlib';
 import { randomUUID } from 'node:crypto';
 import WebSocket from 'ws';
 
-export type SpeechResult = { text: string; isFinal: boolean };
+export type SpeechResult = { text: string; isFinal: boolean; startTimeMs?: number; endTimeMs?: number };
 
 export type VolcSpeechOptions = {
   onResult: (result: SpeechResult) => void;
@@ -88,11 +88,17 @@ export function parseResponseFrame(frame: Buffer): SpeechResult | null {
   const decoded = compression === 1 ? gunzipSync(encoded) : encoded;
   const payload = JSON.parse(decoded.toString('utf8')) as Record<string, unknown>;
   const result = (payload.result ?? payload.payload ?? payload) as Record<string, unknown>;
-  const text = typeof result.text === 'string' ? result.text : '';
+  const utterances = Array.isArray(result.utterances) ? result.utterances as Array<Record<string, unknown>> : [];
+  const latestUtterance = utterances.at(-1);
+  const text = typeof result.text === 'string' ? result.text : typeof latestUtterance?.text === 'string' ? latestUtterance.text : '';
   if (!text) return null;
+  const startTimeMs = typeof latestUtterance?.start_time === 'number' ? latestUtterance.start_time : undefined;
+  const endTimeMs = typeof latestUtterance?.end_time === 'number' ? latestUtterance.end_time : undefined;
   return {
     text,
-    isFinal: Boolean(payload.is_final ?? payload.definite) || flags === 3,
+    isFinal: Boolean(payload.is_final ?? payload.definite ?? result.definite ?? latestUtterance?.definite) || flags === 3,
+    ...(startTimeMs === undefined ? {} : { startTimeMs }),
+    ...(endTimeMs === undefined ? {} : { endTimeMs }),
   };
 }
 
