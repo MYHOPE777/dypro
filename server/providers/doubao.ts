@@ -1,5 +1,5 @@
 import type { ComplianceAnalyzer, AnalysisInput } from '../../src/compliance/engine';
-import { analyzeTranscript } from '../../src/compliance/engine';
+import { analyzeTranscript, evaluateCustomRules } from '../../src/compliance/engine';
 import type { ComplianceResult } from '../../src/shared/types';
 
 type DoubaoConfig = { apiKey: string; endpointId: string; baseUrl: string };
@@ -52,6 +52,8 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
   }
 
   async analyze(input: AnalysisInput): Promise<ComplianceResult> {
+    const customResult = evaluateCustomRules(input);
+    if (customResult) return customResult;
     if (!this.config) return analyzeTranscript(input);
     try {
       const response = await fetch(this.config.baseUrl, {

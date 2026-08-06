@@ -1,9 +1,10 @@
-import type { ComplianceResult, Product, RiskLevel } from '../shared/types';
+import type { ComplianceResult, ComplianceRule, Product, RiskLevel } from '../shared/types';
 
 export type AnalysisInput = {
   productId: string;
   transcript: string;
   product?: Pick<Product, 'id' | 'name' | 'category' | 'price' | 'compliantPhrases'>;
+  customRules?: ComplianceRule[];
 };
 
 export type ComplianceAnalyzer = {
@@ -58,7 +59,37 @@ const RULES: Rule[] = [
 
 const makeId = () => `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+export function evaluateCustomRules(input: AnalysisInput): ComplianceResult | null {
+  const severity: Record<RiskLevel, number> = { safe: 0, warning: 1, blocked: 2 };
+  const rule = input.customRules?.filter((candidate) => {
+    if (!candidate.enabled || candidate.status !== 'published') return false;
+    try {
+      return candidate.matchType === 'contains'
+        ? input.transcript.toLocaleLowerCase().includes(candidate.pattern.toLocaleLowerCase())
+        : new RegExp(candidate.pattern, 'iu').test(input.transcript);
+    } catch {
+      return false;
+    }
+  }).sort((first, second) => severity[second.risk] - severity[first.risk])[0];
+  if (!rule) return null;
+  return {
+    id: `rule-${rule.id}-${Date.now()}`,
+    productId: input.productId,
+    risk: rule.risk,
+    title: rule.title,
+    reason: rule.reason,
+    alternative: rule.alternative,
+    policyRef: rule.policyRef,
+    confidence: 0.99,
+    source: 'custom-rule',
+    transcript: input.transcript,
+    createdAt: Date.now(),
+  };
+}
+
 export async function analyzeTranscript(input: AnalysisInput): Promise<ComplianceResult> {
+  const customResult = evaluateCustomRules(input);
+  if (customResult) return customResult;
   const rule = RULES.find((candidate) => candidate.pattern.test(input.transcript));
   const now = Date.now();
 

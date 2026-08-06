@@ -3,6 +3,8 @@ import type WebSocket from 'ws';
 import { createDoubaoAnalyzer } from './services';
 import { createVolcSpeechStream, type VolcSpeechStream } from './providers/volcSpeech';
 import type { TimelineWriter } from './timelineStore';
+import type { ProductCatalog } from './productCatalog';
+import type { RuleCatalog } from './ruleCatalog';
 import { DEFAULT_PRODUCT, PRODUCTS } from '../src/shared/products';
 import type {
   ComplianceResult,
@@ -15,7 +17,7 @@ import type {
 
 type Client = { socket: WebSocket; role: 'operator' | 'display' };
 type TranscriptTiming = { startTimeMs?: number; endTimeMs?: number };
-type LiveSessionOptions = { timelineStore?: TimelineWriter; now?: () => number };
+type LiveSessionOptions = { timelineStore?: TimelineWriter; productCatalog?: ProductCatalog; ruleCatalog?: RuleCatalog; roomId?: string; actorId?: string; now?: () => number };
 
 function createStats(): SessionStats {
   return { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 };
@@ -23,6 +25,7 @@ function createStats(): SessionStats {
 
 export class LiveSession {
   readonly id: string;
+  readonly roomId: string;
   readonly createdAt: number;
   private readonly clients = new Set<Client>();
   private readonly analyzer = createDoubaoAnalyzer();
@@ -30,7 +33,12 @@ export class LiveSession {
   private segmentNumber = 0;
   private productGeneration = 0;
   private analysisQueue: Promise<void> = Promise.resolve();
+  private readonly complianceBySegment = new Map<string, ComplianceResult>();
+  private readonly segmentRevisions = new Map<string, number>();
   private readonly timelineStore?: TimelineWriter;
+  private readonly productCatalog?: ProductCatalog;
+  private readonly ruleCatalog?: RuleCatalog;
+  private readonly actorId: string;
   private readonly now: () => number;
   private recordingStartedAt: number | null = null;
   private currentCaptureOffsetMs: number | null = null;
@@ -40,13 +48,21 @@ export class LiveSession {
   constructor(id = `live-${randomUUID().slice(0, 8)}`, options: LiveSessionOptions = {}) {
     this.id = id;
     this.timelineStore = options.timelineStore;
+    this.productCatalog = options.productCatalog;
+    this.ruleCatalog = options.ruleCatalog;
+    this.roomId = options.roomId ?? 'room-default';
+    this.actorId = options.actorId ?? 'owner';
     this.now = options.now ?? Date.now;
     const persistedTiming = this.timelineStore?.getSessionTiming(id) ?? { createdAt: null, recordingStartedAt: null };
     this.createdAt = persistedTiming.createdAt ?? this.now();
     this.recordingStartedAt = persistedTiming.recordingStartedAt;
+    const lineup = this.productCatalog?.getLineup(id, this.roomId) ?? PRODUCTS;
+    const initialProduct = lineup[0] ?? DEFAULT_PRODUCT;
     this.stateValue = {
       sessionId: id,
-      product: DEFAULT_PRODUCT,
+      roomId: this.roomId,
+      product: initialProduct,
+      lineup,
       isListening: false,
       partialTranscript: '',
       transcriptHistory: [],
@@ -56,7 +72,7 @@ export class LiveSession {
       lastEventAt: this.createdAt,
     };
     if (persistedTiming.createdAt === null) {
-      this.recordTimeline('session.created', this.createdAt, null, DEFAULT_PRODUCT.id, { product: DEFAULT_PRODUCT });
+      this.recordTimeline('session.created', this.createdAt, null, initialProduct.id, { roomId: this.roomId, actorId: this.actorId, product: initialProduct, lineupProductIds: lineup.map((product) => product.id) });
     }
   }
 
@@ -79,11 +95,11 @@ export class LiveSession {
   }
 
   products(): Product[] {
-    return PRODUCTS;
+    return structuredClone(this.stateValue.lineup);
   }
 
   selectProduct(productId: string): void {
-    const product = PRODUCTS.find((item) => item.id === productId);
+    const product = this.stateValue.lineup.find((item) => item.id === productId);
     if (!product) return;
     this.productGeneration += 1;
     this.stateValue.product = product;
@@ -94,6 +110,30 @@ export class LiveSession {
     this.recordTimeline('product.selected', occurredAt, this.offsetAt(occurredAt), product.id, { product });
     this.broadcast({ type: 'state.snapshot', state: this.state });
     this.status(`已切换商品：${product.name}`, 'success');
+  }
+
+  setLineup(productIds: string[], actorId = this.actorId): void {
+    const lineup = this.productCatalog?.setLineup(this.id, this.roomId, productIds)
+      ?? PRODUCTS.filter((product) => productIds.includes(product.id));
+    if (lineup.length === 0) return;
+    const occurredAt = this.now();
+    const currentProduct = lineup.find((product) => product.id === this.stateValue.product.id);
+    this.stateValue.lineup = lineup;
+    if (!currentProduct) {
+      this.productGeneration += 1;
+      this.stateValue.product = lineup[0];
+      this.stateValue.latestCompliance = null;
+      this.stateValue.partialTranscript = '';
+    } else {
+      this.stateValue.product = currentProduct;
+    }
+    this.stateValue.lastEventAt = occurredAt;
+    this.recordTimeline('lineup.updated', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, {
+      productIds: lineup.map((product) => product.id),
+      actorId,
+    });
+    this.broadcast({ type: 'state.snapshot', state: this.state });
+    this.status(`本场商品清单已更新，共 ${lineup.length} 件`, 'success');
   }
 
   startListening(): void {
@@ -198,16 +238,56 @@ export class LiveSession {
     });
     this.broadcast({ type: 'transcript.final', segment });
     this.broadcast({ type: 'state.snapshot', state: this.state });
+    this.segmentRevisions.set(segment.id, 0);
+    this.enqueueCompliance(segment);
+  }
+
+  correctTranscript(segmentId: string, correctedText: string, actorId = this.actorId): void {
+    const text = correctedText.trim();
+    if (!text) return;
+    const index = this.stateValue.transcriptHistory.findIndex((segment) => segment.id === segmentId && segment.isFinal);
+    if (index < 0) return;
+    const original = this.stateValue.transcriptHistory[index];
+    const corrected = { ...original, text, timestamp: this.now() };
+    this.segmentRevisions.set(segmentId, (this.segmentRevisions.get(segmentId) ?? 0) + 1);
+    const history = [...this.stateValue.transcriptHistory];
+    history[index] = corrected;
+    this.stateValue.transcriptHistory = history;
+    this.stateValue.stats.words = Math.max(0, this.stateValue.stats.words - original.text.replace(/\s/g, '').length + text.replace(/\s/g, '').length);
+    const previousResult = this.complianceBySegment.get(segmentId);
+    if (previousResult) {
+      const statKey = `${previousResult.risk}Count` as 'safeCount' | 'warningCount' | 'blockedCount';
+      this.stateValue.stats[statKey] = Math.max(0, this.stateValue.stats[statKey] - 1);
+      this.complianceBySegment.delete(segmentId);
+    }
+    this.stateValue.alerts = this.stateValue.alerts.filter((alert) => alert.segmentId !== segmentId);
+    if (this.stateValue.latestCompliance?.segmentId === segmentId) this.stateValue.latestCompliance = null;
+    this.stateValue.lastEventAt = corrected.timestamp;
+    this.recordTimeline('transcript.corrected', corrected.timestamp, corrected.endOffsetMs, this.stateValue.product.id, {
+      segmentId,
+      originalText: original.text,
+      correctedText: text,
+      actorId,
+    });
+    this.broadcast({ type: 'transcript.final', segment: corrected });
+    this.broadcast({ type: 'state.snapshot', state: this.state });
+    this.enqueueCompliance(corrected);
+  }
+
+  private enqueueCompliance(segment: TranscriptSegment): void {
     const generation = this.productGeneration;
     const product = this.stateValue.product;
+    const revision = this.segmentRevisions.get(segment.id) ?? 0;
     this.analysisQueue = this.analysisQueue
-      .then(() => this.checkCompliance(text, generation, product.id, product, segment))
+      .then(() => this.checkCompliance(segment.text, generation, product.id, product, segment, revision))
       .catch((error: unknown) => this.status(`合规分析暂时不可用：${error instanceof Error ? error.message : String(error)}`, 'error'));
   }
 
-  private async checkCompliance(transcript: string, generation: number, productId: string, product: Product, segment: TranscriptSegment): Promise<void> {
-    const result = await this.analyzer.analyze({ productId, transcript, product });
-    if (generation !== this.productGeneration || productId !== this.stateValue.product.id) return;
+  private async checkCompliance(transcript: string, generation: number, productId: string, product: Product, segment: TranscriptSegment, revision: number): Promise<void> {
+    const analyzed = await this.analyzer.analyze({ productId, transcript, product, customRules: this.ruleCatalog?.listActive(this.roomId) });
+    if (generation !== this.productGeneration || productId !== this.stateValue.product.id || revision !== this.segmentRevisions.get(segment.id)) return;
+    const result = { ...analyzed, segmentId: segment.id };
+    this.complianceBySegment.set(segment.id, result);
     this.stateValue.latestCompliance = result;
     this.stateValue.stats[`${result.risk}Count` as 'safeCount' | 'warningCount' | 'blockedCount'] += 1;
     if (result.risk !== 'safe') {
