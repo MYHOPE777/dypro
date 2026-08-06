@@ -1,3 +1,4 @@
+import safeRegex from 'safe-regex2';
 import type { ComplianceResult, ComplianceRule, Product, RiskLevel } from '../shared/types';
 
 export type AnalysisInput = {
@@ -58,15 +59,15 @@ const RULES: Rule[] = [
 ];
 
 const makeId = () => `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const severity: Record<RiskLevel, number> = { safe: 0, warning: 1, blocked: 2 };
 
 export function evaluateCustomRules(input: AnalysisInput): ComplianceResult | null {
-  const severity: Record<RiskLevel, number> = { safe: 0, warning: 1, blocked: 2 };
   const rule = input.customRules?.filter((candidate) => {
     if (!candidate.enabled || candidate.status !== 'published') return false;
     try {
       return candidate.matchType === 'contains'
         ? input.transcript.toLocaleLowerCase().includes(candidate.pattern.toLocaleLowerCase())
-        : new RegExp(candidate.pattern, 'iu').test(input.transcript);
+        : safeRegex(candidate.pattern) && new RegExp(candidate.pattern, 'iu').test(input.transcript);
     } catch {
       return false;
     }
@@ -89,11 +90,13 @@ export function evaluateCustomRules(input: AnalysisInput): ComplianceResult | nu
 
 export async function analyzeTranscript(input: AnalysisInput): Promise<ComplianceResult> {
   const customResult = evaluateCustomRules(input);
-  if (customResult) return customResult;
   const rule = RULES.find((candidate) => candidate.pattern.test(input.transcript));
   const now = Date.now();
 
+  if (customResult && (!rule || severity[customResult.risk] > severity[rule.risk])) return customResult;
+
   if (!rule) {
+    if (customResult) return customResult;
     return {
       id: makeId(),
       productId: input.productId,

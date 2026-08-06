@@ -123,7 +123,7 @@ export type SessionState = {
 };
 
 export type ClientMessage =
-  | { type: 'session.join'; sessionId?: string; roomId?: string; actorId?: string; role: 'operator' | 'display' }
+  | { type: 'session.join'; sessionId?: string; roomId?: string; actorId?: string; token?: string; role: 'operator' | 'display' }
   | { type: 'control.start' }
   | { type: 'control.stop' }
   | { type: 'product.select'; productId: string }
@@ -139,6 +139,7 @@ export type ServerMessage =
   | { type: 'transcript.partial'; segment: TranscriptSegment }
   | { type: 'transcript.final'; segment: TranscriptSegment }
   | { type: 'compliance.result'; result: ComplianceResult }
+  | { type: 'capture.denied'; message: string }
   | { type: 'system.status'; message: string; tone: 'neutral' | 'success' | 'warning' | 'error' }
   | { type: 'system.error'; message: string };
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { analyzeTranscript } from './engine';
+import type { ComplianceRule } from '../shared/types';
 
 describe('analyzeTranscript', () => {
   it('flags an absolute efficacy claim and gives the host a product-safe replacement', async () => {
@@ -26,5 +27,17 @@ describe('analyzeTranscript', () => {
     expect(result.risk).toBe('blocked');
     expect(result.alternative).toContain('云感降噪耳机');
     expect(result.alternative).not.toContain('肤感');
+  });
+
+  it('never lets a custom safe rule downgrade a built-in blocked expression', async () => {
+    const safeRule: ComplianceRule = {
+      id: 'rule-safe', roomId: 'room-default', scope: 'room', name: '普通保证用语', matchType: 'contains', pattern: '保证',
+      risk: 'safe', title: '内部白名单', reason: '内部认为可以使用', alternative: '继续介绍', policyRef: '内部规则',
+      enabled: true, status: 'published', version: 1, createdBy: 'owner', createdAt: 1, updatedAt: 1,
+    };
+    const result = await analyzeTranscript({ productId: 'serum', transcript: '保证三天全部消失', customRules: [safeRule] });
+
+    expect(result.risk).toBe('blocked');
+    expect(result.title).toContain('绝对化');
   });
 });

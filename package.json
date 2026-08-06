@@ -7,6 +7,7 @@
     "dev": "concurrently -k \"tsx watch server/index.ts\" \"vite --host 0.0.0.0\"",
     "build": "tsc --noEmit && vite build",
     "start": "tsx server/index.ts",
+    "auth:hash": "tsx server/hashPassword.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -18,12 +19,13 @@
     "lucide-react": "1.28.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
+    "safe-regex2": "5.1.1",
     "vite": "8.2.0",
     "ws": "8.21.2"
   },
   "devDependencies": {
-    "@types/express": "5.0.6",
     "@types/cors": "2.8.19",
+    "@types/express": "5.0.6",
     "@types/node": "26.1.2",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",

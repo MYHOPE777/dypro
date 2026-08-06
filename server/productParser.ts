@@ -27,8 +27,8 @@ function list(value: unknown): string[] {
   return [];
 }
 
-function makeId(name: string): string {
-  const digest = createHash('sha1').update(name).digest('hex').slice(0, 12);
+function makeId(name: string, sku = ''): string {
+  const digest = createHash('sha1').update(`${name}\0${sku.trim() || 'no-sku'}`).digest('hex').slice(0, 12);
   return `product-${digest}`;
 }
 
@@ -69,7 +69,7 @@ function localParse(sourceText: string, extraWarning = ''): ProductImportRespons
   if (stock === null) warnings.push('未识别到库存，库存暂按待确认处理。');
   return {
     product: {
-      id: makeId(name),
+      id: makeId(name, sku),
       name,
       category,
       price,
@@ -111,7 +111,8 @@ function normalizeDoubao(fields: ProductFields, sourceText: string): ProductImpo
   const name = text(fields.name) || '待命名商品';
   const rawPrice = fields.price;
   const price = typeof rawPrice === 'number' ? `¥${rawPrice}` : text(rawPrice) || '价格待确认';
-  const rawStock = typeof fields.stock === 'number' ? fields.stock : Number(text(fields.stock).replace(/[,，]/gu, ''));
+  const stockText = text(fields.stock).replace(/[,，]/gu, '');
+  const rawStock = typeof fields.stock === 'number' ? fields.stock : stockText ? Number(stockText) : Number.NaN;
   const stock = Number.isSafeInteger(rawStock) && rawStock >= 0 ? rawStock : null;
   const warnings: string[] = [];
   if (name === '待命名商品') warnings.push('豆包未识别到明确商品名称，请保存前确认。');
@@ -119,7 +120,7 @@ function normalizeDoubao(fields: ProductFields, sourceText: string): ProductImpo
   if (stock === null) warnings.push('豆包未识别到库存，库存暂按待确认处理。');
   return {
     product: {
-      id: makeId(name),
+      id: makeId(name, text(fields.sku)),
       name,
       category: text(fields.category) || '其他',
       price,
@@ -143,6 +144,7 @@ function normalizeDoubao(fields: ProductFields, sourceText: string): ProductImpo
 export async function parseProductText(sourceText: string): Promise<ProductImportResponse> {
   const normalizedText = sourceText.trim();
   if (!normalizedText) throw new Error('请先粘贴商品信息');
+  if (normalizedText.length > 20_000) throw new Error('商品信息不能超过 20000 个字符');
   const config = getDoubaoConfig();
   if (!config) return localParse(normalizedText);
   try {

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import safeRegex from 'safe-regex2';
 import type { ComplianceRule, ComplianceRuleScope, ComplianceRuleStatus, LiveRoom, RuleAuditEntry, RiskLevel } from '../src/shared/types';
 import type { ProductCatalog } from './productCatalog';
 
@@ -222,6 +223,7 @@ export class FileRuleCatalog implements RuleCatalog {
     if (!rule.name || !rule.pattern || !rule.title || !rule.reason || !rule.alternative) throw new Error('规则名称、匹配内容、风险说明和替代表达不能为空');
     if (rule.pattern.length > 200) throw new Error('规则匹配内容不能超过 200 个字符');
     if (rule.matchType === 'regex') {
+      if (!safeRegex(rule.pattern)) throw new Error('规则正则表达式存在性能风险');
       try {
         new RegExp(rule.pattern, 'iu');
       } catch {

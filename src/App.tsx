@@ -11,6 +11,8 @@ import {
   ExternalLink,
   Headphones,
   Keyboard,
+  LockKeyhole,
+  LogOut,
   Mic,
   Monitor,
   Pencil,
@@ -29,6 +31,31 @@ import { DEFAULT_PRODUCT } from './shared/products';
 import type { ComplianceResult, ComplianceRule, LiveRoom, Product, ProductImportResponse, RuleAuditEntry, ServerMessage, SessionState } from './shared/types';
 
 type Role = 'operator' | 'display';
+type AuthIdentity = { actorId: string; displayName: string; role: 'operator' | 'reviewer'; roomIds: string[] };
+type OperatorAccess = AuthIdentity & { token: string; mode: 'multi-user' | 'local-only' };
+type Readiness = {
+  readyForLive: boolean;
+  speech: { configured: boolean; label: string };
+  doubao: { configured: boolean; label: string };
+  auth: { configured: boolean; label: string };
+  storage: { configured: boolean; label: string };
+};
+
+function storedActorId(): string {
+  const stored = localStorage.getItem('live-actor');
+  if (stored) return stored;
+  const generated = `operator-${Math.random().toString(36).slice(2, 10)}`;
+  localStorage.setItem('live-actor', generated);
+  return generated;
+}
+
+function accessHeaders(actorId: string, token = '', contentType = false): Record<string, string> {
+  return {
+    ...(contentType ? { 'Content-Type': 'application/json' } : {}),
+    'X-Actor-Id': actorId,
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+}
 
 const EMPTY_STATE: SessionState = {
   sessionId: '',
@@ -44,19 +71,15 @@ const EMPTY_STATE: SessionState = {
   lastEventAt: Date.now(),
 };
 
-function useLiveSession(role: Role) {
+function useLiveSession(role: Role, access?: OperatorAccess) {
   const [state, setState] = useState<SessionState>(EMPTY_STATE);
   const [sessionId, setSessionId] = useState(() => new URLSearchParams(window.location.search).get('session') ?? localStorage.getItem('live-session') ?? '');
   const [roomId] = useState(() => new URLSearchParams(window.location.search).get('room') ?? localStorage.getItem('live-room') ?? 'room-default');
-  const [actorId] = useState(() => {
-    const stored = localStorage.getItem('live-actor');
-    if (stored) return stored;
-    const generated = `operator-${Math.random().toString(36).slice(2, 10)}`;
-    localStorage.setItem('live-actor', generated);
-    return generated;
-  });
+  const [localActorId] = useState(storedActorId);
+  const actorId = access?.actorId ?? localActorId;
   const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState('正在连接会话');
+  const [captureDeniedVersion, setCaptureDeniedVersion] = useState(0);
   const socketRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
@@ -68,7 +91,7 @@ function useLiveSession(role: Role) {
       socketRef.current = socket;
       socket.onopen = () => {
         setConnected(true);
-        socket.send(JSON.stringify({ type: 'session.join', sessionId: sessionId || undefined, roomId, actorId, role }));
+        socket.send(JSON.stringify({ type: 'session.join', sessionId: sessionId || undefined, roomId, actorId, token: access?.token || undefined, role }));
       };
       socket.onmessage = (event) => {
         const message = JSON.parse(event.data) as ServerMessage;
@@ -90,6 +113,9 @@ function useLiveSession(role: Role) {
           });
         } else if (message.type === 'system.status') {
           setStatus(message.message);
+        } else if (message.type === 'capture.denied') {
+          setCaptureDeniedVersion((current) => current + 1);
+          setStatus(message.message);
         } else if (message.type === 'system.error') {
           setStatus(message.message);
         }
@@ -106,22 +132,73 @@ function useLiveSession(role: Role) {
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       socketRef.current?.close();
     };
-  }, [actorId, role, roomId, sessionId]);
+  }, [access?.token, actorId, role, roomId, sessionId]);
 
   const send = useCallback((message: object) => {
-    if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify(message));
+    if (socketRef.current?.readyState !== WebSocket.OPEN) return false;
+    socketRef.current.send(JSON.stringify(message));
+    return true;
   }, []);
 
-  return { state, sessionId, roomId, actorId, connected, status, send };
+  return { state, sessionId, roomId, actorId, connected, status, captureDeniedVersion, send };
+}
+
+function useOperatorAccess() {
+  const [localActorId] = useState(storedActorId);
+  const [access, setAccess] = useState<OperatorAccess | null>(null);
+  const [readiness, setReadiness] = useState<Readiness | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [message, setMessage] = useState('');
+
+  useEffect(() => {
+    const token = localStorage.getItem('live-auth-token') ?? '';
+    void Promise.all([
+      fetch('/api/auth/status', { headers: accessHeaders(localActorId, token) }),
+      fetch('/api/readiness'),
+    ]).then(async ([authResponse, readinessResponse]) => {
+      const auth = await authResponse.json() as { mode: OperatorAccess['mode']; authenticated: boolean; identity?: AuthIdentity; message?: string };
+      const ready = await readinessResponse.json() as Readiness;
+      setReadiness(ready);
+      if (auth.authenticated && auth.identity) setAccess({ ...auth.identity, token, mode: auth.mode });
+      else {
+        localStorage.removeItem('live-auth-token');
+        setMessage(auth.message ?? '请登录控制台');
+      }
+    }).catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error))).finally(() => setLoading(false));
+  }, [localActorId]);
+
+  const login = async (actorId: string, password: string) => {
+    setMessage('');
+    try {
+      const response = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ actorId, password }) });
+      const body = await response.json() as { identity?: AuthIdentity; token?: string; message?: string };
+      if (!response.ok || !body.identity || !body.token) return setMessage(body.message ?? '登录失败');
+      localStorage.setItem('live-auth-token', body.token);
+      localStorage.setItem('live-actor', body.identity.actorId);
+      setAccess({ ...body.identity, token: body.token, mode: 'multi-user' });
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const logout = () => {
+    localStorage.removeItem('live-auth-token');
+    setAccess(null);
+    setMessage('已退出登录');
+  };
+
+  return { access, readiness, loading, message, login, logout };
 }
 
 function useMicrophone(send: (message: object) => void, isListening: boolean) {
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState('');
   const [error, setError] = useState('');
+  const [capturing, setCapturing] = useState(false);
   const streamRef = useRef<MediaStream | null>(null);
   const contextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const requestVersionRef = useRef(0);
 
   const refresh = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -138,12 +215,14 @@ function useMicrophone(send: (message: object) => void, isListening: boolean) {
   }, [refresh]);
 
   const stop = useCallback(() => {
+    requestVersionRef.current += 1;
     processorRef.current?.disconnect();
     processorRef.current = null;
     contextRef.current?.close();
     contextRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    setCapturing(false);
   }, []);
 
   useEffect(() => {
@@ -152,11 +231,17 @@ function useMicrophone(send: (message: object) => void, isListening: boolean) {
   }, [isListening, stop]);
 
   const start = useCallback(async () => {
+    const requestVersion = requestVersionRef.current + 1;
+    requestVersionRef.current = requestVersion;
     try {
       setError('');
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { deviceId: deviceId ? { exact: deviceId } : undefined, channelCount: 1, echoCancellation: true, noiseSuppression: true },
       });
+      if (requestVersionRef.current !== requestVersion) {
+        stream.getTracks().forEach((track) => track.stop());
+        return false;
+      }
       streamRef.current = stream;
       const context = new AudioContext();
       contextRef.current = context;
@@ -189,13 +274,15 @@ function useMicrophone(send: (message: object) => void, isListening: boolean) {
       silentSink.gain.value = 0;
       processor.connect(silentSink);
       silentSink.connect(context.destination);
+      setCapturing(true);
+      return true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '无法访问麦克风');
-      send({ type: 'control.stop' });
+      return false;
     }
   }, [deviceId, send]);
 
-  return { devices, deviceId, setDeviceId, start, stop, error, refresh };
+  return { devices, deviceId, setDeviceId, start, stop, capturing, error, refresh };
 }
 
 function RiskIcon({ risk }: { risk: ComplianceResult['risk'] }) {
@@ -267,7 +354,8 @@ const RULE_ACTION_LABEL: Record<RuleAuditEntry['action'], string> = {
   created: '创建', submitted: '提交审核', approved: '审核通过', rejected: '驳回', edited: '保存新版本', rolled_back: '回滚', disabled: '停用', enabled: '启用',
 };
 
-function WorkspaceModal({ state, actorId, send, onClose }: { state: SessionState; actorId: string; send: (message: object) => void; onClose: () => void }) {
+function WorkspaceModal({ state, access, send, onClose, onLogout }: { state: SessionState; access: OperatorAccess; send: (message: object) => void; onClose: () => void; onLogout: () => void }) {
+  const actorId = access.actorId;
   const [tab, setTab] = useState<'products' | 'rules'>('products');
   const [rooms, setRooms] = useState<LiveRoom[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
@@ -284,17 +372,17 @@ function WorkspaceModal({ state, actorId, send, onClose }: { state: SessionState
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
 
-  const actorHeaders = { 'Content-Type': 'application/json', 'X-Actor-Id': actorId };
+  const actorHeaders = accessHeaders(actorId, access.token, true);
   const refresh = useCallback(async () => {
     const [roomsResponse, productsResponse, rulesResponse, auditsResponse] = await Promise.all([
-      fetch('/api/rooms'), fetch(`/api/rooms/${state.roomId}/products`), fetch(`/api/rooms/${state.roomId}/rules`), fetch(`/api/rooms/${state.roomId}/rules/audits`),
+      fetch('/api/rooms', { headers: actorHeaders }), fetch(`/api/rooms/${state.roomId}/products`, { headers: actorHeaders }), fetch(`/api/rooms/${state.roomId}/rules`, { headers: actorHeaders }), fetch(`/api/rooms/${state.roomId}/rules/audits`, { headers: actorHeaders }),
     ]);
     if (!roomsResponse.ok || !productsResponse.ok || !rulesResponse.ok || !auditsResponse.ok) throw new Error('工作区数据读取失败');
     setRooms(await roomsResponse.json() as LiveRoom[]);
     setProducts(await productsResponse.json() as Product[]);
     setRules(await rulesResponse.json() as ComplianceRule[]);
     setAudits(await auditsResponse.json() as RuleAuditEntry[]);
-  }, [state.roomId]);
+  }, [access.token, actorId, state.roomId]);
 
   useEffect(() => { void refresh().catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error))); }, [refresh]);
 
@@ -383,31 +471,41 @@ function WorkspaceModal({ state, actorId, send, onClose }: { state: SessionState
 
   const currentRoom = rooms.find((room) => room.id === state.roomId);
   return <div className="modal-backdrop" role="presentation"><section className="workspace-modal" role="dialog" aria-modal="true" aria-label="直播间工作区">
-    <header className="workspace-head"><div><span className="section-kicker">直播间工作区 <span>ROOM DATA</span></span><h2>{currentRoom?.name ?? '当前直播间'}</h2><p>{currentRoom?.accountName ?? state.roomId} · 负责人 {currentRoom?.ownerActorId ?? 'owner'}</p></div><div className="actor-switch"><input value={actorDraft} onChange={(event) => setActorDraft(event.target.value)} aria-label="当前操作人账号" /><button type="button" onClick={switchActor}>切换操作人</button></div><button type="button" className="modal-close" onClick={onClose} title="关闭">×</button></header>
+    <header className="workspace-head"><div><span className="section-kicker">直播间工作区 <span>ROOM DATA</span></span><h2>{currentRoom?.name ?? '当前直播间'}</h2><p>{currentRoom?.accountName ?? state.roomId} · 负责人 {currentRoom?.ownerActorId ?? 'owner'}</p></div>{access.mode === 'multi-user' ? <div className="actor-identity"><span><LockKeyhole size={13} />{access.displayName}</span><small>{access.role === 'reviewer' ? '规则审核人' : '场控账号'}</small><button type="button" onClick={onLogout} title="退出登录"><LogOut size={14} /></button></div> : <div className="actor-switch"><input value={actorDraft} onChange={(event) => setActorDraft(event.target.value)} aria-label="当前操作人账号" /><button type="button" onClick={switchActor}>切换操作人</button></div>}<button type="button" className="modal-close" onClick={onClose} title="关闭">×</button></header>
     <div className="room-toolbar"><select value={state.roomId} onChange={(event) => switchRoom(event.target.value)} aria-label="切换直播间">{rooms.map((room) => <option key={room.id} value={room.id}>{room.name} · {room.accountName}</option>)}</select><input value={newRoomName} onChange={(event) => setNewRoomName(event.target.value)} placeholder="新直播间名称" /><input value={newAccountName} onChange={(event) => setNewAccountName(event.target.value)} placeholder="抖音账号名称" /><button type="button" onClick={() => void createRoom()}><Plus size={14} />创建</button></div>
     <div className="workspace-tabs"><button type="button" className={tab === 'products' ? 'active' : ''} onClick={() => setTab('products')}><Database size={15} />商品库</button><button type="button" className={tab === 'rules' ? 'active' : ''} onClick={() => setTab('rules')}><ShieldCheck size={15} />规则库</button></div>
     {tab === 'products' ? <div className="workspace-grid">
       <section className="catalog-pane"><div className="pane-head"><div><strong>长期商品库</strong><span>{products.length} 件</span></div><button type="button" title="刷新" onClick={() => void refresh()}><RefreshCw size={14} /></button></div><div className="catalog-list">{products.map((product) => <label className="catalog-row" key={product.id}><input type="checkbox" checked={selectedIds.includes(product.id)} onChange={(event) => setSelectedIds((current) => event.target.checked ? [...new Set([...current, product.id])] : current.filter((id) => id !== product.id))} /><img src={product.image} alt="" /><span><strong>{product.name}</strong><small>{product.price} · 库存 {product.stock ?? '待确认'} · {product.sku || '无 SKU'}</small></span></label>)}</div><button type="button" className="primary-wide" disabled={selectedIds.length === 0} onClick={() => { send({ type: 'lineup.set', productIds: selectedIds }); onClose(); }}><Save size={15} />保存为本场商品清单</button></section>
       <section className="import-pane"><div className="pane-head"><div><strong>粘贴识别商品</strong><span>豆包结构化</span></div></div><textarea value={importText} onChange={(event) => setImportText(event.target.value)} placeholder="粘贴商品标题、详情、价格、库存、SKU、卖点等文本" /><button type="button" className="secondary-wide" disabled={busy || !importText.trim()} onClick={() => void parseProduct()}><ClipboardPaste size={15} />{busy ? '识别中' : '识别商品信息'}</button>{importResult && <div className="product-draft"><div className="draft-source">{importResult.source === 'doubao' ? 'DOUBAO' : 'LOCAL'} · {Math.round(importResult.confidence * 100)}%</div><label>名称<input value={importResult.product.name} onChange={(event) => setImportResult({ ...importResult, product: { ...importResult.product, name: event.target.value } })} /></label><div className="draft-fields"><label>价格<input value={importResult.product.price} onChange={(event) => setImportResult({ ...importResult, product: { ...importResult.product, price: event.target.value } })} /></label><label>库存<input type="number" value={importResult.product.stock ?? ''} onChange={(event) => setImportResult({ ...importResult, product: { ...importResult.product, stock: event.target.value ? Number(event.target.value) : null } })} /></label></div><label>SKU<input value={importResult.product.sku} onChange={(event) => setImportResult({ ...importResult, product: { ...importResult.product, sku: event.target.value } })} /></label>{importResult.warnings.map((warning) => <p key={warning}>{warning}</p>)}<button type="button" className="primary-wide" onClick={() => void saveProduct()}><Save size={15} />保存到商品库</button></div>}</section>
     </div> : <div className="workspace-grid rules-grid">
-      <section className="rule-form"><div className="pane-head"><div><strong>{editingRuleId ? '编辑规则新版本' : '新增内部规则'}</strong><span>房间规则立即生效，共享规则需审核</span></div></div><input value={ruleDraft.name} onChange={(event) => setRuleDraft({ ...ruleDraft, name: event.target.value })} placeholder="规则名称" /><div className="draft-fields"><select value={ruleDraft.scope} onChange={(event) => setRuleDraft({ ...ruleDraft, scope: event.target.value as RuleDraft['scope'] })}><option value="room">当前直播间</option><option value="shared">共享规则</option></select><select value={ruleDraft.risk} onChange={(event) => setRuleDraft({ ...ruleDraft, risk: event.target.value as RuleDraft['risk'] })}><option value="warning">需留意</option><option value="blocked">高风险</option><option value="safe">安全白名单</option></select></div><div className="draft-fields"><select value={ruleDraft.matchType} onChange={(event) => setRuleDraft({ ...ruleDraft, matchType: event.target.value as RuleDraft['matchType'] })}><option value="contains">包含关键词</option><option value="regex">正则表达式</option></select><input value={ruleDraft.pattern} onChange={(event) => setRuleDraft({ ...ruleDraft, pattern: event.target.value })} placeholder="违规词或匹配表达式" /></div><input value={ruleDraft.title} onChange={(event) => setRuleDraft({ ...ruleDraft, title: event.target.value })} placeholder="预警标题" /><textarea value={ruleDraft.reason} onChange={(event) => setRuleDraft({ ...ruleDraft, reason: event.target.value })} placeholder="违规原因" /><textarea value={ruleDraft.alternative} onChange={(event) => setRuleDraft({ ...ruleDraft, alternative: event.target.value })} placeholder="主播可立即照读的替代表达" /><button type="button" className="primary-wide" disabled={busy} onClick={() => void saveRule()}><Save size={15} />{editingRuleId ? '保存新版本' : '保存规则'}</button></section>
-      <section className="catalog-pane"><div className="pane-head"><div><strong>规则与审核</strong><span>{rules.length} 条 · 日志 {audits.length} 条</span></div><button type="button" title="刷新" onClick={() => void refresh()}><RefreshCw size={14} /></button></div><div className="rule-list">{rules.map((rule) => <div className="rule-row" key={rule.id}><div><span className={`rule-status ${rule.status}`}>{RULE_STATUS_LABEL[rule.status]}</span><strong>{rule.name}</strong><small>v{rule.version} · {rule.scope === 'shared' ? '共享' : '当前直播间'} · {rule.pattern}</small></div><p>{rule.reason}</p><div className="rule-actions"><button type="button" onClick={() => { setEditingRuleId(rule.id); setRuleDraft({ name: rule.name, scope: rule.scope, matchType: rule.matchType, pattern: rule.pattern, risk: rule.risk, title: rule.title, reason: rule.reason, alternative: rule.alternative, policyRef: rule.policyRef }); }}>编辑</button>{rule.status === 'pending_review' && <><button type="button" onClick={() => void ruleAction(rule, 'approve')}>审核通过</button><button type="button" onClick={() => void ruleAction(rule, 'reject')}>驳回</button></>}{rule.version > 1 && <button type="button" onClick={() => void ruleAction(rule, 'rollback')}>回滚上一版</button>}</div></div>)}</div><div className="audit-list"><strong>最近操作日志</strong>{audits.slice(-6).reverse().map((audit) => <div key={audit.id}><span>{new Date(audit.occurredAt).toLocaleString('zh-CN', { hour12: false })}</span><em>{audit.actorId}</em><span>{RULE_ACTION_LABEL[audit.action]}</span></div>)}</div></section>
+      <section className="rule-form"><div className="pane-head"><div><strong>{editingRuleId ? '编辑规则新版本' : '新增内部规则'}</strong><span>房间规则立即生效，共享规则需审核</span></div></div><input value={ruleDraft.name} onChange={(event) => setRuleDraft({ ...ruleDraft, name: event.target.value })} placeholder="规则名称" /><div className="draft-fields"><select value={ruleDraft.scope} onChange={(event) => setRuleDraft({ ...ruleDraft, scope: event.target.value as RuleDraft['scope'] })}><option value="room">当前直播间</option><option value="shared">共享规则</option></select><select value={ruleDraft.risk} onChange={(event) => setRuleDraft({ ...ruleDraft, risk: event.target.value as RuleDraft['risk'] })}><option value="warning">需留意</option><option value="blocked">高风险</option><option value="safe">安全提示（不覆盖高风险）</option></select></div><div className="draft-fields"><select value={ruleDraft.matchType} onChange={(event) => setRuleDraft({ ...ruleDraft, matchType: event.target.value as RuleDraft['matchType'] })}><option value="contains">包含关键词</option><option value="regex">正则表达式</option></select><input value={ruleDraft.pattern} onChange={(event) => setRuleDraft({ ...ruleDraft, pattern: event.target.value })} placeholder="违规词或匹配表达式" /></div><input value={ruleDraft.title} onChange={(event) => setRuleDraft({ ...ruleDraft, title: event.target.value })} placeholder="预警标题" /><textarea value={ruleDraft.reason} onChange={(event) => setRuleDraft({ ...ruleDraft, reason: event.target.value })} placeholder="违规原因" /><textarea value={ruleDraft.alternative} onChange={(event) => setRuleDraft({ ...ruleDraft, alternative: event.target.value })} placeholder="主播可立即照读的替代表达" /><button type="button" className="primary-wide" disabled={busy} onClick={() => void saveRule()}><Save size={15} />{editingRuleId ? '保存新版本' : '保存规则'}</button></section>
+      <section className="catalog-pane"><div className="pane-head"><div><strong>规则与审核</strong><span>{rules.length} 条 · 日志 {audits.length} 条</span></div><button type="button" title="刷新" onClick={() => void refresh()}><RefreshCw size={14} /></button></div><div className="rule-list">{rules.map((rule) => <div className="rule-row" key={rule.id}><div><span className={`rule-status ${rule.status}`}>{RULE_STATUS_LABEL[rule.status]}</span><strong>{rule.name}</strong><small>v{rule.version} · {rule.scope === 'shared' ? '共享' : '当前直播间'} · {rule.pattern}</small></div><p>{rule.reason}</p><div className="rule-actions"><button type="button" onClick={() => { setEditingRuleId(rule.id); setRuleDraft({ name: rule.name, scope: rule.scope, matchType: rule.matchType, pattern: rule.pattern, risk: rule.risk, title: rule.title, reason: rule.reason, alternative: rule.alternative, policyRef: rule.policyRef }); }}>编辑</button>{access.role === 'reviewer' && rule.status === 'pending_review' && <><button type="button" onClick={() => void ruleAction(rule, 'approve')}>审核通过</button><button type="button" onClick={() => void ruleAction(rule, 'reject')}>驳回</button></>}{rule.version > 1 && (access.role === 'reviewer' || (rule.scope === 'room' && currentRoom?.ownerActorId === access.actorId)) && <button type="button" onClick={() => void ruleAction(rule, 'rollback')}>回滚上一版</button>}</div></div>)}</div><div className="audit-list"><strong>最近操作日志</strong>{audits.slice(-6).reverse().map((audit) => <div key={audit.id}><span>{new Date(audit.occurredAt).toLocaleString('zh-CN', { hour12: false })}</span><em>{audit.actorId}</em><span>{RULE_ACTION_LABEL[audit.action]}</span></div>)}</div></section>
     </div>}
     {message && <div className="workspace-message">{message}</div>}
   </section></div>;
 }
 
-function MicPanel({ isListening, send }: { isListening: boolean; send: (message: object) => void }) {
+function MicPanel({ isListening, connected, captureDeniedVersion, send }: { isListening: boolean; connected: boolean; captureDeniedVersion: number; send: (message: object) => boolean }) {
   const microphone = useMicrophone(send, isListening);
   const [showDevices, setShowDevices] = useState(false);
-  useEffect(() => { if (isListening) void microphone.start(); }, [isListening]);
+  const selected = microphone.devices.find((device) => device.deviceId === microphone.deviceId);
+  useEffect(() => { if (captureDeniedVersion > 0) microphone.stop(); }, [captureDeniedVersion, microphone.stop]);
+  useEffect(() => { if (!connected) microphone.stop(); }, [connected, microphone.stop]);
+  const toggleCapture = async () => {
+    if (isListening && microphone.capturing) {
+      microphone.stop();
+      send({ type: 'control.stop' });
+      return;
+    }
+    if (!isListening && await microphone.start() && !send({ type: 'control.start' })) microphone.stop();
+  };
   return <section className="rail-section mic-section">
     <div className="section-kicker">收音设备 <span>INPUT</span></div>
-    <div className="mic-device-row"><div className={`mic-orb ${isListening ? 'active' : ''}`}><Mic size={21} /></div><div className="mic-device-name"><strong>{isListening ? '正在实时收音' : '蓝牙麦克风待机'}</strong><small>{microphone.devices.find((device) => device.deviceId === microphone.deviceId)?.label || '请先允许浏览器访问麦克风'}</small></div></div>
-    <button type="button" className="device-toggle" onClick={() => { setShowDevices((value) => !value); void microphone.refresh(); }}><Headphones size={15} />选择输入设备 <ChevronRight size={14} className={showDevices ? 'rotate' : ''} /></button>
-    {showDevices && <div className="device-select-wrap"><select value={microphone.deviceId} onChange={(event) => microphone.setDeviceId(event.target.value)} aria-label="选择麦克风"><option value="">系统默认输入</option>{microphone.devices.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label || `麦克风 ${device.deviceId.slice(0, 5)}`}</option>)}</select></div>}
+    <div className="mic-device-row"><div className={`mic-orb ${microphone.capturing ? 'active' : ''}`}><Mic size={21} /></div><div className="mic-device-name"><strong>{microphone.capturing ? '本机正在实时收音' : isListening ? '其他控制台正在收音' : '蓝牙麦克风待机'}</strong><small>{selected?.label || '请先允许浏览器访问麦克风'}</small></div></div>
+    <button type="button" className="device-toggle" disabled={isListening || !connected} onClick={() => { setShowDevices((value) => !value); void microphone.refresh(); }}><Headphones size={15} />选择输入设备 <ChevronRight size={14} className={showDevices ? 'rotate' : ''} /></button>
+    {showDevices && <div className="device-select-wrap"><select value={microphone.deviceId} onChange={(event) => microphone.setDeviceId(event.target.value)} aria-label="选择麦克风" disabled={isListening}><option value="">系统默认输入</option>{microphone.devices.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label || `麦克风 ${device.deviceId.slice(0, 5)}`}</option>)}</select></div>}
     {microphone.error && <div className="inline-error"><AlertTriangle size={14} />{microphone.error}</div>}
-    <div className="mic-control-row"><button type="button" className={`main-control ${isListening ? 'stop' : 'start'}`} onClick={() => send({ type: isListening ? 'control.stop' : 'control.start' })}>{isListening ? <><CircleStop size={16} />停止收音</> : <><Play size={16} fill="currentColor" />开始收音</>}</button><span className="capture-note"><span className={`capture-dot ${isListening ? 'active' : ''}`} />{isListening ? '16kHz PCM' : '未连接'}</span></div>
+    <div className="mic-control-row"><button type="button" className={`main-control ${isListening ? 'stop' : 'start'}`} onClick={() => void toggleCapture()} disabled={!connected || (isListening && !microphone.capturing)}>{isListening ? microphone.capturing ? <><CircleStop size={16} />停止收音</> : <><Radio size={16} />远端收音中</> : <><Play size={16} fill="currentColor" />开始收音</>}</button><span className="capture-note"><span className={`capture-dot ${microphone.capturing ? 'active' : ''}`} />{microphone.capturing ? '16kHz PCM' : isListening ? '只读监听' : '未连接'}</span></div>
   </section>;
 }
 
@@ -458,10 +556,34 @@ function SessionStats({ state }: { state: SessionState }) {
   return <div className="session-stats"><div><span>已播时长</span><strong>{Math.floor(state.stats.speakingSeconds / 60).toString().padStart(2, '0')}:{(state.stats.speakingSeconds % 60).toString().padStart(2, '0')}</strong></div><div><span>识别字数</span><strong>{state.stats.words}</strong></div><div><span>高风险</span><strong className="danger-text">{state.stats.blockedCount}</strong></div><div><span>需留意</span><strong className="warning-text">{state.stats.warningCount}</strong></div></div>;
 }
 
-function OperatorScreen() {
-  const session = useLiveSession('operator');
+function ReadinessStrip({ readiness }: { readiness: Readiness | null }) {
+  if (!readiness) return null;
+  const items = [readiness.speech, readiness.doubao, readiness.auth, readiness.storage];
+  return <section className={`readiness-strip ${readiness.readyForLive ? 'ready' : 'attention'}`} aria-label="开播检查">
+    <div className="readiness-title"><Activity size={14} /><span>开播检查</span><strong>{readiness.readyForLive ? '配置齐全，开播时连接验证' : '当前为演示模式'}</strong></div>
+    <div className="readiness-items">{items.map((item) => <span className={item.configured ? 'ok' : 'pending'} key={item.label}><i />{item.label}</span>)}</div>
+  </section>;
+}
+
+function LoginScreen({ readiness, message, onLogin }: { readiness: Readiness | null; message: string; onLogin: (actorId: string, password: string) => Promise<void> }) {
+  const [actorId, setActorId] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const localOnlyBlocked = readiness && !readiness.auth.configured;
+  return <div className="access-shell"><div className="access-brand"><span className="brand-mark"><ShieldCheck size={19} /></span><strong>合规台</strong></div><section className="access-panel"><div className="access-icon"><LockKeyhole size={23} /></div><span className="section-kicker">控制台身份 <span>SECURE ACCESS</span></span><h1>{localOnlyBlocked ? '当前设备仅可查看主播屏' : '登录直播控制台'}</h1>{localOnlyBlocked ? <p>多人账号尚未配置，控制操作仅允许在 MacBook 本机完成。</p> : <form onSubmit={(event) => { event.preventDefault(); setBusy(true); void onLogin(actorId.trim(), password).finally(() => setBusy(false)); }}><label>账号<input value={actorId} onChange={(event) => setActorId(event.target.value)} autoComplete="username" /></label><label>密码<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" /></label><button type="submit" disabled={busy || !actorId.trim() || !password}><LockKeyhole size={15} />{busy ? '正在登录' : '登录'}</button></form>}{message && <div className="access-message">{message}</div>}</section></div>;
+}
+
+function OperatorScreen({ access, readiness, onLogout }: { access: OperatorAccess; readiness: Readiness | null; onLogout: () => void }) {
+  const session = useLiveSession('operator', access);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
-  return <div className="app-shell operator-shell"><AppHeader state={session.state} connected={session.connected} status={session.status} mode="operator" /><main className="operator-grid"><aside className="left-rail"><ProductRail state={session.state} send={session.send} onOpenLibrary={() => setWorkspaceOpen(true)} /><MicPanel isListening={session.state.isListening} send={session.send} /><div className="rail-footer"><Wifi size={14} />局域网地址可供 iPad 访问</div></aside><section className="main-stage"><div className="stage-context"><div><span className="eyebrow">TODAY'S LIVE · 01</span><h2>{session.state.product.name}</h2></div><div className="context-actions"><span className="ai-tag"><ShieldCheck size={14} />豆包合规引擎</span><span className="context-dot" />火山实时语音</div></div><TranscriptStage state={session.state} send={session.send} /><DemoInput send={session.send} /></section><aside className="coach-rail"><PromptPanel state={session.state} /><CompliancePanel result={session.state.latestCompliance} /><section className="alert-history"><div className="section-kicker">近期提醒 <span>ALERT LOG</span></div>{session.state.alerts.length ? session.state.alerts.slice(0, 4).map((alert) => <div className="alert-row" key={alert.id}><div className={`alert-icon ${alert.risk}`}><RiskIcon risk={alert.risk} /></div><div><strong>{alert.title}</strong><small>{new Date(alert.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {alert.alternative.replace(/^可以改为：/u, '')}</small></div></div>) : <div className="empty-alert"><Check size={16} />暂无风险提醒</div>}</section></aside></main><footer className="operator-footer"><SessionStats state={session.state} /><div className="footer-note"><Activity size={15} />风险判断以豆包大模型为主，未配置密钥时使用本地规则即时兜底</div></footer>{workspaceOpen && <WorkspaceModal state={session.state} actorId={session.actorId} send={session.send} onClose={() => setWorkspaceOpen(false)} />}</div>;
+  return <div className="app-shell operator-shell"><AppHeader state={session.state} connected={session.connected} status={session.status} mode="operator" /><main className="operator-grid"><aside className="left-rail"><ProductRail state={session.state} send={session.send} onOpenLibrary={() => setWorkspaceOpen(true)} /><MicPanel isListening={session.state.isListening} connected={session.connected} captureDeniedVersion={session.captureDeniedVersion} send={session.send} /><div className="rail-footer"><Wifi size={14} />局域网地址可供 iPad 访问</div></aside><section className="main-stage"><div className="stage-context"><div><span className="eyebrow">TODAY'S LIVE · 01</span><h2>{session.state.product.name}</h2></div><div className="context-actions"><span className="ai-tag"><ShieldCheck size={14} />豆包合规引擎</span><span className="context-dot" />火山实时语音</div></div><ReadinessStrip readiness={readiness} /><TranscriptStage state={session.state} send={session.send} /><DemoInput send={session.send} /></section><aside className="coach-rail"><PromptPanel state={session.state} /><CompliancePanel result={session.state.latestCompliance} /><section className="alert-history"><div className="section-kicker">近期提醒 <span>ALERT LOG</span></div>{session.state.alerts.length ? session.state.alerts.slice(0, 4).map((alert) => <div className="alert-row" key={alert.id}><div className={`alert-icon ${alert.risk}`}><RiskIcon risk={alert.risk} /></div><div><strong>{alert.title}</strong><small>{new Date(alert.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {alert.alternative.replace(/^可以改为：/u, '')}</small></div></div>) : <div className="empty-alert"><Check size={16} />暂无风险提醒</div>}</section></aside></main><footer className="operator-footer"><SessionStats state={session.state} /><div className="footer-note"><Activity size={15} />风险判断以豆包大模型为主，未配置密钥时使用本地规则即时兜底</div></footer>{workspaceOpen && <WorkspaceModal state={session.state} access={access} send={session.send} onClose={() => setWorkspaceOpen(false)} onLogout={onLogout} />}</div>;
+}
+
+function OperatorEntry() {
+  const auth = useOperatorAccess();
+  if (auth.loading) return <div className="access-shell"><div className="access-loading">正在验证控制台身份</div></div>;
+  if (!auth.access) return <LoginScreen readiness={auth.readiness} message={auth.message} onLogin={auth.login} />;
+  return <OperatorScreen access={auth.access} readiness={auth.readiness} onLogout={auth.logout} />;
 }
 
 function DisplayScreen() {
@@ -473,5 +595,5 @@ function DisplayScreen() {
 }
 
 export default function App() {
-  return window.location.pathname.startsWith('/display') ? <DisplayScreen /> : <OperatorScreen />;
+  return window.location.pathname.startsWith('/display') ? <DisplayScreen /> : <OperatorEntry />;
 }

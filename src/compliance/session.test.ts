@@ -7,6 +7,10 @@ function fakeSocket() {
 }
 
 describe('LiveSession', () => {
+  it('uses an unguessable id for a new display session', () => {
+    expect(new LiveSession().id).toMatch(/^live-[a-f0-9]{24}$/u);
+  });
+
   it('keeps the selected product as the context for the next compliance result', async () => {
     const session = new LiveSession('test-session');
     session.addClient(fakeSocket(), 'operator');

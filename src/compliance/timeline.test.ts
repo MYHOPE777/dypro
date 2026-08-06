@@ -102,7 +102,7 @@ describe('session timeline export', () => {
     expect(() => timelineStore.appendSourceAudio('live-pcm-test', Buffer.from([0x01]), 48_000)).toThrow('complete samples');
   });
 
-  it('restores the original timeline epoch when a session id is reopened', () => {
+  it('restores the live state when a session id is reopened', async () => {
     const directory = mkdtempSync(path.join(tmpdir(), 'live-resume-'));
     tempDirectories.push(directory);
     const timelineStore = new FileTimelineStore(directory);
@@ -111,11 +111,19 @@ describe('session timeline export', () => {
     now = 2_000;
     firstSession.startListening();
     firstSession.ingestAudio(Buffer.alloc(4));
+    firstSession.selectProduct('headphones');
+    now = 3_000;
+    firstSession.ingestTranscript('今天是全网最低价');
+    await new Promise((resolve) => setTimeout(resolve, 0));
     firstSession.stopListening();
 
     now = 7_000;
     const resumedSession = new LiveSession('live-resume-test', { timelineStore, now: () => now });
     expect(resumedSession.createdAt).toBe(1_000);
+    expect(resumedSession.state.product.id).toBe('headphones');
+    expect(resumedSession.state.transcriptHistory.at(-1)?.text).toBe('今天是全网最低价');
+    expect(resumedSession.state.latestCompliance).toMatchObject({ risk: 'warning', productId: 'headphones' });
+    expect(resumedSession.state.stats).toMatchObject({ words: 8, warningCount: 1 });
     now = 8_000;
     resumedSession.startListening();
     resumedSession.ingestAudio(Buffer.alloc(2));

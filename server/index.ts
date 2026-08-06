@@ -12,6 +12,9 @@ import { FileTimelineStore } from './timelineStore';
 import { FileProductCatalog } from './productCatalog';
 import { FileRuleCatalog } from './ruleCatalog';
 import { parseProductText } from './productParser';
+import { AuthService, allowsControlTransport, canAccessRoom, type AuthIdentity } from './auth';
+import { readSessionIdleTtlMs } from './config';
+import { canDisplayJoin, CaptureLease } from './sessionAccess';
 import type { ClientMessage, ComplianceRuleScope, RiskLevel, Product } from '../src/shared/types';
 
 const app = express();
@@ -24,13 +27,16 @@ const clientDir = path.resolve(projectRoot, '../dist/client');
 const timelineStore = new FileTimelineStore(process.env.TIMELINE_DATA_DIR ?? path.resolve(projectRoot, '../.data/timeline'));
 const productCatalog = new FileProductCatalog(process.env.PRODUCT_CATALOG_PATH ?? path.resolve(projectRoot, '../.data/products/catalog.json'));
 const ruleCatalog = new FileRuleCatalog(productCatalog, process.env.RULE_CATALOG_PATH ?? path.resolve(projectRoot, '../.data/rules/catalog.json'));
+const authService = new AuthService(process.env);
+const requestIdentities = new WeakMap<express.Request, AuthIdentity>();
+const loginAttempts = new Map<string, { failures: number; blockedUntil: number }>();
+const sessionExpiryTimers = new Map<string, NodeJS.Timeout>();
+const captureLeases = new CaptureLease<WebSocket>();
+const sessionIdleTtlMs = readSessionIdleTtlMs(process.env);
+const allowInsecureAuth = process.env.ALLOW_INSECURE_AUTH === 'true';
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
-
-function safeActorId(value: unknown): string {
-  return typeof value === 'string' && /^[a-zA-Z0-9_.-]{1,64}$/u.test(value) ? value : 'owner';
-}
 
 function safeRoomId(value: unknown): string {
   return typeof value === 'string' && /^room-[a-z0-9-]{4,64}$/u.test(value) ? value : 'room-default';
@@ -38,10 +44,29 @@ function safeRoomId(value: unknown): string {
 
 function getOrCreateSession(id?: string, roomId = 'room-default', actorId = 'owner'): LiveSession {
   const safeId = id && /^live-[a-z0-9-]{4,32}$/u.test(id) ? id : undefined;
-  if (safeId && sessions.has(safeId)) return sessions.get(safeId)!;
-  const session = new LiveSession(safeId, { timelineStore, productCatalog, ruleCatalog, roomId, actorId });
+  if (safeId && sessions.has(safeId)) {
+    const existing = sessions.get(safeId)!;
+    if (existing.roomId === roomId) return existing;
+  }
+  const session = new LiveSession(safeId && !sessions.has(safeId) ? safeId : undefined, { timelineStore, productCatalog, ruleCatalog, roomId, actorId });
   sessions.set(session.id, session);
   return session;
+}
+
+function detachSessionClient(session: LiveSession, socket: WebSocket): void {
+  if (captureLeases.release(session.id, socket)) session.stopListening();
+  session.removeClient(socket);
+  if (session.clientCount !== 0) return;
+  session.stopListening();
+  const existingTimer = sessionExpiryTimers.get(session.id);
+  if (existingTimer) clearTimeout(existingTimer);
+  const sessionId = session.id;
+  const timer = setTimeout(() => {
+    if (sessions.get(sessionId)?.clientCount === 0) sessions.delete(sessionId);
+    sessionExpiryTimers.delete(sessionId);
+  }, sessionIdleTtlMs);
+  timer.unref();
+  sessionExpiryTimers.set(sessionId, timer);
 }
 
 function isClientMessage(value: unknown): value is ClientMessage {
@@ -52,6 +77,7 @@ function isClientMessage(value: unknown): value is ClientMessage {
       return (message.sessionId === undefined || (typeof message.sessionId === 'string' && message.sessionId.length <= 64))
         && (message.roomId === undefined || typeof message.roomId === 'string')
         && (message.actorId === undefined || typeof message.actorId === 'string')
+        && (message.token === undefined || typeof message.token === 'string')
         && (message.role === 'operator' || message.role === 'display');
     case 'control.start':
     case 'control.stop':
@@ -84,12 +110,148 @@ function getLanAddress(): string {
 }
 
 app.get('/api/health', (_request, response) => {
-  response.json({ ok: true, sessions: sessions.size, rooms: productCatalog.listRooms().length, volcConfigured: Boolean(process.env.VOLC_SPEECH_APP_KEY && process.env.VOLC_SPEECH_ACCESS_KEY), doubaoConfigured: Boolean(process.env.DOUBAO_API_KEY && process.env.DOUBAO_ENDPOINT_ID) });
+  response.json({ ok: true, sessions: sessions.size, rooms: productCatalog.listRooms().length, volcConfigured: Boolean(process.env.VOLC_SPEECH_APP_KEY && process.env.VOLC_SPEECH_ACCESS_KEY), doubaoConfigured: Boolean(process.env.DOUBAO_API_KEY && process.env.DOUBAO_ENDPOINT_ID), authMode: authService.configured ? 'multi-user' : 'local-only' });
 });
 
 function actorFromRequest(request: express.Request): string {
-  return safeActorId(request.header('x-actor-id') ?? (request.body as Record<string, unknown> | undefined)?.actorId);
+  return identityFromRequest(request).actorId;
 }
+
+function identityFromRequest(request: express.Request): AuthIdentity {
+  const identity = requestIdentities.get(request);
+  if (!identity) throw new Error('请求缺少认证身份');
+  return identity;
+}
+
+function bearerToken(request: express.Request): string | undefined {
+  const authorization = request.header('authorization');
+  return authorization?.startsWith('Bearer ') ? authorization.slice(7).trim() : undefined;
+}
+
+function isEncryptedSocket(socket: { encrypted?: boolean }): boolean {
+  return socket.encrypted === true;
+}
+
+function assertControlTransport(input: { socket: { remoteAddress?: string; encrypted?: boolean }; headers: { origin?: string; 'x-forwarded-proto'?: string | string[] } }): void {
+  const forwarded = input.headers['x-forwarded-proto'];
+  const forwardedProto = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  if (!allowsControlTransport({
+    authConfigured: authService.configured,
+    encrypted: isEncryptedSocket(input.socket),
+    remoteAddress: input.socket.remoteAddress,
+    forwardedProto,
+    allowInsecure: allowInsecureAuth,
+  })) throw new Error('多人控制台必须通过 HTTPS/WSS 访问');
+}
+
+function routeParam(request: express.Request, name: string): string {
+  const value = request.params[name];
+  return Array.isArray(value) ? value[0] ?? '' : value ?? '';
+}
+
+const requireOperator: express.RequestHandler = (request, response, next) => {
+  try {
+    assertControlTransport(request);
+    const identity = authService.authenticate({
+      token: bearerToken(request),
+      claimedActorId: request.header('x-actor-id'),
+      remoteAddress: request.socket.remoteAddress,
+      origin: request.header('origin'),
+    });
+    requestIdentities.set(request, identity);
+    next();
+  } catch (error) {
+    response.status(401).json({ message: error instanceof Error ? error.message : '身份认证失败' });
+  }
+};
+
+function assertRoomAccess(identity: AuthIdentity, roomId: string): void {
+  const room = productCatalog.getRoom(roomId);
+  if (!room || !canAccessRoom(identity, room)) throw new Error('无权访问该直播间');
+}
+
+const requireRoomAccess: express.RequestHandler = (request, response, next) => {
+  try {
+    assertRoomAccess(identityFromRequest(request), routeParam(request, 'roomId'));
+    next();
+  } catch (error) {
+    response.status(403).json({ message: error instanceof Error ? error.message : '直播间权限校验失败' });
+  }
+};
+
+function ruleRoomId(ruleId: string): string | null {
+  return ruleCatalog.versions(ruleId).at(-1)?.roomId ?? null;
+}
+
+const requireRuleAccess: express.RequestHandler = (request, response, next) => {
+  try {
+    const roomId = ruleRoomId(routeParam(request, 'ruleId'));
+    if (!roomId) return response.status(404).json({ message: '规则不存在' });
+    assertRoomAccess(identityFromRequest(request), roomId);
+    next();
+  } catch (error) {
+    response.status(403).json({ message: error instanceof Error ? error.message : '规则权限校验失败' });
+  }
+};
+
+function persistedSessionRoomId(sessionId: string): string | null {
+  const roomId = timelineStore.exportSession(sessionId)?.events.find((event) => event.type === 'session.created')?.payload.roomId;
+  return typeof roomId === 'string' ? roomId : null;
+}
+
+const requireSessionAccess: express.RequestHandler = (request, response, next) => {
+  try {
+    const sessionId = routeParam(request, 'id');
+    const roomId = sessions.get(sessionId)?.roomId ?? persistedSessionRoomId(sessionId);
+    if (!roomId) return response.status(404).json({ message: 'session not found' });
+    assertRoomAccess(identityFromRequest(request), roomId);
+    next();
+  } catch (error) {
+    response.status(403).json({ message: error instanceof Error ? error.message : '会话权限校验失败' });
+  }
+};
+
+app.get('/api/auth/status', (request, response) => {
+  try {
+    assertControlTransport(request);
+    const identity = authService.authenticate({ token: bearerToken(request), claimedActorId: request.header('x-actor-id'), remoteAddress: request.socket.remoteAddress, origin: request.header('origin') });
+    return response.json({ mode: authService.configured ? 'multi-user' : 'local-only', authenticated: true, identity });
+  } catch (error) {
+    return response.json({ mode: authService.configured ? 'multi-user' : 'local-only', authenticated: false, message: error instanceof Error ? error.message : '身份认证失败' });
+  }
+});
+
+app.post('/api/auth/login', (request, response) => {
+  try {
+    assertControlTransport(request);
+  } catch (error) {
+    return response.status(426).json({ message: error instanceof Error ? error.message : '需要安全连接' });
+  }
+  const remoteAddress = request.socket.remoteAddress ?? 'unknown';
+  const attempt = loginAttempts.get(remoteAddress);
+  if (attempt && attempt.blockedUntil > Date.now()) return response.status(429).json({ message: '登录尝试过多，请稍后再试' });
+  try {
+    const login = authService.login(String(request.body?.actorId ?? ''), String(request.body?.password ?? ''));
+    loginAttempts.delete(remoteAddress);
+    return response.json(login);
+  } catch (error) {
+    const failures = (attempt?.failures ?? 0) + 1;
+    loginAttempts.set(remoteAddress, { failures, blockedUntil: failures >= 5 ? Date.now() + 60_000 : 0 });
+    return response.status(401).json({ message: error instanceof Error ? error.message : '登录失败' });
+  }
+});
+
+app.get('/api/readiness', (_request, response) => {
+  const volcConfigured = Boolean(process.env.VOLC_SPEECH_APP_KEY && process.env.VOLC_SPEECH_ACCESS_KEY);
+  const doubaoConfigured = Boolean(process.env.DOUBAO_API_KEY && process.env.DOUBAO_ENDPOINT_ID);
+  response.json({
+    readyForLive: volcConfigured && doubaoConfigured,
+    speech: { configured: volcConfigured, label: volcConfigured ? '火山语音参数已填写' : '火山实时语音待配置' },
+    doubao: { configured: doubaoConfigured, label: doubaoConfigured ? '豆包参数已填写' : '豆包合规模型待配置' },
+    auth: { configured: authService.configured, label: authService.configured ? '多人身份已保护' : '仅限本机控制' },
+    storage: { configured: false, label: '本地文件存储' },
+  });
+});
 
 function isProductPayload(value: unknown): value is Product {
   if (!value || typeof value !== 'object') return false;
@@ -115,9 +277,12 @@ function readRuleInput(value: unknown): { name: string; scope: ComplianceRuleSco
   return { scope, matchType, risk, name: rule.name as string, pattern: rule.pattern as string, title: rule.title as string, reason: rule.reason as string, alternative: rule.alternative as string, policyRef: rule.policyRef as string };
 }
 
-app.get('/api/rooms', (_request, response) => response.json(productCatalog.listRooms()));
+app.get('/api/rooms', requireOperator, (request, response) => {
+  const identity = identityFromRequest(request);
+  response.json(productCatalog.listRooms().filter((room) => canAccessRoom(identity, room)));
+});
 
-app.post('/api/rooms', (request, response) => {
+app.post('/api/rooms', requireOperator, (request, response) => {
   try {
     const room = productCatalog.createRoom({ name: String(request.body?.name ?? ''), accountName: String(request.body?.accountName ?? ''), ownerActorId: actorFromRequest(request) });
     return response.status(201).json(room);
@@ -126,22 +291,29 @@ app.post('/api/rooms', (request, response) => {
   }
 });
 
-app.get('/api/rooms/:roomId', (request, response) => {
-  const room = productCatalog.getRoom(request.params.roomId);
+app.get('/api/rooms/:roomId', requireOperator, requireRoomAccess, (request, response) => {
+  const room = productCatalog.getRoom(routeParam(request, 'roomId'));
   return room ? response.json(room) : response.status(404).json({ message: '直播间不存在' });
 });
 
-app.get('/api/rooms/:roomId/products', (request, response) => {
+app.get('/api/rooms/:roomId/products', requireOperator, requireRoomAccess, (request, response) => {
   try {
-    return response.json(productCatalog.list(request.params.roomId));
+    return response.json(productCatalog.list(routeParam(request, 'roomId')));
   } catch (error) {
     return response.status(404).json({ message: error instanceof Error ? error.message : '商品库读取失败' });
   }
 });
 
-app.get('/api/products', (_request, response) => response.json(productCatalog.list('room-default')));
+app.get('/api/products', requireOperator, (request, response) => {
+  try {
+    assertRoomAccess(identityFromRequest(request), 'room-default');
+    return response.json(productCatalog.list('room-default'));
+  } catch (error) {
+    return response.status(403).json({ message: error instanceof Error ? error.message : '商品库权限校验失败' });
+  }
+});
 
-app.post('/api/products/parse', async (request, response) => {
+app.post('/api/products/parse', requireOperator, async (request, response) => {
   try {
     const text = typeof request.body?.text === 'string' ? request.body.text : '';
     return response.json(await parseProductText(text));
@@ -150,61 +322,64 @@ app.post('/api/products/parse', async (request, response) => {
   }
 });
 
-app.post('/api/rooms/:roomId/products', (request, response) => {
+app.post('/api/rooms/:roomId/products', requireOperator, requireRoomAccess, (request, response) => {
   if (!isProductPayload(request.body?.product)) return response.status(400).json({ message: '商品资料格式不完整' });
   try {
-    return response.status(201).json(productCatalog.upsert(request.params.roomId, request.body.product));
+    return response.status(201).json(productCatalog.upsert(routeParam(request, 'roomId'), request.body.product));
   } catch (error) {
     return response.status(400).json({ message: error instanceof Error ? error.message : '商品保存失败' });
   }
 });
 
-app.get('/api/rooms/:roomId/rules', (request, response) => response.json(ruleCatalog.list(request.params.roomId)));
-app.get('/api/rooms/:roomId/rules/audits', (request, response) => response.json(ruleCatalog.audits(request.params.roomId)));
+app.get('/api/rooms/:roomId/rules', requireOperator, requireRoomAccess, (request, response) => response.json(ruleCatalog.list(routeParam(request, 'roomId'))));
+app.get('/api/rooms/:roomId/rules/audits', requireOperator, requireRoomAccess, (request, response) => response.json(ruleCatalog.audits(routeParam(request, 'roomId'))));
 
-app.post('/api/rooms/:roomId/rules', (request, response) => {
+app.post('/api/rooms/:roomId/rules', requireOperator, requireRoomAccess, (request, response) => {
   const input = readRuleInput(request.body);
   if (!input) return response.status(400).json({ message: '规则资料格式不完整' });
   try {
-    return response.status(201).json(ruleCatalog.create(request.params.roomId, actorFromRequest(request), input));
+    return response.status(201).json(ruleCatalog.create(routeParam(request, 'roomId'), actorFromRequest(request), input));
   } catch (error) {
     return response.status(400).json({ message: error instanceof Error ? error.message : '规则保存失败' });
   }
 });
 
-app.get('/api/rules/:ruleId/versions', (request, response) => response.json(ruleCatalog.versions(request.params.ruleId)));
-app.patch('/api/rules/:ruleId', (request, response) => {
+app.get('/api/rules/:ruleId/versions', requireOperator, requireRuleAccess, (request, response) => response.json(ruleCatalog.versions(routeParam(request, 'ruleId'))));
+app.patch('/api/rules/:ruleId', requireOperator, requireRuleAccess, (request, response) => {
   const input = readRuleInput(request.body);
   if (!input) return response.status(400).json({ message: '规则资料格式不完整' });
-  try { return response.json(ruleCatalog.update(request.params.ruleId, actorFromRequest(request), input)); }
+  try { return response.json(ruleCatalog.update(routeParam(request, 'ruleId'), actorFromRequest(request), input)); }
   catch (error) { return response.status(403).json({ message: error instanceof Error ? error.message : '规则更新失败' }); }
 });
-app.post('/api/rules/:ruleId/approve', (request, response) => {
-  try { return response.json(ruleCatalog.approve(request.params.ruleId, actorFromRequest(request))); }
+app.post('/api/rules/:ruleId/approve', requireOperator, requireRuleAccess, (request, response) => {
+  try { return response.json(ruleCatalog.approve(routeParam(request, 'ruleId'), actorFromRequest(request))); }
   catch (error) { return response.status(403).json({ message: error instanceof Error ? error.message : '规则审核失败' }); }
 });
-app.post('/api/rules/:ruleId/reject', (request, response) => {
-  try { return response.json(ruleCatalog.reject(request.params.ruleId, actorFromRequest(request), String(request.body?.reason ?? ''))); }
+app.post('/api/rules/:ruleId/reject', requireOperator, requireRuleAccess, (request, response) => {
+  try { return response.json(ruleCatalog.reject(routeParam(request, 'ruleId'), actorFromRequest(request), String(request.body?.reason ?? ''))); }
   catch (error) { return response.status(403).json({ message: error instanceof Error ? error.message : '规则驳回失败' }); }
 });
-app.post('/api/rules/:ruleId/rollback', (request, response) => {
+app.post('/api/rules/:ruleId/rollback', requireOperator, requireRuleAccess, (request, response) => {
   const targetVersion = Number(request.body?.targetVersion);
   if (!Number.isSafeInteger(targetVersion) || targetVersion < 1) return response.status(400).json({ message: '目标版本无效' });
-  try { return response.json(ruleCatalog.rollback(request.params.ruleId, targetVersion, actorFromRequest(request))); }
+  try { return response.json(ruleCatalog.rollback(routeParam(request, 'ruleId'), targetVersion, actorFromRequest(request))); }
   catch (error) { return response.status(403).json({ message: error instanceof Error ? error.message : '规则回滚失败' }); }
 });
 
-app.put('/api/session/:id/lineup', (request, response) => {
+app.put('/api/session/:id/lineup', requireOperator, (request, response) => {
   const productIds = request.body?.productIds;
   if (!Array.isArray(productIds) || !productIds.every((productId: unknown) => typeof productId === 'string')) return response.status(400).json({ message: '商品清单格式不正确' });
   const roomId = safeRoomId(request.body?.roomId);
   try {
-    const session = sessions.get(request.params.id);
+    assertRoomAccess(identityFromRequest(request), roomId);
+    const sessionId = routeParam(request, 'id');
+    const session = sessions.get(sessionId);
     if (session) {
+      if (session.roomId !== roomId) throw new Error('会话与直播间不匹配');
       session.setLineup(productIds, actorFromRequest(request));
       return response.json(session.state.lineup);
     }
-    return response.json(productCatalog.setLineup(request.params.id, roomId, productIds));
+    return response.json(productCatalog.setLineup(sessionId, roomId, productIds));
   } catch (error) {
     return response.status(400).json({ message: error instanceof Error ? error.message : '本场商品清单更新失败' });
   }
@@ -215,23 +390,24 @@ app.get('/api/network', (_request, response) => {
   response.json({ origin: `http://${getLanAddress()}:${clientPort}` });
 });
 
-app.get('/api/session/:id', (request, response) => {
-  const session = sessions.get(request.params.id);
+app.get('/api/session/:id', requireOperator, requireSessionAccess, (request, response) => {
+  const session = sessions.get(routeParam(request, 'id'));
   if (!session) return response.status(404).json({ message: 'session not found' });
   return response.json(session.state);
 });
 
-app.get('/api/session/:id/timeline', (request, response) => {
-  const timeline = timelineStore.exportSession(request.params.id);
+app.get('/api/session/:id/timeline', requireOperator, requireSessionAccess, (request, response) => {
+  const timeline = timelineStore.exportSession(routeParam(request, 'id'));
   if (!timeline) return response.status(404).json({ message: 'timeline not found' });
   return response.json(timeline);
 });
 
-app.get('/api/session/:id/timeline.jsonl', (request, response) => {
-  const jsonLines = timelineStore.toJsonLines(request.params.id);
+app.get('/api/session/:id/timeline.jsonl', requireOperator, requireSessionAccess, (request, response) => {
+  const sessionId = routeParam(request, 'id');
+  const jsonLines = timelineStore.toJsonLines(sessionId);
   if (!jsonLines) return response.status(404).json({ message: 'timeline not found' });
   response.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
-  response.setHeader('Content-Disposition', `attachment; filename="${request.params.id}.timeline.jsonl"`);
+  response.setHeader('Content-Disposition', `attachment; filename="${sessionId}.timeline.jsonl"`);
   return response.send(jsonLines);
 });
 
@@ -258,15 +434,15 @@ function streamAudio(sessionId: string, asWav: boolean, source: boolean, respons
   createReadStream(audioPath).pipe(response);
 }
 
-app.get('/api/session/:id/audio.pcm', (request, response) => streamAudio(request.params.id, false, false, response));
-app.get('/api/session/:id/audio.wav', (request, response) => streamAudio(request.params.id, true, false, response));
-app.get('/api/session/:id/audio-source.pcm', (request, response) => {
+app.get('/api/session/:id/audio.pcm', requireOperator, requireSessionAccess, (request, response) => streamAudio(routeParam(request, 'id'), false, false, response));
+app.get('/api/session/:id/audio.wav', requireOperator, requireSessionAccess, (request, response) => streamAudio(routeParam(request, 'id'), true, false, response));
+app.get('/api/session/:id/audio-source.pcm', requireOperator, requireSessionAccess, (request, response) => {
   const trackIndex = parseTrackIndex(request.query.track);
-  return trackIndex === null ? response.status(400).json({ message: 'invalid audio track' }) : streamAudio(request.params.id, false, true, response, trackIndex);
+  return trackIndex === null ? response.status(400).json({ message: 'invalid audio track' }) : streamAudio(routeParam(request, 'id'), false, true, response, trackIndex);
 });
-app.get('/api/session/:id/audio-source.wav', (request, response) => {
+app.get('/api/session/:id/audio-source.wav', requireOperator, requireSessionAccess, (request, response) => {
   const trackIndex = parseTrackIndex(request.query.track);
-  return trackIndex === null ? response.status(400).json({ message: 'invalid audio track' }) : streamAudio(request.params.id, true, true, response, trackIndex);
+  return trackIndex === null ? response.status(400).json({ message: 'invalid audio track' }) : streamAudio(routeParam(request, 'id'), true, true, response, trackIndex);
 });
 
 if (existsSync(clientDir)) {
@@ -282,12 +458,13 @@ server.on('upgrade', (request, socket, head) => {
   wsServer.handleUpgrade(request, socket, head, (client) => wsServer.emit('connection', client, request));
 });
 
-wsServer.on('connection', (socket: WebSocket) => {
+wsServer.on('connection', (socket: WebSocket, request) => {
   let session: LiveSession | null = null;
   let role: 'operator' | 'display' = 'display';
   let actorId = 'owner';
 
   const sendError = (message: string) => socket.send(JSON.stringify({ type: 'system.error', message }));
+  const denyCapture = () => socket.send(JSON.stringify({ type: 'capture.denied', message: '另一台控制台正在收音，本机保持只读监听' }));
   socket.on('message', (raw) => {
     try {
       if (raw.toString().length > 2_500_000) return sendError('消息过大，已忽略');
@@ -295,10 +472,37 @@ wsServer.on('connection', (socket: WebSocket) => {
       if (!isClientMessage(parsed)) return sendError('收到无法识别的消息');
       const message = parsed;
       if (message.type === 'session.join') {
-        if (session) session.removeClient(socket);
-        session = getOrCreateSession(message.sessionId, safeRoomId(message.roomId), safeActorId(message.actorId));
+        if (session) {
+          detachSessionClient(session, socket);
+          session = null;
+        }
         role = message.role;
-        actorId = safeActorId(message.actorId);
+        const requestedRoomId = safeRoomId(message.roomId);
+        if (role === 'operator') {
+          try {
+            assertControlTransport(request);
+            const identity = authService.authenticate({ token: message.token, claimedActorId: message.actorId, remoteAddress: request.socket.remoteAddress, origin: request.headers.origin });
+            assertRoomAccess(identity, requestedRoomId);
+            actorId = identity.actorId;
+          } catch (error) {
+            return sendError(error instanceof Error ? error.message : '身份认证失败');
+          }
+        } else {
+          actorId = 'display';
+          const persisted = message.sessionId ? timelineStore.exportSession(message.sessionId) : null;
+          const persistedRoomId = persisted?.events.find((event) => event.type === 'session.created')?.payload.roomId;
+          const displayCanJoin = canDisplayJoin(
+            message.sessionId,
+            requestedRoomId,
+            message.sessionId ? sessions.get(message.sessionId)?.roomId ?? null : null,
+            typeof persistedRoomId === 'string' ? persistedRoomId : null,
+          );
+          if (!displayCanJoin) return sendError('主播屏链接无效，请从控制台重新打开主播屏');
+        }
+        session = getOrCreateSession(message.sessionId, requestedRoomId, actorId);
+        const expiryTimer = sessionExpiryTimers.get(session.id);
+        if (expiryTimer) clearTimeout(expiryTimer);
+        sessionExpiryTimers.delete(session.id);
         session.addClient(socket, role);
         socket.send(JSON.stringify({ type: 'connection.ready', sessionId: session.id, products: session.products() }));
         socket.send(JSON.stringify({ type: 'state.snapshot', state: session.state }));
@@ -308,10 +512,14 @@ wsServer.on('connection', (socket: WebSocket) => {
       if (role !== 'operator') return sendError('主播屏为只读模式');
       switch (message.type) {
         case 'control.start':
+          if (!session.state.isListening) captureLeases.clear(session.id);
+          if (!captureLeases.acquire(session.id, socket)) return denyCapture();
           session.startListening();
           break;
         case 'control.stop':
+          if (!captureLeases.owns(session.id, socket)) return denyCapture();
           session.stopListening();
+          captureLeases.release(session.id, socket);
           break;
         case 'product.select':
           session.selectProduct(message.productId);
@@ -320,9 +528,11 @@ wsServer.on('connection', (socket: WebSocket) => {
           session.setLineup(message.productIds, actorId);
           break;
         case 'audio':
+          if (!captureLeases.owns(session.id, socket)) break;
           session.ingestAudio(Buffer.from(message.data, 'base64'));
           break;
         case 'audio.raw':
+          if (!captureLeases.owns(session.id, socket)) break;
           session.ingestSourceAudio(Buffer.from(message.data, 'base64'), message.sampleRate);
           break;
         case 'demo.transcript':
@@ -340,11 +550,8 @@ wsServer.on('connection', (socket: WebSocket) => {
   });
   socket.on('close', () => {
     if (!session) return;
-    session.removeClient(socket);
-    if (session.clientCount === 0) {
-      session.stopListening();
-      sessions.delete(session.id);
-    }
+    detachSessionClient(session, socket);
+    session = null;
   });
 });
 

@@ -13,6 +13,7 @@ const tempDirectories: string[] = [];
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   for (const directory of tempDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
@@ -61,6 +62,36 @@ describe('pasted product parsing', () => {
     expect(parsed.warnings).not.toContain('未识别到明确商品名称，请保存前确认。');
     expect(parsed.warnings).not.toContain('未识别到价格，请保存前补充。');
   });
+
+  it('keeps missing Doubao stock as unknown instead of converting it to zero', async () => {
+    vi.stubEnv('DOUBAO_API_KEY', 'test-key');
+    vi.stubEnv('DOUBAO_ENDPOINT_ID', 'test-endpoint');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ name: '同名水杯', price: '¥59', sku: 'CUP-A' }) } }] }), { status: 200 })));
+
+    const parsed = await parseProductText('同名水杯，直播价 59 元');
+
+    expect(parsed.product.stock).toBeNull();
+    expect(parsed.warnings).toContain('豆包未识别到库存，库存暂按待确认处理。');
+  });
+
+  it('creates different product ids for the same name with different SKUs', async () => {
+    vi.stubEnv('DOUBAO_API_KEY', '');
+    vi.stubEnv('DOUBAO_ENDPOINT_ID', '');
+    const first = await parseProductText('商品：同名水杯\nSKU：CUP-A\n价格：59\n库存：10');
+    const second = await parseProductText('商品：同名水杯\nSKU：CUP-B\n价格：69\n库存：20');
+
+    expect(first.product.id).not.toBe(second.product.id);
+  });
+
+  it('rejects oversized pasted content before sending it to Doubao', async () => {
+    vi.stubEnv('DOUBAO_API_KEY', 'test-key');
+    vi.stubEnv('DOUBAO_ENDPOINT_ID', 'test-endpoint');
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(parseProductText('商品：' + '字'.repeat(20_001))).rejects.toThrow('商品信息不能超过 20000 个字符');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('collaborative compliance rules', () => {
@@ -91,6 +122,16 @@ describe('collaborative compliance rules', () => {
     expect(rolledBack.pattern).toBe('行业第一');
     expect(rules.audits(sourceRoom.id).map((audit) => audit.action)).toEqual(expect.arrayContaining(['created', 'approved', 'edited', 'rolled_back']));
   });
+
+  it('rejects regular expressions that can cause catastrophic backtracking', () => {
+    const { catalog, directory } = createCatalog();
+    const rules = new FileRuleCatalog(catalog, path.join(directory, 'rules.json'));
+
+    expect(() => rules.create('room-default', 'owner', {
+      name: '危险正则', scope: 'room', matchType: 'regex', pattern: '(a+)+$', risk: 'warning',
+      title: '风险提示', reason: '测试', alternative: '替代表达', policyRef: '内部规则',
+    })).toThrow('正则表达式存在性能风险');
+  });
 });
 
 describe('transcript correction', () => {
@@ -102,21 +143,27 @@ describe('transcript correction', () => {
       title: '命中内部处罚词', reason: '该词来自内部处罚案例。', alternative: '可以改为：根据页面信息介绍商品特点。', policyRef: '内部案例库',
     });
     const timelineStore = new FileTimelineStore(path.join(directory, 'timeline'));
-    const session = new LiveSession('live-correction-test', { timelineStore, productCatalog: catalog, ruleCatalog: rules, roomId: 'room-default', actorId: 'staff-a' });
+    let now = 1_000;
+    const session = new LiveSession('live-correction-test', { timelineStore, productCatalog: catalog, ruleCatalog: rules, roomId: 'room-default', actorId: 'staff-a', now: () => now });
     session.ingestTranscript('这是普通商品介绍');
     const segmentId = session.state.transcriptHistory[0].id;
+    now = 2_000;
+    session.ingestTranscript('这是稍后说的第二句话');
 
+    now = 3_000;
     session.correctTranscript(segmentId, '这里包含一个神奇词', 'staff-b');
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(session.state.transcriptHistory[0].text).toBe('这里包含一个神奇词');
     expect(session.state.latestCompliance).toMatchObject({ risk: 'blocked', source: 'custom-rule', title: '命中内部处罚词' });
-    expect(session.state.stats).toMatchObject({ safeCount: 0, blockedCount: 1 });
+    expect(session.state.stats).toMatchObject({ safeCount: 1, blockedCount: 1 });
     expect(timelineStore.exportSession(session.id)?.events.find((event) => event.type === 'transcript.corrected')?.payload).toMatchObject({
       segmentId,
       originalText: '这是普通商品介绍',
       correctedText: '这里包含一个神奇词',
       actorId: 'staff-b',
     });
+    const restored = new LiveSession(session.id, { timelineStore, productCatalog: catalog, ruleCatalog: rules, roomId: 'room-default', actorId: 'staff-a', now: () => 4_000 });
+    expect(restored.state.transcriptHistory.map((segment) => segment.text)).toEqual(['这里包含一个神奇词', '这是稍后说的第二句话']);
   });
 });

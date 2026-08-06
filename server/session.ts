@@ -45,7 +45,7 @@ export class LiveSession {
   private currentCaptureSampleOffset = 0;
   private stateValue: SessionState;
 
-  constructor(id = `live-${randomUUID().slice(0, 8)}`, options: LiveSessionOptions = {}) {
+  constructor(id = `live-${randomUUID().replaceAll('-', '').slice(0, 24)}`, options: LiveSessionOptions = {}) {
     this.id = id;
     this.timelineStore = options.timelineStore;
     this.productCatalog = options.productCatalog;
@@ -73,6 +73,8 @@ export class LiveSession {
     };
     if (persistedTiming.createdAt === null) {
       this.recordTimeline('session.created', this.createdAt, null, initialProduct.id, { roomId: this.roomId, actorId: this.actorId, product: initialProduct, lineupProductIds: lineup.map((product) => product.id) });
+    } else {
+      this.restorePersistedState();
     }
   }
 
@@ -248,7 +250,8 @@ export class LiveSession {
     const index = this.stateValue.transcriptHistory.findIndex((segment) => segment.id === segmentId && segment.isFinal);
     if (index < 0) return;
     const original = this.stateValue.transcriptHistory[index];
-    const corrected = { ...original, text, timestamp: this.now() };
+    const correctedAt = this.now();
+    const corrected = { ...original, text };
     this.segmentRevisions.set(segmentId, (this.segmentRevisions.get(segmentId) ?? 0) + 1);
     const history = [...this.stateValue.transcriptHistory];
     history[index] = corrected;
@@ -262,8 +265,8 @@ export class LiveSession {
     }
     this.stateValue.alerts = this.stateValue.alerts.filter((alert) => alert.segmentId !== segmentId);
     if (this.stateValue.latestCompliance?.segmentId === segmentId) this.stateValue.latestCompliance = null;
-    this.stateValue.lastEventAt = corrected.timestamp;
-    this.recordTimeline('transcript.corrected', corrected.timestamp, corrected.endOffsetMs, this.stateValue.product.id, {
+    this.stateValue.lastEventAt = correctedAt;
+    this.recordTimeline('transcript.corrected', correctedAt, corrected.endOffsetMs, this.stateValue.product.id, {
       segmentId,
       originalText: original.text,
       correctedText: text,
@@ -305,6 +308,83 @@ export class LiveSession {
     });
     this.broadcast({ type: 'compliance.result', result });
     this.broadcast({ type: 'state.snapshot', state: this.state });
+  }
+
+  private restorePersistedState(): void {
+    const timeline = this.timelineStore?.exportSession(this.id);
+    if (!timeline) return;
+    const transcripts = new Map<string, TranscriptSegment>();
+    const results = new Map<string, ComplianceResult>();
+    let selectedProductId = this.stateValue.product.id;
+    let maximumOffsetMs = 0;
+
+    for (const event of timeline.events) {
+      maximumOffsetMs = Math.max(maximumOffsetMs, event.offsetMs ?? 0);
+      this.stateValue.lastEventAt = Math.max(this.stateValue.lastEventAt, event.occurredAt);
+      if (event.type === 'product.selected' && event.productId) selectedProductId = event.productId;
+      if (event.type === 'transcript.final') {
+        const segmentId = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
+        const text = typeof event.payload.text === 'string' ? event.payload.text : '';
+        if (!segmentId || !text) continue;
+        transcripts.set(segmentId, {
+          id: segmentId,
+          text,
+          isFinal: true,
+          timestamp: event.occurredAt,
+          offsetMs: event.offsetMs,
+          startOffsetMs: typeof event.payload.startOffsetMs === 'number' ? event.payload.startOffsetMs : null,
+          endOffsetMs: typeof event.payload.endOffsetMs === 'number' ? event.payload.endOffsetMs : event.offsetMs,
+        });
+        const match = /^segment-(\d+)$/u.exec(segmentId);
+        if (match) this.segmentNumber = Math.max(this.segmentNumber, Number(match[1]) + 1);
+      }
+      if (event.type === 'transcript.corrected') {
+        const segmentId = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
+        const correctedText = typeof event.payload.correctedText === 'string' ? event.payload.correctedText : '';
+        const existing = transcripts.get(segmentId);
+        if (existing && correctedText) {
+          transcripts.set(segmentId, { ...existing, text: correctedText });
+          results.delete(segmentId);
+        }
+      }
+      if (event.type === 'compliance.result') {
+        const segmentId = typeof event.payload.transcriptSegmentId === 'string' ? event.payload.transcriptSegmentId : '';
+        const segment = transcripts.get(segmentId);
+        const risk = event.payload.risk === 'blocked' || event.payload.risk === 'warning' ? event.payload.risk : 'safe';
+        const source = event.payload.source === 'doubao' || event.payload.source === 'custom-rule' ? event.payload.source : 'local-fallback';
+        if (!segmentId || !segment) continue;
+        results.set(segmentId, {
+          id: `restored-${event.id}`,
+          segmentId,
+          productId: event.productId ?? this.stateValue.product.id,
+          risk,
+          title: typeof event.payload.title === 'string' ? event.payload.title : '历史合规结果',
+          reason: typeof event.payload.reason === 'string' ? event.payload.reason : '',
+          alternative: typeof event.payload.alternative === 'string' ? event.payload.alternative : '',
+          policyRef: typeof event.payload.policyRef === 'string' ? event.payload.policyRef : '',
+          confidence: typeof event.payload.confidence === 'number' ? event.payload.confidence : 0,
+          source,
+          transcript: segment.text,
+          createdAt: event.occurredAt,
+        });
+      }
+    }
+
+    const allTranscripts = [...transcripts.values()].sort((first, second) => first.timestamp - second.timestamp);
+    const allResults = [...results.values()].sort((first, second) => first.createdAt - second.createdAt);
+    this.stateValue.product = this.stateValue.lineup.find((product) => product.id === selectedProductId) ?? this.stateValue.product;
+    this.stateValue.transcriptHistory = allTranscripts.slice(-20);
+    this.stateValue.latestCompliance = allResults.at(-1) ?? null;
+    this.stateValue.alerts = allResults.filter((result) => result.risk !== 'safe').reverse().slice(0, 12);
+    this.stateValue.stats = {
+      speakingSeconds: Math.round(maximumOffsetMs / 1_000),
+      words: allTranscripts.reduce((total, segment) => total + segment.text.replace(/\s/g, '').length, 0),
+      blockedCount: allResults.filter((result) => result.risk === 'blocked').length,
+      warningCount: allResults.filter((result) => result.risk === 'warning').length,
+      safeCount: allResults.filter((result) => result.risk === 'safe').length,
+    };
+    for (const segment of allTranscripts) this.segmentRevisions.set(segment.id, 0);
+    for (const [segmentId, result] of results) this.complianceBySegment.set(segmentId, result);
   }
 
   private status(message: string, tone: 'neutral' | 'success' | 'warning' | 'error'): void {

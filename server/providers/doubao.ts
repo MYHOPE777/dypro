@@ -1,8 +1,9 @@
 import type { ComplianceAnalyzer, AnalysisInput } from '../../src/compliance/engine';
-import { analyzeTranscript, evaluateCustomRules } from '../../src/compliance/engine';
+import { analyzeTranscript } from '../../src/compliance/engine';
 import type { ComplianceResult } from '../../src/shared/types';
 
 type DoubaoConfig = { apiKey: string; endpointId: string; baseUrl: string };
+const severity = { safe: 0, warning: 1, blocked: 2 } as const;
 
 function getConfig(env: NodeJS.ProcessEnv = process.env): DoubaoConfig | null {
   if (!env.DOUBAO_API_KEY || !env.DOUBAO_ENDPOINT_ID) return null;
@@ -52,9 +53,8 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
   }
 
   async analyze(input: AnalysisInput): Promise<ComplianceResult> {
-    const customResult = evaluateCustomRules(input);
-    if (customResult) return customResult;
-    if (!this.config) return analyzeTranscript(input);
+    const localResult = await analyzeTranscript(input);
+    if (!this.config) return localResult;
     try {
       const response = await fetch(this.config.baseUrl, {
         method: 'POST',
@@ -76,12 +76,12 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
       const body = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
       const content = body.choices?.[0]?.message?.content;
       if (!content) throw new Error('豆包返回为空');
-      return fromDoubao(input, parseJson(content));
+      const doubaoResult = fromDoubao(input, parseJson(content));
+      return severity[doubaoResult.risk] >= severity[localResult.risk] ? doubaoResult : localResult;
     } catch (error) {
-      const fallback = await analyzeTranscript(input);
       return {
-        ...fallback,
-        reason: `${fallback.reason} 豆包暂时不可用，已切换本地规则兜底。`,
+        ...localResult,
+        reason: `${localResult.reason} 豆包暂时不可用，已切换本地规则兜底。`,
       };
     }
   }

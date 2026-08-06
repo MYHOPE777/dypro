@@ -22,6 +22,7 @@ export interface TimelineWriter {
   getAudioByteLength(sessionId: string): number;
   appendSourceAudio(sessionId: string, audio: Buffer, sampleRate: number): void;
   getSessionTiming(sessionId: string): { createdAt: number | null; recordingStartedAt: number | null };
+  exportSession(sessionId: string): SessionTimelineExport | null;
 }
 
 function assertSessionId(sessionId: string): void {
