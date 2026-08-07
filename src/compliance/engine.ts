@@ -2,6 +2,7 @@ import safeRegex from 'safe-regex2';
 import type { ComplianceResult, ComplianceRule, Product, RiskLevel } from '../shared/types';
 
 export type AnalysisInput = {
+  roomId?: string;
   productId: string;
   transcript: string;
   product?: Pick<Product, 'id' | 'name' | 'category' | 'price' | 'compliantPhrases'>;

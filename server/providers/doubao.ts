@@ -1,6 +1,7 @@
 import type { ComplianceAnalyzer, AnalysisInput } from '../../src/compliance/engine';
 import { analyzeTranscript } from '../../src/compliance/engine';
-import type { ComplianceResult } from '../../src/shared/types';
+import type { ComplianceResult, KnowledgeEvidence } from '../../src/shared/types';
+import { createKnowledgeBase, type ComplianceKnowledgeBase } from '../knowledgeBase';
 
 type DoubaoConfig = { apiKey: string; endpointId: string; baseUrl: string };
 const severity = { safe: 0, warning: 1, blocked: 2 } as const;
@@ -26,7 +27,7 @@ function parseJson(content: string): Record<string, unknown> {
   return JSON.parse(normalized.slice(start, end + 1)) as Record<string, unknown>;
 }
 
-function fromDoubao(input: AnalysisInput, payload: Record<string, unknown>): ComplianceResult {
+function fromDoubao(input: AnalysisInput, payload: Record<string, unknown>, knowledgeEvidence: KnowledgeEvidence[]): ComplianceResult {
   const risk = payload.risk === 'blocked' || payload.risk === 'warning' ? payload.risk : 'safe';
   const text = (value: unknown, fallback: string) => (typeof value === 'string' && value.trim() ? value.trim() : fallback);
   const confidence = typeof payload.confidence === 'number' ? Math.max(0, Math.min(1, payload.confidence)) : 0.85;
@@ -42,20 +43,29 @@ function fromDoubao(input: AnalysisInput, payload: Record<string, unknown>): Com
     source: 'doubao',
     transcript: input.transcript,
     createdAt: Date.now(),
+    ...(knowledgeEvidence.length > 0 ? { knowledgeEvidence } : {}),
   };
 }
 
 export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
   private readonly config: DoubaoConfig | null;
+  private readonly knowledgeBase: ComplianceKnowledgeBase;
 
-  constructor(env: NodeJS.ProcessEnv = process.env) {
+  constructor(env: NodeJS.ProcessEnv = process.env, knowledgeBase: ComplianceKnowledgeBase = createKnowledgeBase(env)) {
     this.config = getConfig(env);
+    this.knowledgeBase = knowledgeBase;
   }
 
   async analyze(input: AnalysisInput): Promise<ComplianceResult> {
     const localResult = await analyzeTranscript(input);
     if (!this.config) return localResult;
     try {
+      const knowledgeEvidence = await this.knowledgeBase.retrieve({
+        roomId: input.roomId ?? 'room-default',
+        transcript: input.transcript,
+        product: input.product ?? { id: input.productId, name: input.productId, category: '其他', price: '价格待确认', compliantPhrases: [] },
+        activeRules: input.customRules ?? [],
+      });
       const response = await fetch(this.config.baseUrl, {
         method: 'POST',
         headers: {
@@ -68,7 +78,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
           max_tokens: 500,
           messages: [
             { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: `当前商品：${JSON.stringify(input.product ?? { id: input.productId })}\n主播原话：${input.transcript}` },
+            { role: 'user', content: `当前商品：${JSON.stringify(input.product ?? { id: input.productId })}\n主播原话：${input.transcript}\n\n方舟知识库召回证据（仅作核验参考，规则库事实优先）：${JSON.stringify(knowledgeEvidence)}` },
           ],
         }),
       });
@@ -76,7 +86,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
       const body = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
       const content = body.choices?.[0]?.message?.content;
       if (!content) throw new Error('豆包返回为空');
-      const doubaoResult = fromDoubao(input, parseJson(content));
+      const doubaoResult = fromDoubao(input, parseJson(content), knowledgeEvidence);
       return severity[doubaoResult.risk] >= severity[localResult.risk] ? doubaoResult : localResult;
     } catch (error) {
       return {

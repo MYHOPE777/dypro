@@ -35,10 +35,17 @@ type AuthIdentity = { actorId: string; displayName: string; role: 'operator' | '
 type OperatorAccess = AuthIdentity & { token: string; mode: 'multi-user' | 'local-only' };
 type Readiness = {
   readyForLive: boolean;
+  readyForProduction: boolean;
+  mode: 'production' | 'live-with-local-persistence' | 'demo';
   speech: { configured: boolean; label: string };
   doubao: { configured: boolean; label: string };
   auth: { configured: boolean; label: string };
   storage: { configured: boolean; label: string };
+  database: { configured: boolean; label: string };
+  objectStorage: { configured: boolean; label: string; status?: { pending: number; failed: number } };
+  redis: { configured: boolean; label: string };
+  knowledge: { configured: boolean; available: boolean; label: string; detail: string; lastError?: string };
+  knowledgeSync: { configured: boolean; available: boolean; label: string; detail: string; pending: number; failed: number; succeeded: number; lastSyncedAt: number | null };
 };
 
 function storedActorId(): string {
@@ -538,7 +545,7 @@ function CompliancePanel({ result }: { result: ComplianceResult | null }) {
   const resolved = result ?? { risk: 'safe' as const, title: '等待下一句', reason: '系统会在每个转录片段完成后即时分析。', policyRef: '豆包大模型 · 抖音直播规则', confidence: 0 };
   return <section className={`compliance-panel ${resolved.risk}`}>
     <div className="compliance-top"><div className="risk-pill"><RiskIcon risk={resolved.risk} /><span><RiskLabel risk={resolved.risk} /></span></div><span className="confidence">{resolved.confidence ? `${Math.round(resolved.confidence * 100)}% 置信` : '实时监测'}</span></div>
-    <h3>{resolved.title}</h3><p>{resolved.reason}</p><div className="policy-ref"><ShieldCheck size={14} />{resolved.policyRef}</div>
+    <h3>{resolved.title}</h3><p>{resolved.reason}</p><div className="policy-ref"><ShieldCheck size={14} />{resolved.policyRef}{result?.knowledgeEvidence?.length ? <span> · 知识库 {result.knowledgeEvidence.length} 条证据</span> : null}</div>
   </section>;
 }
 
@@ -558,10 +565,11 @@ function SessionStats({ state }: { state: SessionState }) {
 
 function ReadinessStrip({ readiness }: { readiness: Readiness | null }) {
   if (!readiness) return null;
-  const items = [readiness.speech, readiness.doubao, readiness.auth, readiness.storage];
+  const items = [readiness.speech, readiness.doubao, readiness.auth, readiness.database, readiness.objectStorage, readiness.redis, readiness.knowledge, readiness.knowledgeSync];
+  const headline = readiness.readyForProduction ? '生产依赖已就绪' : readiness.readyForLive ? '实时链路已就绪，本地持久化' : '当前为演示模式';
   return <section className={`readiness-strip ${readiness.readyForLive ? 'ready' : 'attention'}`} aria-label="开播检查">
-    <div className="readiness-title"><Activity size={14} /><span>开播检查</span><strong>{readiness.readyForLive ? '配置齐全，开播时连接验证' : '当前为演示模式'}</strong></div>
-    <div className="readiness-items">{items.map((item) => <span className={item.configured ? 'ok' : 'pending'} key={item.label}><i />{item.label}</span>)}</div>
+    <div className="readiness-title"><Activity size={14} /><span>开播检查</span><strong>{headline}</strong><small>{readiness.mode === 'production' ? 'Production' : readiness.mode === 'live-with-local-persistence' ? 'Live + local fallback' : 'Demo'}</small></div>
+    <div className="readiness-items">{items.map((item) => <span className={item.configured && ('available' in item ? item.available : true) ? 'ok' : 'pending'} key={item.label} title={item.label}><i />{item.label}</span>)}</div>
   </section>;
 }
 

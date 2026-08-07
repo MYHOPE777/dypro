@@ -2,6 +2,8 @@ export type RiskLevel = 'safe' | 'warning' | 'blocked';
 
 export type LiveRoom = {
   id: string;
+  /** Optional for backward-compatible local catalogs; production rooms always carry a tenant. */
+  tenantId?: string;
   name: string;
   accountName: string;
   platform: 'douyin';
@@ -98,6 +100,16 @@ export type ComplianceResult = {
   source: 'doubao' | 'local-fallback' | 'custom-rule';
   transcript: string;
   createdAt: number;
+  knowledgeEvidence?: KnowledgeEvidence[];
+};
+
+export type KnowledgeEvidence = {
+  id: string;
+  title: string;
+  content: string;
+  source: string;
+  score: number;
+  metadata?: Record<string, unknown>;
 };
 
 export type SessionStats = {

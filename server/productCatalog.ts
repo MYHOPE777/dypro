@@ -14,7 +14,7 @@ type CatalogFile = {
 export interface ProductCatalog {
   listRooms(): LiveRoom[];
   getRoom(roomId: string): LiveRoom | null;
-  createRoom(input: { name: string; accountName: string; ownerActorId: string }): LiveRoom;
+  createRoom(input: { name: string; accountName: string; ownerActorId: string; tenantId?: string }): LiveRoom;
   list(roomId: string): Product[];
   getById(roomId: string, productId: string): Product | null;
   getLineup(sessionId: string, roomId: string): Product[];
@@ -88,10 +88,11 @@ function makeRoomId(name: string): string {
   return `room-${createHash('sha1').update(`${name}-${Date.now()}`).digest('hex').slice(0, 12)}`;
 }
 
-function defaultCatalog(): CatalogFile {
+function defaultCatalog(tenantId = process.env.TENANT_ID ?? 'tenant-default'): CatalogFile {
   const now = Date.now();
   const room: LiveRoom = {
     id: 'room-default',
+    tenantId,
     name: '默认抖音直播间',
     accountName: '演示账号',
     platform: 'douyin',
@@ -105,9 +106,11 @@ function defaultCatalog(): CatalogFile {
 export class FileProductCatalog implements ProductCatalog {
   private readonly filePath: string;
   private data: CatalogFile;
+  private readonly tenantId: string;
 
-  constructor(filePath = path.resolve(process.cwd(), '.data/products/catalog.json')) {
+  constructor(filePath = path.resolve(process.cwd(), '.data/products/catalog.json'), tenantId = process.env.TENANT_ID ?? 'tenant-default') {
     this.filePath = filePath;
+    this.tenantId = tenantId;
     this.data = this.readCatalog();
   }
 
@@ -120,13 +123,14 @@ export class FileProductCatalog implements ProductCatalog {
     return clone(this.data.rooms.find((room) => room.id === roomId) ?? null);
   }
 
-  createRoom(input: { name: string; accountName: string; ownerActorId: string }): LiveRoom {
+  createRoom(input: { name: string; accountName: string; ownerActorId: string; tenantId?: string }): LiveRoom {
     const name = input.name.trim();
     const accountName = input.accountName.trim();
     const ownerActorId = input.ownerActorId.trim();
     if (!name || !accountName || !ownerActorId) throw new Error('直播间名称、账号名称和创建人不能为空');
     const now = Date.now();
-    const room: LiveRoom = { id: makeRoomId(name), name, accountName, platform: 'douyin', ownerActorId, createdAt: now, updatedAt: now };
+    const tenantId = input.tenantId?.trim() || this.tenantId;
+    const room: LiveRoom = { id: makeRoomId(name), tenantId, name, accountName, platform: 'douyin', ownerActorId, createdAt: now, updatedAt: now };
     this.data.rooms.push(room);
     this.data.products[room.id] = [];
     this.writeCatalog();
@@ -192,14 +196,14 @@ export class FileProductCatalog implements ProductCatalog {
   }
 
   private readCatalog(): CatalogFile {
-    if (!existsSync(this.filePath)) return defaultCatalog();
+    if (!existsSync(this.filePath)) return defaultCatalog(this.tenantId);
     try {
       const parsed: unknown = JSON.parse(readFileSync(this.filePath, 'utf8'));
-      if (isCatalogFile(parsed)) return clone(parsed);
+      if (isCatalogFile(parsed)) return { ...clone(parsed), rooms: parsed.rooms.map((room) => ({ ...room, tenantId: room.tenantId ?? this.tenantId })) };
     } catch {
       // Fall back to the built-in room when the local catalog is incomplete.
     }
-    return defaultCatalog();
+    return defaultCatalog(this.tenantId);
   }
 
   private writeCatalog(): void {

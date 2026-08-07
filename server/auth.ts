@@ -8,6 +8,8 @@ export type AuthIdentity = {
   displayName: string;
   role: AuthRole;
   roomIds: string[];
+  tenantId?: string;
+  tenantIds?: string[];
 };
 
 type AuthUser = AuthIdentity & { passwordHash: string };
@@ -40,7 +42,23 @@ function parseRoomIds(value: unknown): string[] {
   return [...new Set(value)];
 }
 
-export function canAccessRoom(identity: AuthIdentity, room: { id: string; ownerActorId: string }): boolean {
+function parseTenantId(value: unknown): string | undefined {
+  if (value === undefined || value === '') return undefined;
+  if (typeof value !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,63}$/u.test(value)) throw new Error('认证账号的 tenantId 格式无效');
+  return value;
+}
+
+function parseTenantIds(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new Error('认证账号的 tenantIds 必须是数组');
+  const tenantIds = value.map(parseTenantId).filter((tenantId): tenantId is string => Boolean(tenantId));
+  if (tenantIds.length === 0) throw new Error('认证账号的 tenantIds 不能为空');
+  return [...new Set(tenantIds)];
+}
+
+export function canAccessRoom(identity: AuthIdentity, room: { id: string; ownerActorId: string; tenantId?: string }): boolean {
+  if (room.tenantId && identity.tenantId && room.tenantId !== identity.tenantId) return false;
+  if (room.tenantId && identity.tenantIds && !identity.tenantIds.includes(room.tenantId)) return false;
   return identity.role === 'reviewer' || room.ownerActorId === identity.actorId || identity.roomIds.includes(room.id);
 }
 
@@ -88,9 +106,11 @@ function parseUsers(raw: string | undefined): AuthUser[] {
     const displayName = typeof user.displayName === 'string' ? user.displayName.trim() : '';
     const passwordHash = typeof user.passwordHash === 'string' ? user.passwordHash : '';
     const roomIds = parseRoomIds(user.roomIds);
+    const tenantId = parseTenantId(user.tenantId);
+    const tenantIds = parseTenantIds(user.tenantIds);
     const role: AuthRole | null = user.role === 'reviewer' ? 'reviewer' : user.role === 'operator' ? 'operator' : null;
     if (actorId !== user.actorId || !displayName || !isPasswordHash(passwordHash) || !role) throw new Error('认证账号需要合法 actorId、名称、scrypt passwordHash 和角色');
-    return { actorId, displayName, passwordHash, role, roomIds };
+    return { actorId, displayName, passwordHash, role, roomIds, ...(tenantId ? { tenantId } : {}), ...(tenantIds ? { tenantIds } : {}) };
   });
   if (new Set(users.map((user) => user.actorId)).size !== users.length) throw new Error('AUTH_USERS_JSON 存在重复 actorId');
   return users;
@@ -123,7 +143,7 @@ export class AuthService {
     if (!this.configured) throw new Error('当前为本机控制模式，无需登录');
     const user = this.users.get(actorId);
     if (!user || !verifyPassword(password, user.passwordHash)) throw new Error('账号或密码不正确');
-    const identity: AuthIdentity = { actorId: user.actorId, displayName: user.displayName, role: user.role, roomIds: user.roomIds };
+    const identity: AuthIdentity = { actorId: user.actorId, displayName: user.displayName, role: user.role, roomIds: user.roomIds, ...(user.tenantId ? { tenantId: user.tenantId } : {}), ...(user.tenantIds ? { tenantIds: user.tenantIds } : {}) };
     return { identity, token: this.sign({ ...identity, expiresAt: this.now() + this.tokenTtlMs }) };
   }
 
@@ -156,7 +176,7 @@ export class AuthService {
       throw new Error('登录凭证无效');
     }
     const user = this.users.get(payload.actorId);
-    if (!user || payload.expiresAt <= this.now() || payload.role !== user.role || payload.displayName !== user.displayName || JSON.stringify(payload.roomIds) !== JSON.stringify(user.roomIds)) throw new Error('登录已过期，请重新登录');
-    return { actorId: user.actorId, displayName: user.displayName, role: user.role, roomIds: user.roomIds };
+    if (!user || payload.expiresAt <= this.now() || payload.role !== user.role || payload.displayName !== user.displayName || JSON.stringify(payload.roomIds) !== JSON.stringify(user.roomIds) || payload.tenantId !== user.tenantId || JSON.stringify(payload.tenantIds) !== JSON.stringify(user.tenantIds)) throw new Error('登录已过期，请重新登录');
+    return { actorId: user.actorId, displayName: user.displayName, role: user.role, roomIds: user.roomIds, ...(user.tenantId ? { tenantId: user.tenantId } : {}), ...(user.tenantIds ? { tenantIds: user.tenantIds } : {}) };
   }
 }

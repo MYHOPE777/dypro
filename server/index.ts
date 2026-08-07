@@ -15,6 +15,9 @@ import { parseProductText } from './productParser';
 import { AuthService, allowsControlTransport, canAccessRoom, type AuthIdentity } from './auth';
 import { readSessionIdleTtlMs } from './config';
 import { canDisplayJoin, CaptureLease } from './sessionAccess';
+import { createKnowledgeBase } from './knowledgeBase';
+import { FileKnowledgeSyncQueue } from './knowledgeSync';
+import { createRecordingArchiveQueue } from './recordingArchive';
 import type { ClientMessage, ComplianceRuleScope, RiskLevel, Product } from '../src/shared/types';
 
 const app = express();
@@ -34,6 +37,13 @@ const sessionExpiryTimers = new Map<string, NodeJS.Timeout>();
 const captureLeases = new CaptureLease<WebSocket>();
 const sessionIdleTtlMs = readSessionIdleTtlMs(process.env);
 const allowInsecureAuth = process.env.ALLOW_INSECURE_AUTH === 'true';
+const knowledgeBase = createKnowledgeBase();
+const knowledgeSyncQueue = new FileKnowledgeSyncQueue(knowledgeBase, process.env.KNOWLEDGE_SYNC_PATH ?? path.resolve(projectRoot, '../.data/knowledge/sync.json'));
+const knowledgeSyncTimer = setInterval(() => { void knowledgeSyncQueue.flush(); }, 5_000);
+knowledgeSyncTimer.unref();
+const recordingArchiveQueue = createRecordingArchiveQueue(timelineStore);
+const recordingArchiveTimer = setInterval(() => { void recordingArchiveQueue.flush(); }, 10_000);
+recordingArchiveTimer.unref();
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -48,7 +58,7 @@ function getOrCreateSession(id?: string, roomId = 'room-default', actorId = 'own
     const existing = sessions.get(safeId)!;
     if (existing.roomId === roomId) return existing;
   }
-  const session = new LiveSession(safeId && !sessions.has(safeId) ? safeId : undefined, { timelineStore, productCatalog, ruleCatalog, roomId, actorId });
+  const session = new LiveSession(safeId && !sessions.has(safeId) ? safeId : undefined, { timelineStore, productCatalog, ruleCatalog, archiveQueue: recordingArchiveQueue, roomId, actorId });
   sessions.set(session.id, session);
   return session;
 }
@@ -244,14 +254,36 @@ app.post('/api/auth/login', (request, response) => {
 app.get('/api/readiness', (_request, response) => {
   const volcConfigured = Boolean(process.env.VOLC_SPEECH_APP_KEY && process.env.VOLC_SPEECH_ACCESS_KEY);
   const doubaoConfigured = Boolean(process.env.DOUBAO_API_KEY && process.env.DOUBAO_ENDPOINT_ID);
+  const databaseConfigured = Boolean(process.env.DATABASE_URL);
+  const archiveStatus = recordingArchiveQueue.status();
+  const objectStorageConfigured = archiveStatus.configured;
+  const redisConfigured = Boolean(process.env.REDIS_URL);
+  const knowledge = knowledgeBase.status();
+  const knowledgeSync = knowledgeSyncQueue.status();
+  const liveConfigured = volcConfigured && doubaoConfigured;
+  const productionConfigured = liveConfigured && authService.configured && databaseConfigured && objectStorageConfigured && redisConfigured && knowledge.configured && knowledgeSync.configured;
   response.json({
-    readyForLive: volcConfigured && doubaoConfigured,
+    readyForLive: liveConfigured,
+    readyForProduction: productionConfigured,
+    mode: productionConfigured ? 'production' : liveConfigured ? 'live-with-local-persistence' : 'demo',
     speech: { configured: volcConfigured, label: volcConfigured ? '火山语音参数已填写' : '火山实时语音待配置' },
     doubao: { configured: doubaoConfigured, label: doubaoConfigured ? '豆包参数已填写' : '豆包合规模型待配置' },
     auth: { configured: authService.configured, label: authService.configured ? '多人身份已保护' : '仅限本机控制' },
-    storage: { configured: false, label: '本地文件存储' },
+    storage: { configured: databaseConfigured && objectStorageConfigured, label: databaseConfigured && objectStorageConfigured ? '数据库 + 对象存储已配置' : '本地文件存储（生产存储待配置）' },
+    database: { configured: databaseConfigured, label: databaseConfigured ? '业务数据库参数已填写' : '业务数据库待配置' },
+    objectStorage: { configured: objectStorageConfigured, label: objectStorageConfigured ? 'TOS 原始音频归档已配置' : 'TOS 原始音频归档待配置', status: archiveStatus },
+    redis: { configured: redisConfigured, label: redisConfigured ? 'Redis 会话协调已配置' : 'Redis 会话协调待配置' },
+    knowledge,
+    knowledgeSync,
   });
 });
+
+function scheduleKnowledgeSync(rule: Parameters<typeof knowledgeSyncQueue.enqueue>[0]): void {
+  knowledgeSyncQueue.enqueue(rule, productCatalog.getRoom(rule.roomId) ?? undefined);
+  void knowledgeSyncQueue.flush();
+}
+
+app.get('/api/knowledge/status', requireOperator, (_request, response) => response.json({ knowledge: knowledgeBase.status(), sync: knowledgeSyncQueue.status() }));
 
 function isProductPayload(value: unknown): value is Product {
   if (!value || typeof value !== 'object') return false;
@@ -338,7 +370,9 @@ app.post('/api/rooms/:roomId/rules', requireOperator, requireRoomAccess, (reques
   const input = readRuleInput(request.body);
   if (!input) return response.status(400).json({ message: '规则资料格式不完整' });
   try {
-    return response.status(201).json(ruleCatalog.create(routeParam(request, 'roomId'), actorFromRequest(request), input));
+    const rule = ruleCatalog.create(routeParam(request, 'roomId'), actorFromRequest(request), input);
+    scheduleKnowledgeSync(rule);
+    return response.status(201).json(rule);
   } catch (error) {
     return response.status(400).json({ message: error instanceof Error ? error.message : '规则保存失败' });
   }
@@ -348,11 +382,19 @@ app.get('/api/rules/:ruleId/versions', requireOperator, requireRuleAccess, (requ
 app.patch('/api/rules/:ruleId', requireOperator, requireRuleAccess, (request, response) => {
   const input = readRuleInput(request.body);
   if (!input) return response.status(400).json({ message: '规则资料格式不完整' });
-  try { return response.json(ruleCatalog.update(routeParam(request, 'ruleId'), actorFromRequest(request), input)); }
+  try {
+    const rule = ruleCatalog.update(routeParam(request, 'ruleId'), actorFromRequest(request), input);
+    scheduleKnowledgeSync(rule);
+    return response.json(rule);
+  }
   catch (error) { return response.status(403).json({ message: error instanceof Error ? error.message : '规则更新失败' }); }
 });
 app.post('/api/rules/:ruleId/approve', requireOperator, requireRuleAccess, (request, response) => {
-  try { return response.json(ruleCatalog.approve(routeParam(request, 'ruleId'), actorFromRequest(request))); }
+  try {
+    const rule = ruleCatalog.approve(routeParam(request, 'ruleId'), actorFromRequest(request));
+    scheduleKnowledgeSync(rule);
+    return response.json(rule);
+  }
   catch (error) { return response.status(403).json({ message: error instanceof Error ? error.message : '规则审核失败' }); }
 });
 app.post('/api/rules/:ruleId/reject', requireOperator, requireRuleAccess, (request, response) => {
@@ -362,8 +404,23 @@ app.post('/api/rules/:ruleId/reject', requireOperator, requireRuleAccess, (reque
 app.post('/api/rules/:ruleId/rollback', requireOperator, requireRuleAccess, (request, response) => {
   const targetVersion = Number(request.body?.targetVersion);
   if (!Number.isSafeInteger(targetVersion) || targetVersion < 1) return response.status(400).json({ message: '目标版本无效' });
-  try { return response.json(ruleCatalog.rollback(routeParam(request, 'ruleId'), targetVersion, actorFromRequest(request))); }
+  try {
+    const rule = ruleCatalog.rollback(routeParam(request, 'ruleId'), targetVersion, actorFromRequest(request));
+    scheduleKnowledgeSync(rule);
+    return response.json(rule);
+  }
   catch (error) { return response.status(403).json({ message: error instanceof Error ? error.message : '规则回滚失败' }); }
+});
+
+app.post('/api/rules/:ruleId/enabled', requireOperator, requireRuleAccess, (request, response) => {
+  if (typeof request.body?.enabled !== 'boolean') return response.status(400).json({ message: 'enabled 必须是布尔值' });
+  try {
+    const rule = ruleCatalog.setEnabled(routeParam(request, 'ruleId'), request.body.enabled, actorFromRequest(request));
+    scheduleKnowledgeSync(rule);
+    return response.json(rule);
+  } catch (error) {
+    return response.status(403).json({ message: error instanceof Error ? error.message : '规则启停失败' });
+  }
 });
 
 app.put('/api/session/:id/lineup', requireOperator, (request, response) => {

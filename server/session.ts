@@ -3,6 +3,7 @@ import type WebSocket from 'ws';
 import { createDoubaoAnalyzer } from './services';
 import { createVolcSpeechStream, type VolcSpeechStream } from './providers/volcSpeech';
 import type { TimelineWriter } from './timelineStore';
+import type { RecordingArchiveQueue } from './recordingArchive';
 import type { ProductCatalog } from './productCatalog';
 import type { RuleCatalog } from './ruleCatalog';
 import { DEFAULT_PRODUCT, PRODUCTS } from '../src/shared/products';
@@ -17,7 +18,7 @@ import type {
 
 type Client = { socket: WebSocket; role: 'operator' | 'display' };
 type TranscriptTiming = { startTimeMs?: number; endTimeMs?: number };
-type LiveSessionOptions = { timelineStore?: TimelineWriter; productCatalog?: ProductCatalog; ruleCatalog?: RuleCatalog; roomId?: string; actorId?: string; now?: () => number };
+type LiveSessionOptions = { timelineStore?: TimelineWriter; productCatalog?: ProductCatalog; ruleCatalog?: RuleCatalog; archiveQueue?: RecordingArchiveQueue; roomId?: string; actorId?: string; now?: () => number };
 
 function createStats(): SessionStats {
   return { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 };
@@ -38,6 +39,7 @@ export class LiveSession {
   private readonly timelineStore?: TimelineWriter;
   private readonly productCatalog?: ProductCatalog;
   private readonly ruleCatalog?: RuleCatalog;
+  private readonly archiveQueue?: RecordingArchiveQueue;
   private readonly actorId: string;
   private readonly now: () => number;
   private recordingStartedAt: number | null = null;
@@ -50,6 +52,7 @@ export class LiveSession {
     this.timelineStore = options.timelineStore;
     this.productCatalog = options.productCatalog;
     this.ruleCatalog = options.ruleCatalog;
+    this.archiveQueue = options.archiveQueue;
     this.roomId = options.roomId ?? 'room-default';
     this.actorId = options.actorId ?? 'owner';
     this.now = options.now ?? Date.now;
@@ -176,6 +179,7 @@ export class LiveSession {
     this.recordTimeline('capture.stopped', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, {
       audioSampleOffset: Math.floor((this.timelineStore?.getAudioByteLength(this.id) ?? 0) / 2),
     });
+    this.archiveQueue?.enqueue(this.id);
     this.broadcast({ type: 'state.snapshot', state: this.state });
     this.status('已停止收音', 'neutral');
   }
@@ -287,7 +291,7 @@ export class LiveSession {
   }
 
   private async checkCompliance(transcript: string, generation: number, productId: string, product: Product, segment: TranscriptSegment, revision: number): Promise<void> {
-    const analyzed = await this.analyzer.analyze({ productId, transcript, product, customRules: this.ruleCatalog?.listActive(this.roomId) });
+    const analyzed = await this.analyzer.analyze({ roomId: this.roomId, productId, transcript, product, customRules: this.ruleCatalog?.listActive(this.roomId) });
     if (generation !== this.productGeneration || productId !== this.stateValue.product.id || revision !== this.segmentRevisions.get(segment.id)) return;
     const result = { ...analyzed, segmentId: segment.id };
     this.complianceBySegment.set(segment.id, result);
@@ -305,6 +309,7 @@ export class LiveSession {
       policyRef: result.policyRef,
       confidence: result.confidence,
       source: result.source,
+      knowledgeEvidence: result.knowledgeEvidence ?? [],
     });
     this.broadcast({ type: 'compliance.result', result });
     this.broadcast({ type: 'state.snapshot', state: this.state });
