@@ -28,7 +28,7 @@ export interface ComplianceKnowledgeBase {
 
 export interface KnowledgeBaseIndexer {
   index(document: KnowledgeRuleDocument): Promise<void>;
-  status(): KnowledgeBaseStatus;
+  indexStatus(): KnowledgeBaseStatus;
 }
 
 const EMPTY_STATUS: KnowledgeBaseStatus = {
@@ -45,6 +45,10 @@ export class DisabledKnowledgeBase implements ComplianceKnowledgeBase, Knowledge
 
   status(): KnowledgeBaseStatus {
     return { ...EMPTY_STATUS };
+  }
+
+  indexStatus(): KnowledgeBaseStatus {
+    return { ...EMPTY_STATUS, label: '方舟知识库索引待配置' };
   }
 
   index(): Promise<void> {
@@ -117,8 +121,10 @@ function responseItems(body: unknown): unknown[] {
  */
 export class ArkKnowledgeBase implements ComplianceKnowledgeBase, KnowledgeBaseIndexer {
   private readonly config: ArkGatewayConfig;
-  private lastError: string | undefined;
-  private lastSuccessfulAt: number | undefined;
+  private lastRetrieveError: string | undefined;
+  private lastIndexError: string | undefined;
+  private lastRetrieveAt: number | undefined;
+  private lastIndexAt: number | undefined;
 
   constructor(config: ArkGatewayConfig) {
     this.config = config;
@@ -133,44 +139,62 @@ export class ArkKnowledgeBase implements ComplianceKnowledgeBase, KnowledgeBaseI
         filters: { room_id: query.roomId, product_id: query.product.id },
       });
       const evidence = responseItems(response).map(asEvidence).filter((item): item is KnowledgeEvidence => Boolean(item)).slice(0, 5);
-      this.markSuccess();
+      this.lastRetrieveError = undefined;
+      this.lastRetrieveAt = Date.now();
       return evidence;
     } catch (error) {
-      this.markFailure(error);
+      this.lastRetrieveError = error instanceof Error ? error.message : String(error);
       return [];
     }
   }
 
   async index(document: KnowledgeRuleDocument): Promise<void> {
     if (!this.config.indexUrl) throw new Error('ARK_KB_INDEX_URL 未配置');
-    await this.request(this.config.indexUrl, {
-      collection_id: this.config.collectionId,
-      operation: document.operation,
-      document: {
-        id: document.rule.id,
-        room_id: document.rule.roomId,
-        scope: document.rule.scope,
-        version: document.rule.version,
-        enabled: document.rule.enabled,
-        name: document.rule.name,
-        pattern: document.rule.pattern,
-        risk: document.rule.risk,
-        reason: document.rule.reason,
-        alternative: document.rule.alternative,
-        policy_ref: document.rule.policyRef,
-        room: document.room,
-      },
-    });
-    this.markSuccess();
+    try {
+      await this.request(this.config.indexUrl, {
+        collection_id: this.config.collectionId,
+        operation: document.operation,
+        document: {
+          id: document.rule.id,
+          room_id: document.rule.roomId,
+          scope: document.rule.scope,
+          version: document.rule.version,
+          enabled: document.rule.enabled,
+          name: document.rule.name,
+          pattern: document.rule.pattern,
+          risk: document.rule.risk,
+          reason: document.rule.reason,
+          alternative: document.rule.alternative,
+          policy_ref: document.rule.policyRef,
+          room: document.room,
+        },
+      });
+      this.lastIndexError = undefined;
+      this.lastIndexAt = Date.now();
+    } catch (error) {
+      this.lastIndexError = error instanceof Error ? error.message : String(error);
+      throw error;
+    }
   }
 
   status(): KnowledgeBaseStatus {
     return {
       configured: true,
-      available: !this.lastError,
-      label: this.lastError ? '方舟知识库连接异常，已降级' : '方舟知识库已配置，首句时验证',
-      detail: this.lastSuccessfulAt ? `最近成功 ${new Date(this.lastSuccessfulAt).toLocaleString('zh-CN', { hour12: false })}` : '检索和索引均通过显式地址接入，不影响规则库事实源。',
-      ...(this.lastError ? { lastError: this.lastError } : {}),
+      available: !this.lastRetrieveError,
+      label: this.lastRetrieveError ? '方舟知识库连接异常，已降级' : '方舟知识库已配置，首句时验证',
+      detail: this.lastRetrieveAt ? `最近检索成功 ${new Date(this.lastRetrieveAt).toLocaleString('zh-CN', { hour12: false })}` : '检索通过显式地址接入，不影响规则库事实源。',
+      ...(this.lastRetrieveError ? { lastError: this.lastRetrieveError } : {}),
+    };
+  }
+
+  indexStatus(): KnowledgeBaseStatus {
+    if (!this.config.indexUrl) return { ...EMPTY_STATUS, label: '方舟知识库索引地址待配置' };
+    return {
+      configured: true,
+      available: !this.lastIndexError,
+      label: this.lastIndexError ? '方舟知识库索引异常，后台将重试' : '方舟知识库索引已配置',
+      detail: this.lastIndexAt ? `最近索引成功 ${new Date(this.lastIndexAt).toLocaleString('zh-CN', { hour12: false })}` : '已发布规则由后台队列同步。',
+      ...(this.lastIndexError ? { lastError: this.lastIndexError } : {}),
     };
   }
 
@@ -191,21 +215,9 @@ export class ArkKnowledgeBase implements ComplianceKnowledgeBase, KnowledgeBaseI
     }
   }
 
-  private markSuccess(): void {
-    this.lastError = undefined;
-    this.lastSuccessfulAt = Date.now();
-  }
-
-  private markFailure(error: unknown): void {
-    this.lastError = error instanceof Error ? error.message : String(error);
-  }
 }
 
 export function createKnowledgeBase(env: NodeJS.ProcessEnv = process.env): ComplianceKnowledgeBase & KnowledgeBaseIndexer {
   const config = readConfig(env);
   return config ? new ArkKnowledgeBase(config) : new DisabledKnowledgeBase();
-}
-
-export function createKnowledgeBaseFromConfig(env: NodeJS.ProcessEnv = process.env): ComplianceKnowledgeBase & KnowledgeBaseIndexer {
-  return createKnowledgeBase(env);
 }

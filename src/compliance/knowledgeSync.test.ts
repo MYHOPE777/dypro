@@ -16,7 +16,7 @@ const rule: ComplianceRule = {
 };
 
 function createIndexer() {
-  return { status: () => ({ configured: true, available: true, label: 'ok', detail: 'ok' }), index: vi.fn().mockResolvedValue(undefined) } satisfies KnowledgeBaseIndexer;
+  return { indexStatus: () => ({ configured: true, available: true, label: 'ok', detail: 'ok' }), index: vi.fn().mockResolvedValue(undefined) } satisfies KnowledgeBaseIndexer;
 }
 
 describe('FileKnowledgeSyncQueue', () => {
@@ -42,11 +42,23 @@ describe('FileKnowledgeSyncQueue', () => {
   it('keeps tasks pending while the indexer is not configured', async () => {
     const directory = mkdtempSync(path.join(tmpdir(), 'knowledge-sync-'));
     directories.push(directory);
-    const indexer = { status: () => ({ configured: false, available: true, label: '待配置', detail: '待配置' }), index: vi.fn() } satisfies KnowledgeBaseIndexer;
+    const indexer = { indexStatus: () => ({ configured: false, available: true, label: '待配置', detail: '待配置' }), index: vi.fn() } satisfies KnowledgeBaseIndexer;
     const queue = new FileKnowledgeSyncQueue(indexer, path.join(directory, 'sync.json'));
     queue.enqueue(rule);
     await queue.flush();
     expect(queue.status()).toMatchObject({ pending: 1, configured: false });
     expect(indexer.index).not.toHaveBeenCalled();
+  });
+
+  it('retries an unavailable indexer and can remove a rule that left published state', async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'knowledge-sync-'));
+    directories.push(directory);
+    const indexer = { indexStatus: () => ({ configured: true, available: false, label: '上次失败', detail: '后台重试' }), index: vi.fn().mockResolvedValue(undefined) } satisfies KnowledgeBaseIndexer;
+    const queue = new FileKnowledgeSyncQueue(indexer, path.join(directory, 'sync.json'));
+
+    expect(queue.enqueue({ ...rule, status: 'pending_review' }, undefined, 'remove')).toBe(true);
+    await queue.flush();
+    expect(indexer.index).toHaveBeenCalledWith(expect.objectContaining({ operation: 'remove', rule: expect.objectContaining({ id: rule.id, status: 'pending_review' }) }));
+    expect(queue.status().succeeded).toBe(1);
   });
 });

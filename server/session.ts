@@ -4,6 +4,7 @@ import { createDoubaoAnalyzer } from './services';
 import { createVolcSpeechStream, type VolcSpeechStream } from './providers/volcSpeech';
 import type { TimelineWriter } from './timelineStore';
 import type { RecordingArchiveQueue } from './recordingArchive';
+import type { ComplianceAnalyzer } from '../src/compliance/engine';
 import type { ProductCatalog } from './productCatalog';
 import type { RuleCatalog } from './ruleCatalog';
 import { DEFAULT_PRODUCT, PRODUCTS } from '../src/shared/products';
@@ -18,7 +19,7 @@ import type {
 
 type Client = { socket: WebSocket; role: 'operator' | 'display' };
 type TranscriptTiming = { startTimeMs?: number; endTimeMs?: number };
-type LiveSessionOptions = { timelineStore?: TimelineWriter; productCatalog?: ProductCatalog; ruleCatalog?: RuleCatalog; archiveQueue?: RecordingArchiveQueue; roomId?: string; actorId?: string; now?: () => number };
+type LiveSessionOptions = { timelineStore?: TimelineWriter; productCatalog?: ProductCatalog; ruleCatalog?: RuleCatalog; archiveQueue?: RecordingArchiveQueue; analyzer?: ComplianceAnalyzer; roomId?: string; actorId?: string; now?: () => number };
 
 function createStats(): SessionStats {
   return { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 };
@@ -29,7 +30,7 @@ export class LiveSession {
   readonly roomId: string;
   readonly createdAt: number;
   private readonly clients = new Set<Client>();
-  private readonly analyzer = createDoubaoAnalyzer();
+  private readonly analyzer: ComplianceAnalyzer;
   private speechStream: VolcSpeechStream | null = null;
   private segmentNumber = 0;
   private productGeneration = 0;
@@ -53,6 +54,7 @@ export class LiveSession {
     this.productCatalog = options.productCatalog;
     this.ruleCatalog = options.ruleCatalog;
     this.archiveQueue = options.archiveQueue;
+    this.analyzer = options.analyzer ?? createDoubaoAnalyzer();
     this.roomId = options.roomId ?? 'room-default';
     this.actorId = options.actorId ?? 'owner';
     this.now = options.now ?? Date.now;
@@ -204,6 +206,7 @@ export class LiveSession {
     this.stateValue.partialTranscript = '';
     this.stateValue.lastEventAt = occurredAt;
     this.recordTimeline('capture.failed', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, { message: error.message });
+    this.archiveQueue?.enqueue(this.id);
     this.broadcast({ type: 'state.snapshot', state: this.state });
     this.status(`火山语音连接异常，已停止收音：${error.message}`, 'error');
   }

@@ -2,11 +2,14 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { FileRecordingArchiveQueue } from '../../server/recordingArchive';
-import type { RecordingArchiveUploader, RecordingArchiveSource } from '../../server/recordingArchive';
+import { FileRecordingArchiveQueue, HttpRecordingArchiveUploader } from '../../server/recordingArchive';
+import type { RecordingArchive, RecordingArchiveUploader, RecordingArchiveSource } from '../../server/recordingArchive';
 
 const directories: string[] = [];
-afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
+afterEach(() => {
+  vi.unstubAllGlobals();
+  for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
 
 describe('FileRecordingArchiveQueue', () => {
   it('does not upload while the recording is being collected and archives after enqueue', async () => {
@@ -38,5 +41,35 @@ describe('FileRecordingArchiveQueue', () => {
     queue.enqueue('live-test');
     await queue.flush();
     expect(queue.status()).toMatchObject({ failed: 1, pending: 0, lastError: '网络断开' });
+  });
+
+  it('waits while realtime capture has resumed', async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'recording-archive-'));
+    directories.push(directory);
+    let isListening = true;
+    const source: RecordingArchiveSource = { exportSession: () => ({ schemaVersion: 1, sessionId: 'live-test', timezone: 'Asia/Shanghai', createdAt: 1, recordingStartedAt: 2, audio: null, sourceAudio: [], events: [] }), getAudioPath: () => null, getSourceAudioPath: () => null };
+    const uploader: RecordingArchiveUploader = { upload: vi.fn().mockResolvedValue(undefined), status: () => ({ configured: true, available: true, label: 'ok', detail: 'ok' }) };
+    const queue = new FileRecordingArchiveQueue(source, uploader, path.join(directory, 'queue.json'), () => !isListening);
+    queue.enqueue('live-test');
+
+    await queue.flush();
+    expect(uploader.upload).not.toHaveBeenCalled();
+    isListening = false;
+    await queue.flush();
+    expect(uploader.upload).toHaveBeenCalledOnce();
+  });
+});
+
+describe('HttpRecordingArchiveUploader', () => {
+  it('keeps a failed uploader retryable instead of permanently disabling the queue', async () => {
+    const fetchMock = vi.fn().mockRejectedValueOnce(new Error('网络断开')).mockResolvedValueOnce(new Response(JSON.stringify({ uploadUrls: {} }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const uploader = new HttpRecordingArchiveUploader({ url: 'https://archive.example/manifest', apiKey: 'secret', timeoutMs: 500 });
+    const archive: RecordingArchive = { sessionId: 'live-test', timeline: { schemaVersion: 1, sessionId: 'live-test', timezone: 'Asia/Shanghai', createdAt: 1, recordingStartedAt: 2, audio: null, sourceAudio: [], events: [] }, assets: [] };
+
+    await expect(uploader.upload(archive)).rejects.toThrow('网络断开');
+    expect(uploader.status()).toMatchObject({ configured: true, available: true, lastError: '网络断开' });
+    await expect(uploader.upload(archive)).resolves.toBeUndefined();
+    expect(uploader.status().lastError).toBeUndefined();
   });
 });

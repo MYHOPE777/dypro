@@ -18,6 +18,7 @@ import { canDisplayJoin, CaptureLease } from './sessionAccess';
 import { createKnowledgeBase } from './knowledgeBase';
 import { FileKnowledgeSyncQueue } from './knowledgeSync';
 import { createRecordingArchiveQueue } from './recordingArchive';
+import { createDoubaoAnalyzer } from './services';
 import type { ClientMessage, ComplianceRuleScope, RiskLevel, Product } from '../src/shared/types';
 
 const app = express();
@@ -38,10 +39,11 @@ const captureLeases = new CaptureLease<WebSocket>();
 const sessionIdleTtlMs = readSessionIdleTtlMs(process.env);
 const allowInsecureAuth = process.env.ALLOW_INSECURE_AUTH === 'true';
 const knowledgeBase = createKnowledgeBase();
+const complianceAnalyzer = createDoubaoAnalyzer(process.env, knowledgeBase);
 const knowledgeSyncQueue = new FileKnowledgeSyncQueue(knowledgeBase, process.env.KNOWLEDGE_SYNC_PATH ?? path.resolve(projectRoot, '../.data/knowledge/sync.json'));
 const knowledgeSyncTimer = setInterval(() => { void knowledgeSyncQueue.flush(); }, 5_000);
 knowledgeSyncTimer.unref();
-const recordingArchiveQueue = createRecordingArchiveQueue(timelineStore);
+const recordingArchiveQueue = createRecordingArchiveQueue(timelineStore, process.env, (sessionId) => !sessions.get(sessionId)?.state.isListening);
 const recordingArchiveTimer = setInterval(() => { void recordingArchiveQueue.flush(); }, 10_000);
 recordingArchiveTimer.unref();
 
@@ -58,7 +60,7 @@ function getOrCreateSession(id?: string, roomId = 'room-default', actorId = 'own
     const existing = sessions.get(safeId)!;
     if (existing.roomId === roomId) return existing;
   }
-  const session = new LiveSession(safeId && !sessions.has(safeId) ? safeId : undefined, { timelineStore, productCatalog, ruleCatalog, archiveQueue: recordingArchiveQueue, roomId, actorId });
+  const session = new LiveSession(safeId && !sessions.has(safeId) ? safeId : undefined, { timelineStore, productCatalog, ruleCatalog, archiveQueue: recordingArchiveQueue, analyzer: complianceAnalyzer, roomId, actorId });
   sessions.set(session.id, session);
   return session;
 }
@@ -279,7 +281,9 @@ app.get('/api/readiness', (_request, response) => {
 });
 
 function scheduleKnowledgeSync(rule: Parameters<typeof knowledgeSyncQueue.enqueue>[0]): void {
-  knowledgeSyncQueue.enqueue(rule, productCatalog.getRoom(rule.roomId) ?? undefined);
+  const operation = rule.status === 'published' ? undefined : ruleCatalog.versions(rule.id).some((version) => version.status === 'published') ? 'remove' : null;
+  if (operation === null) return;
+  knowledgeSyncQueue.enqueue(rule, productCatalog.getRoom(rule.roomId) ?? undefined, operation);
   void knowledgeSyncQueue.flush();
 }
 
@@ -398,7 +402,11 @@ app.post('/api/rules/:ruleId/approve', requireOperator, requireRuleAccess, (requ
   catch (error) { return response.status(403).json({ message: error instanceof Error ? error.message : '规则审核失败' }); }
 });
 app.post('/api/rules/:ruleId/reject', requireOperator, requireRuleAccess, (request, response) => {
-  try { return response.json(ruleCatalog.reject(routeParam(request, 'ruleId'), actorFromRequest(request), String(request.body?.reason ?? ''))); }
+  try {
+    const rule = ruleCatalog.reject(routeParam(request, 'ruleId'), actorFromRequest(request), String(request.body?.reason ?? ''));
+    scheduleKnowledgeSync(rule);
+    return response.json(rule);
+  }
   catch (error) { return response.status(403).json({ message: error instanceof Error ? error.message : '规则驳回失败' }); }
 });
 app.post('/api/rules/:ruleId/rollback', requireOperator, requireRuleAccess, (request, response) => {

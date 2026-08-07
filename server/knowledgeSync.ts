@@ -45,9 +45,9 @@ export class FileKnowledgeSyncQueue {
     this.data = this.readFile();
   }
 
-  enqueue(rule: ComplianceRule, room?: Pick<LiveRoom, 'id' | 'name' | 'accountName'>): boolean {
-    if (rule.status !== 'published') return false;
-    const operation = rule.enabled ? 'upsert' : 'remove';
+  enqueue(rule: ComplianceRule, room?: Pick<LiveRoom, 'id' | 'name' | 'accountName'>, requestedOperation?: 'upsert' | 'remove'): boolean {
+    const operation = requestedOperation ?? (rule.enabled ? 'upsert' : 'remove');
+    if (operation === 'upsert' && rule.status !== 'published') return false;
     const key = `${rule.id}:v${rule.version}:${operation}`;
     if (this.data.tasks.some((task) => task.key === key && task.status !== 'failed')) return false;
     const document: KnowledgeRuleDocument = { rule: clone(rule), room: room ? clone(room) : undefined, operation };
@@ -61,7 +61,7 @@ export class FileKnowledgeSyncQueue {
     if (this.flushing) return;
     this.flushing = true;
     try {
-      if (!this.indexer.status().configured || !this.indexer.status().available) return;
+      if (!this.indexer.indexStatus().configured) return;
       const due = this.data.tasks.filter((task) => task.status !== 'succeeded' && task.nextAttemptAt <= now).slice(0, 10);
       for (const task of due) {
         try {
@@ -84,7 +84,7 @@ export class FileKnowledgeSyncQueue {
   }
 
   status(): KnowledgeSyncStatus {
-    const base = this.indexer.status();
+    const base = this.indexer.indexStatus();
     const pending = this.data.tasks.filter((task) => task.status === 'pending').length;
     const failed = this.data.tasks.filter((task) => task.status === 'failed').length;
     const succeededTasks = this.data.tasks.filter((task) => task.status === 'succeeded');

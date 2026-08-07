@@ -84,8 +84,14 @@ export class HttpRecordingArchiveUploader implements RecordingArchiveUploader {
         const uploadUrl = body.uploadUrls?.[asset.assetId];
         if (!uploadUrl) throw new Error(`TOS 归档网关未返回 ${asset.assetId} 上传地址`);
         if (!existsSync(asset.path)) throw new Error(`归档文件不存在：${asset.assetId}`);
-        const response = await fetch(uploadUrl, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(asset.byteLength) }, body: createReadStream(asset.path) as unknown as BodyInit, duplex: 'half' } as RequestInit & { duplex: 'half' });
-        if (!response.ok) throw new Error(`TOS 上传 ${asset.assetId} 返回 ${response.status}`);
+        const uploadController = new AbortController();
+        const uploadTimer = setTimeout(() => uploadController.abort(), this.config.timeoutMs);
+        try {
+          const response = await fetch(uploadUrl, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(asset.byteLength) }, body: createReadStream(asset.path) as unknown as BodyInit, signal: uploadController.signal, duplex: 'half' } as RequestInit & { duplex: 'half' });
+          if (!response.ok) throw new Error(`TOS 上传 ${asset.assetId} 返回 ${response.status}`);
+        } finally {
+          clearTimeout(uploadTimer);
+        }
       }
       this.lastError = undefined;
       this.lastArchivedAt = Date.now();
@@ -98,7 +104,7 @@ export class HttpRecordingArchiveUploader implements RecordingArchiveUploader {
   }
 
   status() {
-    return { configured: true, available: !this.lastError, label: this.lastError ? 'TOS 归档异常，保留本地副本' : 'TOS 归档已配置，停止收音后上传', detail: this.lastArchivedAt ? `最近归档 ${new Date(this.lastArchivedAt).toLocaleString('zh-CN', { hour12: false })}` : '实时收音不会占用 TOS 上传带宽。', ...(this.lastError ? { lastError: this.lastError } : {}) };
+    return { configured: true, available: true, label: this.lastError ? 'TOS 归档异常，后台将重试' : 'TOS 归档已配置，停止收音后上传', detail: this.lastArchivedAt ? `最近归档 ${new Date(this.lastArchivedAt).toLocaleString('zh-CN', { hour12: false })}` : '实时收音不会占用 TOS 上传带宽。', ...(this.lastError ? { lastError: this.lastError } : {}) };
   }
 }
 
@@ -111,13 +117,15 @@ export class FileRecordingArchiveQueue {
   private readonly filePath: string;
   private readonly source: RecordingArchiveSource;
   private readonly uploader: RecordingArchiveUploader;
+  private readonly canArchive: (sessionId: string) => boolean;
   private data: ArchiveFile;
   private flushing = false;
 
-  constructor(source: RecordingArchiveSource, uploader: RecordingArchiveUploader, filePath = path.resolve(process.cwd(), '.data/archive/queue.json')) {
+  constructor(source: RecordingArchiveSource, uploader: RecordingArchiveUploader, filePath = path.resolve(process.cwd(), '.data/archive/queue.json'), canArchive: (sessionId: string) => boolean = () => true) {
     this.source = source;
     this.uploader = uploader;
     this.filePath = filePath;
+    this.canArchive = canArchive;
     this.data = this.readFile();
   }
 
@@ -130,9 +138,9 @@ export class FileRecordingArchiveQueue {
   }
 
   async flush(now = Date.now()): Promise<void> {
-    if (this.flushing || !this.uploader.status().configured || !this.uploader.status().available) return;
+    if (this.flushing || !this.uploader.status().configured) return;
     this.flushing = true;
-    const task = this.data.tasks.find((candidate) => candidate.status !== 'succeeded' && candidate.nextAttemptAt <= now);
+    const task = this.data.tasks.find((candidate) => candidate.status !== 'succeeded' && candidate.nextAttemptAt <= now && this.canArchive(candidate.sessionId));
     if (!task) {
       this.flushing = false;
       return;
@@ -195,6 +203,6 @@ export class FileRecordingArchiveQueue {
   }
 }
 
-export function createRecordingArchiveQueue(source: RecordingArchiveSource, env: NodeJS.ProcessEnv = process.env): FileRecordingArchiveQueue {
-  return new FileRecordingArchiveQueue(source, createRecordingArchiveUploader(env), env.ARCHIVE_QUEUE_PATH ?? path.resolve(process.cwd(), '.data/archive/queue.json'));
+export function createRecordingArchiveQueue(source: RecordingArchiveSource, env: NodeJS.ProcessEnv = process.env, canArchive: (sessionId: string) => boolean = () => true): FileRecordingArchiveQueue {
+  return new FileRecordingArchiveQueue(source, createRecordingArchiveUploader(env), env.ARCHIVE_QUEUE_PATH ?? path.resolve(process.cwd(), '.data/archive/queue.json'), canArchive);
 }

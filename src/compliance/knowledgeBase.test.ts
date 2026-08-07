@@ -19,6 +19,7 @@ describe('ArkKnowledgeBase', () => {
     expect(evidence).toEqual([{ id: 'case-1', title: '处罚案例', content: '不要使用绝对化承诺', source: '内部案例', score: 1 }]);
     expect(fetchMock).toHaveBeenCalledWith('https://kb.example/retrieve', expect.objectContaining({ method: 'POST', body: expect.stringContaining('"top_k":5') }));
     expect(base.status().available).toBe(true);
+    expect(base.indexStatus()).toMatchObject({ configured: false, label: '方舟知识库索引地址待配置' });
   });
 
   it('returns no evidence and exposes the failure after a gateway error', async () => {
