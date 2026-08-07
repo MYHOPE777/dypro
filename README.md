@@ -16,6 +16,8 @@ npm run dev
 
 控制台顶部会显示开播检查结果，包括火山实时语音、豆包、多人身份和数据存储状态。这里的“参数已填写”只确认环境变量存在，火山和豆包连接会在实际开始收音或分析首句话时验证；任一参数未配置时会明确标记为演示模式。
 
+当前优先保证 MacBook 本地模式可独立运行：不配置数据库、Redis、TOS 或方舟知识库时，商品、规则、时间线和原始音频仍写入 `.data/`，实时转录和本地规则不会被云端故障阻断。租户字段已经预留，但本地阶段默认使用 `tenant-default`，不会要求额外登录。
+
 ## 设备与网络
 
 - 蓝牙麦克风需要先在 macOS “系统设置 → 声音 → 输入”中连接。浏览器控制台首次收音会请求麦克风权限。
@@ -45,6 +47,8 @@ npm start
 - `audio.pcm`：发送给火山实时语音的 16kHz PCM signed 16-bit little-endian、单声道副本。
 - `timeline.jsonl`：最终转录、转录纠错、商品清单与商品切换、收音启停和合规结果。每条记录同时包含 UTC 绝对时间、`Asia/Shanghai` 时区标识、相对开播毫秒数及 PCM 采样位置。纠错记录同时保留原文、修正文和操作人。
 
+收音期间不会上传音频。停止收音后，会话进入 `.data/archive/queue.json` 归档队列；只有配置 `TOS_ARCHIVE_GATEWAY_URL` 和 `TOS_ARCHIVE_GATEWAY_KEY` 时才会由后台上传。上传失败会保留本地文件并指数退避重试，不影响下一场实时转录。归档网关负责把文件写入火山引擎 TOS，接口约定为：先接收会话 manifest，再返回各音频资产的预签名 `uploadUrls`，服务端随后以流式 PUT 上传 PCM 文件。
+
 预留给后续复盘工具的只读接口：
 
 - `GET /api/session/:id/timeline`：结构化 JSON 时间线与音频元数据。
@@ -52,6 +56,8 @@ npm start
 - `GET /api/session/:id/audio.pcm`：发送给火山实时语音的 16kHz PCM 副本。
 - `GET /api/session/:id/audio.wav`：给 16kHz PCM 副本增加 WAV 文件头，采样数据保持不变，便于播放器直接打开。
 - `GET /api/session/:id/audio-source.pcm?track=N` 和 `GET /api/session/:id/audio-source.wav?track=N`：第 `N` 条浏览器原生采样率原始音轨及 WAV 封装。收音进行中下载会返回 `409`，结束收音后再下载以保证文件长度和 WAV 头一致。
+
+- `GET /api/readiness`：分别显示实时语音、豆包、业务数据库、TOS 归档、Redis、方舟知识库和规则同步队列状态。
 
 会话在最后一个页面断开后默认保留 30 分钟，时间由 `SESSION_IDLE_TTL_MS` 调整。服务重启或会话重新载入时，系统会从时间线恢复当前商品、最近转录、合规结果、告警和统计，不会因为浏览器刷新丢失直播现场。时间线和音频下载接口需要控制台身份。
 
@@ -109,4 +115,21 @@ npm run auth:hash -- '至少8位的强密码'
 
 ## 数据库 adapter
 
-实时会话只依赖 `ProductCatalog` 和 `RuleCatalog` interface，不直接依赖 JSON 文件。当前提供本地文件 adapter，尚未连接真实火山数据库。接入火山引擎 PostgreSQL/MySQL 时可在这两个接口增加数据库 adapter，并把商品、直播间、规则版本和审计日志迁移为事务表；实时会话、控制台和判定流程不需要改动。开播检查会持续显示“本地文件存储”，直到数据库 adapter 正式启用。
+实时会话只依赖 `ProductCatalog` 和 `RuleCatalog` interface，不直接依赖 JSON 文件。当前提供本地文件 adapter，尚未连接真实火山数据库。接入火山引擎 PostgreSQL/MySQL 时可在这两个接口增加数据库 adapter，并把商品、直播间、规则版本和审计日志迁移为事务表；实时会话、控制台和判定流程不需要改动。
+
+## 方舟知识库与规则同步
+
+方舟知识库只作为平台规则、内部处罚案例的语义召回增强层，不是业务数据库。精确规则仍先在本地/业务数据库执行，召回证据才会作为上下文交给豆包；知识库超时或异常会快速降级。已发布规则、审核确认版本、回滚和停用会写入 `.data/knowledge/sync.json`，由后台队列重试索引；待审核规则不会进入知识库。
+
+由于方舟知识库不同账号的检索地址和请求协议由控制台配置决定，代码使用显式 `ARK_KB_RETRIEVE_URL`、`ARK_KB_INDEX_URL` 网关适配器，不猜测未公开的固定路径。网关需返回 `items` 或 `data.items`，每项包含 `id`、`content/text`、可选 `title/source/score`。
+
+## 商用 SaaS 预留
+
+对外商用部署时，建议把当前 Node 服务拆成“租户控制面 + 直播边缘采集端”：
+
+- 控制面放在服务区，负责账号、租户、直播间、商品库、规则版本、审核、审计和复盘查询。
+- 每个 MacBook 作为一个直播边缘节点，蓝牙麦克风和实时 ASR 音频留在本地；通过短连接/安全 WebSocket 只上送转录和告警，不把原始音频放进实时链路。
+- PostgreSQL/MySQL 保存业务事实，Redis 负责会话状态、采集租约和跨进程协调，TOS 保存下播后的原始音频、录屏和导出文件，方舟知识库保存可检索的规则/案例副本。
+- `tenantId` 已在房间和认证身份上预留；本地旧数据自动归入 `tenant-default`。SaaS 阶段必须在数据库查询、对象存储 key、Redis key 和知识库 metadata 中同时带租户标识。
+
+本地 MacBook 阶段不需要部署这些云依赖，先验证收音稳定性、实时延迟、误报处理和下播归档，再切换到服务区控制面。

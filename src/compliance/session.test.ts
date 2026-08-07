@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { LiveSession } from '../../server/session';
 import type WebSocket from 'ws';
 
@@ -31,5 +31,17 @@ describe('LiveSession', () => {
     expect(session.state.isListening).toBe(true);
     session.stopListening();
     expect(session.state.isListening).toBe(false);
+  });
+
+  it('keeps capture local and enqueues the archive only after stopping', () => {
+    const enqueue = vi.fn();
+    const session = new LiveSession('archive-session', { archiveQueue: { enqueue } });
+
+    session.startListening();
+    session.ingestAudio(Buffer.from([0, 0]));
+    expect(enqueue).not.toHaveBeenCalled();
+    session.stopListening();
+    expect(enqueue).toHaveBeenCalledOnce();
+    expect(enqueue).toHaveBeenCalledWith('archive-session');
   });
 });
