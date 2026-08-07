@@ -45,3 +45,4 @@ button { cursor: pointer; }
 @media (max-width: 760px) { .readiness-strip { grid-template-columns: 1fr; gap: 10px; }.readiness-items { justify-content: flex-start; flex-wrap: wrap; }.workspace-head .actor-identity { grid-column: 1 / -1; grid-row: 2; width: 100%; margin-left: 0; }.access-brand { top: 18px; left: 18px; }.access-panel { padding: 22px; } }
 
 .readiness-title small { grid-column: 2; color: #68776d; font-size: 8px; }.readiness-items { flex-wrap: wrap; gap: 8px 13px; }
+.icon-button:disabled { cursor: not-allowed; opacity: .45; }.rule-status.disabled { background: #303432; color: #8d9890; }.rule-actions button:disabled { cursor: not-allowed; opacity: .45; }

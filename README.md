@@ -49,6 +49,8 @@ npm start
 
 收音期间不会上传音频。停止收音后，会话进入 `.data/archive/queue.json` 归档队列；只有配置 `TOS_ARCHIVE_GATEWAY_URL` 和 `TOS_ARCHIVE_GATEWAY_KEY` 时才会由后台上传。上传失败会保留本地文件并指数退避重试，不影响下一场实时转录。归档网关负责把文件写入火山引擎 TOS，接口约定为：先接收会话 manifest，再返回各音频资产的预签名 `uploadUrls`，服务端随后以流式 PUT 上传 PCM 文件。
 
+如果停止后很快重新开始收音，正在进行的归档上传会被暂停并保留为本地待处理任务，避免归档流量与实时语音链路重叠；再次停止收音后由后台继续上传。
+
 预留给后续复盘工具的只读接口：
 
 - `GET /api/session/:id/timeline`：结构化 JSON 时间线与音频元数据。

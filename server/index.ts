@@ -46,6 +46,7 @@ knowledgeSyncTimer.unref();
 const recordingArchiveQueue = createRecordingArchiveQueue(timelineStore, process.env, (sessionId) => !sessions.get(sessionId)?.state.isListening);
 const recordingArchiveTimer = setInterval(() => { void recordingArchiveQueue.flush(); }, 10_000);
 recordingArchiveTimer.unref();
+let websocketConnectionsAccepted = 0;
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -122,7 +123,7 @@ function getLanAddress(): string {
 }
 
 app.get('/api/health', (_request, response) => {
-  response.json({ ok: true, sessions: sessions.size, rooms: productCatalog.listRooms().length, volcConfigured: Boolean(process.env.VOLC_SPEECH_APP_KEY && process.env.VOLC_SPEECH_ACCESS_KEY), doubaoConfigured: Boolean(process.env.DOUBAO_API_KEY && process.env.DOUBAO_ENDPOINT_ID), authMode: authService.configured ? 'multi-user' : 'local-only' });
+  response.json({ ok: true, sessions: sessions.size, clients: [...sessions.values()].reduce((total, session) => total + session.clientCount, 0), websocketConnectionsAccepted, rooms: productCatalog.listRooms().length, volcConfigured: Boolean(process.env.VOLC_SPEECH_APP_KEY && process.env.VOLC_SPEECH_ACCESS_KEY), doubaoConfigured: Boolean(process.env.DOUBAO_API_KEY && process.env.DOUBAO_ENDPOINT_ID), authMode: authService.configured ? 'multi-user' : 'local-only' });
 });
 
 function actorFromRequest(request: express.Request): string {
@@ -524,6 +525,7 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 wsServer.on('connection', (socket: WebSocket, request) => {
+  websocketConnectionsAccepted += 1;
   let session: LiveSession | null = null;
   let role: 'operator' | 'display' = 'display';
   let actorId = 'owner';

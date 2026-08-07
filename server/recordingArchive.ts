@@ -21,12 +21,13 @@ export type ArchiveStatus = {
 };
 
 export interface RecordingArchiveUploader {
-  upload(archive: RecordingArchive): Promise<void>;
+  upload(archive: RecordingArchive, signal?: AbortSignal): Promise<void>;
   status(): Pick<ArchiveStatus, 'configured' | 'available' | 'label' | 'detail' | 'lastError'>;
 }
 
 export interface RecordingArchiveQueue {
   enqueue(sessionId: string): boolean;
+  pause?(sessionId: string): void;
 }
 
 export interface RecordingArchiveSource {
@@ -68,15 +69,16 @@ export class HttpRecordingArchiveUploader implements RecordingArchiveUploader {
 
   constructor(private readonly config: HttpArchiveConfig) {}
 
-  async upload(archive: RecordingArchive): Promise<void> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
+  async upload(archive: RecordingArchive, signal?: AbortSignal): Promise<void> {
+    const timeoutController = new AbortController();
+    const timer = setTimeout(() => timeoutController.abort(), this.config.timeoutMs);
+    const requestSignal = signal ? AbortSignal.any([signal, timeoutController.signal]) : timeoutController.signal;
     try {
       const manifestResponse = await fetch(this.config.url, {
         method: 'POST',
         headers: { Authorization: `Bearer ${this.config.apiKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId: archive.sessionId, timeline: archive.timeline, assets: archive.assets.map(({ assetId, byteLength, sampleRate }) => ({ assetId, byteLength, sampleRate })) }),
-        signal: controller.signal,
+        signal: requestSignal,
       });
       if (!manifestResponse.ok) throw new Error(`TOS 归档网关返回 ${manifestResponse.status}`);
       const body = await manifestResponse.json() as { uploadUrls?: Record<string, string> };
@@ -86,8 +88,9 @@ export class HttpRecordingArchiveUploader implements RecordingArchiveUploader {
         if (!existsSync(asset.path)) throw new Error(`归档文件不存在：${asset.assetId}`);
         const uploadController = new AbortController();
         const uploadTimer = setTimeout(() => uploadController.abort(), this.config.timeoutMs);
+        const uploadSignal = signal ? AbortSignal.any([signal, uploadController.signal]) : uploadController.signal;
         try {
-          const response = await fetch(uploadUrl, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(asset.byteLength) }, body: createReadStream(asset.path) as unknown as BodyInit, signal: uploadController.signal, duplex: 'half' } as RequestInit & { duplex: 'half' });
+          const response = await fetch(uploadUrl, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(asset.byteLength) }, body: createReadStream(asset.path) as unknown as BodyInit, signal: uploadSignal, duplex: 'half' } as RequestInit & { duplex: 'half' });
           if (!response.ok) throw new Error(`TOS 上传 ${asset.assetId} 返回 ${response.status}`);
         } finally {
           clearTimeout(uploadTimer);
@@ -104,7 +107,7 @@ export class HttpRecordingArchiveUploader implements RecordingArchiveUploader {
   }
 
   status() {
-    return { configured: true, available: true, label: this.lastError ? 'TOS 归档异常，后台将重试' : 'TOS 归档已配置，停止收音后上传', detail: this.lastArchivedAt ? `最近归档 ${new Date(this.lastArchivedAt).toLocaleString('zh-CN', { hour12: false })}` : '实时收音不会占用 TOS 上传带宽。', ...(this.lastError ? { lastError: this.lastError } : {}) };
+    return { configured: true, available: !this.lastError, label: this.lastError ? 'TOS 归档异常，后台将重试' : 'TOS 归档已配置，停止收音后上传', detail: this.lastArchivedAt ? `最近归档 ${new Date(this.lastArchivedAt).toLocaleString('zh-CN', { hour12: false })}` : '实时收音不会占用 TOS 上传带宽。', ...(this.lastError ? { lastError: this.lastError } : {}) };
   }
 }
 
@@ -120,6 +123,8 @@ export class FileRecordingArchiveQueue {
   private readonly canArchive: (sessionId: string) => boolean;
   private data: ArchiveFile;
   private flushing = false;
+  private readonly activeUploads = new Map<string, AbortController>();
+  private readonly pausedSessions = new Set<string>();
 
   constructor(source: RecordingArchiveSource, uploader: RecordingArchiveUploader, filePath = path.resolve(process.cwd(), '.data/archive/queue.json'), canArchive: (sessionId: string) => boolean = () => true) {
     this.source = source;
@@ -130,11 +135,18 @@ export class FileRecordingArchiveQueue {
   }
 
   enqueue(sessionId: string): boolean {
-    if (this.data.tasks.some((task) => task.sessionId === sessionId && task.status !== 'failed')) return false;
+    if (this.data.tasks.some((task) => task.sessionId === sessionId && task.status !== 'succeeded')) return false;
     const now = Date.now();
     this.data.tasks.push({ sessionId, status: 'pending', attempts: 0, createdAt: now, updatedAt: now, nextAttemptAt: now });
     this.writeFile();
     return true;
+  }
+
+  pause(sessionId: string): void {
+    const controller = this.activeUploads.get(sessionId);
+    if (!controller) return;
+    this.pausedSessions.add(sessionId);
+    controller.abort();
   }
 
   async flush(now = Date.now()): Promise<void> {
@@ -145,6 +157,8 @@ export class FileRecordingArchiveQueue {
       this.flushing = false;
       return;
     }
+    const uploadController = new AbortController();
+    this.activeUploads.set(task.sessionId, uploadController);
     try {
       const timeline = this.source.exportSession(task.sessionId);
       if (!timeline) throw new Error('时间线尚未写入，稍后重试');
@@ -157,17 +171,34 @@ export class FileRecordingArchiveQueue {
         const audioPath = this.source.getSourceAudioPath(task.sessionId, index);
         if (audioPath) assets.push({ assetId: audio.assetId, path: audioPath, byteLength: audio.byteLength, sampleRate: audio.sampleRate });
       }
-      await this.uploader.upload({ sessionId: task.sessionId, timeline, assets });
-      task.status = 'succeeded';
-      task.updatedAt = Date.now();
-      task.lastError = undefined;
+      if (!this.canArchive(task.sessionId)) return;
+      await this.uploader.upload({ sessionId: task.sessionId, timeline, assets }, uploadController.signal);
+      if (this.pausedSessions.has(task.sessionId)) {
+        task.status = 'pending';
+        task.nextAttemptAt = Date.now();
+        task.updatedAt = Date.now();
+        task.lastError = undefined;
+      } else {
+        task.status = 'succeeded';
+        task.updatedAt = Date.now();
+        task.lastError = undefined;
+      }
     } catch (error) {
-      task.status = 'failed';
-      task.attempts += 1;
-      task.updatedAt = Date.now();
-      task.nextAttemptAt = task.updatedAt + Math.min(30 * 60_000, 2_000 * (2 ** Math.min(task.attempts, 10)));
-      task.lastError = error instanceof Error ? error.message : String(error);
+      if (this.pausedSessions.has(task.sessionId)) {
+        task.status = 'pending';
+        task.nextAttemptAt = Date.now();
+        task.updatedAt = Date.now();
+        task.lastError = undefined;
+      } else {
+        task.status = 'failed';
+        task.attempts += 1;
+        task.updatedAt = Date.now();
+        task.nextAttemptAt = task.updatedAt + Math.min(30 * 60_000, 2_000 * (2 ** Math.min(task.attempts, 10)));
+        task.lastError = error instanceof Error ? error.message : String(error);
+      }
     } finally {
+      this.activeUploads.delete(task.sessionId);
+      this.pausedSessions.delete(task.sessionId);
       this.writeFile();
       this.flushing = false;
     }

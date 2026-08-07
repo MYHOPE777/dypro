@@ -1,6 +1,7 @@
 import { gzipSync, gunzipSync } from 'node:zlib';
-import { describe, expect, it } from 'vitest';
-import { buildAudioFrame, buildFullClientRequest, parseResponseFrame } from '../../server/providers/volcSpeech';
+import { describe, expect, it, vi } from 'vitest';
+import WebSocket from 'ws';
+import { buildAudioFrame, buildFullClientRequest, parseResponseFrame, VolcSpeechStream } from '../../server/providers/volcSpeech';
 
 describe('Volc realtime speech frames', () => {
   it('builds a gzip JSON full-client request with 16k mono PCM settings', () => {
@@ -45,5 +46,33 @@ describe('Volc realtime speech frames', () => {
       startTimeMs: 240,
       endTimeMs: 1680,
     });
+  });
+
+  it('keeps early audio until the provider websocket is ready', () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const sent: Buffer[] = [];
+    const socket = {
+      readyState: WebSocket.CONNECTING as number,
+      on(event: string, listener: (...args: unknown[]) => void) { listeners.set(event, listener); return this; },
+      send(data: Buffer) { sent.push(data); },
+      close() { this.readyState = WebSocket.CLOSED; },
+    };
+    const onReady = vi.fn();
+    const stream = new VolcSpeechStream(
+      { appKey: 'app', accessKey: 'access', resourceId: 'resource', endpoint: 'wss://speech.example' },
+      { onResult: vi.fn(), onError: vi.fn(), onReady },
+      () => socket as never,
+    );
+
+    stream.connect();
+    stream.sendAudio(Buffer.from([1, 0, 2, 0]));
+    expect(sent).toEqual([]);
+    socket.readyState = WebSocket.OPEN;
+    listeners.get('open')?.();
+
+    expect(sent).toHaveLength(2);
+    expect(sent[0].subarray(0, 4)).toEqual(Buffer.from([0x11, 0x10, 0x11, 0x00]));
+    expect(sent[1]).toEqual(buildAudioFrame(Buffer.from([1, 0, 2, 0])));
+    expect(onReady).toHaveBeenCalledOnce();
   });
 });

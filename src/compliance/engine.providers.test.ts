@@ -30,4 +30,16 @@ describe('DoubaoComplianceAnalyzer', () => {
     expect(result.risk).toBe('blocked');
     expect(fetchMock).toHaveBeenCalledOnce();
   });
+
+  it('falls back to local rules when Doubao exceeds the realtime deadline', async () => {
+    vi.stubGlobal('fetch', vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+    })));
+    const analyzer = new DoubaoComplianceAnalyzer({ DOUBAO_API_KEY: 'key', DOUBAO_ENDPOINT_ID: 'endpoint', DOUBAO_TIMEOUT_MS: '5' });
+
+    const result = await analyzer.analyze({ productId: 'serum', transcript: '这款产品保证立刻见效' });
+
+    expect(result).toMatchObject({ risk: 'blocked', source: 'local-fallback' });
+    expect(result.reason).toContain('豆包暂时不可用');
+  });
 });

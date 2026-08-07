@@ -61,4 +61,20 @@ describe('FileKnowledgeSyncQueue', () => {
     expect(indexer.index).toHaveBeenCalledWith(expect.objectContaining({ operation: 'remove', rule: expect.objectContaining({ id: rule.id, status: 'pending_review' }) }));
     expect(queue.status().succeeded).toBe(1);
   });
+
+  it('re-indexes a rule after disable and re-enable without a content version change', async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'knowledge-sync-'));
+    directories.push(directory);
+    const indexer = createIndexer();
+    const queue = new FileKnowledgeSyncQueue(indexer, path.join(directory, 'sync.json'));
+
+    expect(queue.enqueue(rule)).toBe(true);
+    await queue.flush();
+    expect(queue.enqueue({ ...rule, enabled: false, updatedAt: 2 })).toBe(true);
+    await queue.flush();
+    expect(queue.enqueue({ ...rule, enabled: true, updatedAt: 3 })).toBe(true);
+    await queue.flush();
+
+    expect(indexer.index.mock.calls.map(([document]) => document.operation)).toEqual(['upsert', 'remove', 'upsert']);
+  });
 });

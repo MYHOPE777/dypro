@@ -29,7 +29,7 @@ describe('FileRecordingArchiveQueue', () => {
     queue.enqueue('live-test');
     await queue.flush();
     expect(uploader.upload).toHaveBeenCalledOnce();
-    expect(uploader.upload).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'live-test', assets: [{ assetId: 'asr', path: audioPath, byteLength: 2, sampleRate: 16_000 }] }));
+    expect(uploader.upload).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'live-test', assets: [{ assetId: 'asr', path: audioPath, byteLength: 2, sampleRate: 16_000 }] }), expect.any(AbortSignal));
   });
 
   it('keeps a failed archive local and retryable', async () => {
@@ -58,6 +58,38 @@ describe('FileRecordingArchiveQueue', () => {
     await queue.flush();
     expect(uploader.upload).toHaveBeenCalledOnce();
   });
+
+  it('archives the same session again after capture resumes and stops a second time', async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'recording-archive-'));
+    directories.push(directory);
+    const source: RecordingArchiveSource = { exportSession: () => ({ schemaVersion: 1, sessionId: 'live-test', timezone: 'Asia/Shanghai', createdAt: 1, recordingStartedAt: 2, audio: null, sourceAudio: [], events: [] }), getAudioPath: () => null, getSourceAudioPath: () => null };
+    const uploader: RecordingArchiveUploader = { upload: vi.fn().mockResolvedValue(undefined), status: () => ({ configured: true, available: true, label: 'ok', detail: 'ok' }) };
+    const queue = new FileRecordingArchiveQueue(source, uploader, path.join(directory, 'queue.json'));
+
+    expect(queue.enqueue('live-test')).toBe(true);
+    await queue.flush();
+    expect(queue.enqueue('live-test')).toBe(true);
+    await queue.flush();
+    expect(uploader.upload).toHaveBeenCalledTimes(2);
+  });
+
+  it('pauses an in-flight upload when capture resumes', async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'recording-archive-pause-'));
+    directories.push(directory);
+    const source: RecordingArchiveSource = { exportSession: () => ({ schemaVersion: 1, sessionId: 'live-test', timezone: 'Asia/Shanghai', createdAt: 1, recordingStartedAt: 2, audio: null, sourceAudio: [], events: [] }), getAudioPath: () => null, getSourceAudioPath: () => null };
+    let resolveUpload: (() => void) | undefined;
+    const uploader: RecordingArchiveUploader = { upload: vi.fn((_archive, signal) => new Promise<void>((resolve) => { resolveUpload = resolve; signal?.addEventListener('abort', () => resolve()); })), status: () => ({ configured: true, available: true, label: 'ok', detail: 'ok' }) };
+    const queue = new FileRecordingArchiveQueue(source, uploader, path.join(directory, 'queue.json'));
+
+    expect(queue.enqueue('live-test')).toBe(true);
+    const flushing = queue.flush();
+    queue.pause('live-test');
+    resolveUpload?.();
+    await flushing;
+
+    expect(uploader.upload).toHaveBeenCalledOnce();
+    expect(queue.tasks()[0]).toMatchObject({ sessionId: 'live-test', status: 'pending', attempts: 0 });
+  });
 });
 
 describe('HttpRecordingArchiveUploader', () => {
@@ -68,7 +100,7 @@ describe('HttpRecordingArchiveUploader', () => {
     const archive: RecordingArchive = { sessionId: 'live-test', timeline: { schemaVersion: 1, sessionId: 'live-test', timezone: 'Asia/Shanghai', createdAt: 1, recordingStartedAt: 2, audio: null, sourceAudio: [], events: [] }, assets: [] };
 
     await expect(uploader.upload(archive)).rejects.toThrow('网络断开');
-    expect(uploader.status()).toMatchObject({ configured: true, available: true, lastError: '网络断开' });
+    expect(uploader.status()).toMatchObject({ configured: true, available: false, lastError: '网络断开' });
     await expect(uploader.upload(archive)).resolves.toBeUndefined();
     expect(uploader.status().lastError).toBeUndefined();
   });

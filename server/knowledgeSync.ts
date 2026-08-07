@@ -48,8 +48,8 @@ export class FileKnowledgeSyncQueue {
   enqueue(rule: ComplianceRule, room?: Pick<LiveRoom, 'id' | 'name' | 'accountName'>, requestedOperation?: 'upsert' | 'remove'): boolean {
     const operation = requestedOperation ?? (rule.enabled ? 'upsert' : 'remove');
     if (operation === 'upsert' && rule.status !== 'published') return false;
-    const key = `${rule.id}:v${rule.version}:${operation}`;
-    if (this.data.tasks.some((task) => task.key === key && task.status !== 'failed')) return false;
+    const key = `${rule.id}:v${rule.version}:t${rule.updatedAt}:${operation}`;
+    if (this.data.tasks.some((task) => task.key === key)) return false;
     const document: KnowledgeRuleDocument = { rule: clone(rule), room: room ? clone(room) : undefined, operation };
     const now = Date.now();
     this.data.tasks.push({ id: `knowledge-sync-${randomUUID()}`, key, document, status: 'pending', attempts: 0, createdAt: now, updatedAt: now, nextAttemptAt: now });

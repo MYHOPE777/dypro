@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { SessionTimelineExport, TimelineAudioAsset, TimelineEvent, TimelineEventType } from '../src/shared/types';
@@ -77,7 +77,10 @@ export class FileTimelineStore implements TimelineWriter {
     if (!track) {
       track = { sampleRate, fileName: `audio.source.${tracks.length}.pcm` };
       tracks.push(track);
-      writeFileSync(path.join(directory, 'audio.source.json'), JSON.stringify({ encoding: 'pcm_s16le', channels: 1, bitsPerSample: 16, tracks }), 'utf8');
+      const metadataPath = path.join(directory, 'audio.source.json');
+      const temporaryPath = `${metadataPath}.tmp`;
+      writeFileSync(temporaryPath, JSON.stringify({ encoding: 'pcm_s16le', channels: 1, bitsPerSample: 16, tracks }), 'utf8');
+      renameSync(temporaryPath, metadataPath);
     }
     appendFileSync(path.join(directory, track.fileName), audio);
   }
@@ -195,8 +198,12 @@ export class FileTimelineStore implements TimelineWriter {
   private getSourceTracks(sessionId: string): Array<{ sampleRate: number; fileName: string }> {
     const metadataPath = this.sessionPath(sessionId, 'audio.source.json');
     if (!existsSync(metadataPath)) return [];
-    const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as { tracks?: Array<{ sampleRate?: number; fileName?: string }> };
-    return (metadata.tracks ?? []).filter((track): track is { sampleRate: number; fileName: string } => typeof track.sampleRate === 'number' && typeof track.fileName === 'string');
+    try {
+      const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as { tracks?: Array<{ sampleRate?: number; fileName?: string }> };
+      return (metadata.tracks ?? []).filter((track): track is { sampleRate: number; fileName: string } => typeof track.sampleRate === 'number' && typeof track.fileName === 'string');
+    } catch {
+      return [];
+    }
   }
 
   private ensureSessionDirectory(sessionId: string): string {

@@ -90,12 +90,13 @@ function localParse(sourceText: string, extraWarning = ''): ProductImportRespons
   };
 }
 
-function getDoubaoConfig(): { apiKey: string; endpointId: string; baseUrl: string } | null {
+function getDoubaoConfig(): { apiKey: string; endpointId: string; baseUrl: string; timeoutMs: number } | null {
   if (!process.env.DOUBAO_API_KEY || !process.env.DOUBAO_ENDPOINT_ID) return null;
   return {
     apiKey: process.env.DOUBAO_API_KEY,
     endpointId: process.env.DOUBAO_ENDPOINT_ID,
     baseUrl: process.env.DOUBAO_BASE_URL ?? 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
+    timeoutMs: Number.isFinite(Number(process.env.DOUBAO_PRODUCT_PARSE_TIMEOUT_MS)) && Number(process.env.DOUBAO_PRODUCT_PARSE_TIMEOUT_MS) > 0 ? Number(process.env.DOUBAO_PRODUCT_PARSE_TIMEOUT_MS) : 10_000,
   };
 }
 
@@ -148,24 +149,32 @@ export async function parseProductText(sourceText: string): Promise<ProductImpor
   const config = getDoubaoConfig();
   if (!config) return localParse(normalizedText);
   try {
-    const response = await fetch(config.baseUrl, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: config.endpointId,
-        temperature: 0.1,
-        max_tokens: 800,
-        messages: [
-          {
-            role: 'system',
-            content: '你是商品资料结构化助手。把用户粘贴的商品详情整理成 JSON，不要补造未提供的库存和价格。只输出 JSON：{"name":"","category":"","price":"","stock":null,"sku":"","description":"","sellingPoints":[],"compliantPhrases":[],"image":"","accent":""}。compliantPhrases 必须是适合直播口播、避免绝对化和医疗功效承诺的表达。',
-          },
-          { role: 'user', content: normalizedText },
-        ],
-      }),
-    });
-    if (!response.ok) throw new Error(`豆包接口返回 ${response.status}`);
-    const body = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), config.timeoutMs);
+    let body: { choices?: Array<{ message?: { content?: string } }> };
+    try {
+      const response = await fetch(config.baseUrl, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: config.endpointId,
+          temperature: 0.1,
+          max_tokens: 800,
+          messages: [
+            {
+              role: 'system',
+              content: '你是商品资料结构化助手。把用户粘贴的商品详情整理成 JSON，不要补造未提供的库存和价格。只输出 JSON：{"name":"","category":"","price":"","stock":null,"sku":"","description":"","sellingPoints":[],"compliantPhrases":[],"image":"","accent":""}。compliantPhrases 必须是适合直播口播、避免绝对化和医疗功效承诺的表达。',
+            },
+            { role: 'user', content: normalizedText },
+          ],
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`豆包接口返回 ${response.status}`);
+      body = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    } finally {
+      clearTimeout(timer);
+    }
     const content = body.choices?.[0]?.message?.content;
     if (!content) throw new Error('豆包返回为空');
     return normalizeDoubao(parseJsonObject(content), normalizedText);

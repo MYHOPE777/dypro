@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -92,6 +92,18 @@ describe('session timeline export', () => {
     appendFileSync(path.join(directory, sessionId, 'timeline.jsonl'), '{"type":"incomplete"');
 
     expect(timelineStore.exportSession(sessionId)?.events).toHaveLength(1);
+  });
+
+  it('recovers when source-audio metadata was partially written before a restart', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'live-source-recovery-'));
+    tempDirectories.push(directory);
+    const timelineStore = new FileTimelineStore(directory);
+    const sessionId = 'live-source-recovery';
+    timelineStore.appendEvent(sessionId, { type: 'session.created', occurredAt: 1, offsetMs: null, productId: 'serum' });
+    writeFileSync(path.join(directory, sessionId, 'audio.source.json'), '{"tracks":[');
+
+    expect(() => timelineStore.appendSourceAudio(sessionId, Buffer.from([1, 2]), 48_000)).not.toThrow();
+    expect(timelineStore.exportSession(sessionId)?.sourceAudio).toHaveLength(1);
   });
 
   it('rejects odd PCM byte counts', () => {

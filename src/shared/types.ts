@@ -129,6 +129,8 @@ export type SessionState = {
   partialTranscript: string;
   transcriptHistory: TranscriptSegment[];
   latestCompliance: ComplianceResult | null;
+  /** Timestamp from which transcript belongs to the currently selected product. */
+  productContextStartedAt: number;
   alerts: ComplianceResult[];
   stats: SessionStats;
   lastEventAt: number;

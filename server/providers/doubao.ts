@@ -3,7 +3,7 @@ import { analyzeTranscript } from '../../src/compliance/engine';
 import type { ComplianceResult, KnowledgeEvidence } from '../../src/shared/types';
 import { createKnowledgeBase, type ComplianceKnowledgeBase } from '../knowledgeBase';
 
-type DoubaoConfig = { apiKey: string; endpointId: string; baseUrl: string };
+type DoubaoConfig = { apiKey: string; endpointId: string; baseUrl: string; timeoutMs: number };
 const severity = { safe: 0, warning: 1, blocked: 2 } as const;
 
 function getConfig(env: NodeJS.ProcessEnv = process.env): DoubaoConfig | null {
@@ -12,6 +12,7 @@ function getConfig(env: NodeJS.ProcessEnv = process.env): DoubaoConfig | null {
     apiKey: env.DOUBAO_API_KEY,
     endpointId: env.DOUBAO_ENDPOINT_ID,
     baseUrl: env.DOUBAO_BASE_URL ?? 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
+    timeoutMs: Number.isFinite(Number(env.DOUBAO_TIMEOUT_MS)) && Number(env.DOUBAO_TIMEOUT_MS) > 0 ? Number(env.DOUBAO_TIMEOUT_MS) : 2_500,
   };
 }
 
@@ -66,24 +67,32 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
         product: input.product ?? { id: input.productId, name: input.productId, category: '其他', price: '价格待确认', compliantPhrases: [] },
         activeRules: input.customRules ?? [],
       });
-      const response = await fetch(this.config.baseUrl, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.config.apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: this.config.endpointId,
-          temperature: 0.1,
-          max_tokens: 500,
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: `当前商品：${JSON.stringify(input.product ?? { id: input.productId })}\n主播原话：${input.transcript}\n\n方舟知识库召回证据（仅作核验参考，规则库事实优先）：${JSON.stringify(knowledgeEvidence)}` },
-          ],
-        }),
-      });
-      if (!response.ok) throw new Error(`豆包接口返回 ${response.status}`);
-      const body = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
+      let body: { choices?: Array<{ message?: { content?: string } }> };
+      try {
+        const response = await fetch(this.config.baseUrl, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.config.apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: this.config.endpointId,
+            temperature: 0.1,
+            max_tokens: 500,
+            messages: [
+              { role: 'system', content: SYSTEM_PROMPT },
+              { role: 'user', content: `当前商品：${JSON.stringify(input.product ?? { id: input.productId })}\n主播原话：${input.transcript}\n\n方舟知识库召回证据（仅作核验参考，规则库事实优先）：${JSON.stringify(knowledgeEvidence)}` },
+            ],
+          }),
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`豆包接口返回 ${response.status}`);
+        body = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+      } finally {
+        clearTimeout(timer);
+      }
       const content = body.choices?.[0]?.message?.content;
       if (!content) throw new Error('豆包返回为空');
       const doubaoResult = fromDoubao(input, parseJson(content), knowledgeEvidence);

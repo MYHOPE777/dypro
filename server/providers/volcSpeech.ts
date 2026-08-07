@@ -7,6 +7,7 @@ export type SpeechResult = { text: string; isFinal: boolean; startTimeMs?: numbe
 export type VolcSpeechOptions = {
   onResult: (result: SpeechResult) => void;
   onError: (error: Error) => void;
+  onReady?: () => void;
 };
 
 type VolcConfig = {
@@ -16,7 +17,20 @@ type VolcConfig = {
   endpoint: string;
 };
 
+type SpeechSocket = {
+  readyState: number;
+  on(event: 'open', listener: () => void): SpeechSocket;
+  on(event: 'message', listener: (data: unknown) => void): SpeechSocket;
+  on(event: 'error', listener: (error: Error) => void): SpeechSocket;
+  on(event: 'close', listener: () => void): SpeechSocket;
+  send(data: Buffer): void;
+  close(): void;
+};
+
+type SpeechSocketFactory = (endpoint: string, headers: Record<string, string>) => SpeechSocket;
+
 const DEFAULT_ENDPOINT = 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel';
+const MAX_PENDING_AUDIO_BYTES = 160_000;
 
 export function getVolcConfig(env: NodeJS.ProcessEnv = process.env): VolcConfig | null {
   const appKey = env.VOLC_SPEECH_APP_KEY;
@@ -103,23 +117,34 @@ export function parseResponseFrame(frame: Buffer): SpeechResult | null {
 }
 
 export class VolcSpeechStream {
-  private socket: WebSocket | null = null;
+  private socket: SpeechSocket | null = null;
   private sequence = 1;
   private manuallyClosed = false;
+  private pendingAudio: Buffer[] = [];
+  private pendingAudioBytes = 0;
 
-  constructor(private readonly config: VolcConfig, private readonly options: VolcSpeechOptions) {}
+  constructor(
+    private readonly config: VolcConfig,
+    private readonly options: VolcSpeechOptions,
+    private readonly socketFactory: SpeechSocketFactory = (endpoint, headers) => new WebSocket(endpoint, { headers }),
+  ) {}
 
   connect(): void {
     this.manuallyClosed = false;
-    this.socket = new WebSocket(this.config.endpoint, {
-      headers: {
-        'X-Api-App-Key': this.config.appKey,
-        'X-Api-Access-Key': this.config.accessKey,
-        'X-Api-Resource-Id': this.config.resourceId,
-        'X-Api-Connect-Id': randomUUID(),
-      },
+    this.sequence = 1;
+    this.socket = this.socketFactory(this.config.endpoint, {
+      'X-Api-App-Key': this.config.appKey,
+      'X-Api-Access-Key': this.config.accessKey,
+      'X-Api-Resource-Id': this.config.resourceId,
+      'X-Api-Connect-Id': randomUUID(),
     });
-    this.socket.on('open', () => this.socket?.send(buildFullClientRequest()));
+    this.socket.on('open', () => {
+      this.socket?.send(buildFullClientRequest());
+      for (const audio of this.pendingAudio) this.socket?.send(buildAudioFrame(audio, false, this.sequence++));
+      this.pendingAudio = [];
+      this.pendingAudioBytes = 0;
+      this.options.onReady?.();
+    });
     this.socket.on('message', (data) => {
       try {
         const result = parseResponseFrame(Buffer.from(data as Buffer));
@@ -135,8 +160,18 @@ export class VolcSpeechStream {
   }
 
   sendAudio(audio: Buffer): void {
-    if (this.socket?.readyState !== WebSocket.OPEN) return;
-    this.socket.send(buildAudioFrame(audio, false, this.sequence++));
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(buildAudioFrame(audio, false, this.sequence++));
+      return;
+    }
+    if (this.socket?.readyState !== WebSocket.CONNECTING) return;
+    if (this.pendingAudioBytes + audio.length > MAX_PENDING_AUDIO_BYTES) {
+      this.options.onError(new Error('火山语音连接超时，开场音频缓冲已满'));
+      return;
+    }
+    const copy = Buffer.from(audio);
+    this.pendingAudio.push(copy);
+    this.pendingAudioBytes += copy.length;
   }
 
   finish(): void {
@@ -149,6 +184,8 @@ export class VolcSpeechStream {
     this.manuallyClosed = true;
     this.socket?.close();
     this.socket = null;
+    this.pendingAudio = [];
+    this.pendingAudioBytes = 0;
   }
 }
 

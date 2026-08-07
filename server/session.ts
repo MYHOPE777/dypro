@@ -72,6 +72,7 @@ export class LiveSession {
       partialTranscript: '',
       transcriptHistory: [],
       latestCompliance: null,
+      productContextStartedAt: this.createdAt,
       alerts: [],
       stats: createStats(),
       lastEventAt: this.createdAt,
@@ -109,10 +110,11 @@ export class LiveSession {
     const product = this.stateValue.lineup.find((item) => item.id === productId);
     if (!product) return;
     this.productGeneration += 1;
+    const occurredAt = this.now();
     this.stateValue.product = product;
+    this.stateValue.productContextStartedAt = occurredAt;
     this.stateValue.latestCompliance = null;
     this.stateValue.partialTranscript = '';
-    const occurredAt = this.now();
     this.stateValue.lastEventAt = occurredAt;
     this.recordTimeline('product.selected', occurredAt, this.offsetAt(occurredAt), product.id, { product });
     this.broadcast({ type: 'state.snapshot', state: this.state });
@@ -129,6 +131,7 @@ export class LiveSession {
     if (!currentProduct) {
       this.productGeneration += 1;
       this.stateValue.product = lineup[0];
+      this.stateValue.productContextStartedAt = occurredAt;
       this.stateValue.latestCompliance = null;
       this.stateValue.partialTranscript = '';
     } else {
@@ -145,6 +148,7 @@ export class LiveSession {
 
   startListening(): void {
     if (this.stateValue.isListening) return;
+    this.archiveQueue?.pause?.(this.id);
     const occurredAt = this.now();
     this.recordingStartedAt ??= occurredAt;
     this.currentCaptureOffsetMs = this.offsetAt(occurredAt);
@@ -163,10 +167,11 @@ export class LiveSession {
         if (this.stateValue.isListening) this.ingestTranscript(text, isFinal, { startTimeMs, endTimeMs });
       },
       onError: (error) => this.handleSpeechFailure(error),
+      onReady: () => this.status('火山实时语音已连接', 'success'),
     });
     this.speechStream?.connect();
     this.broadcast({ type: 'state.snapshot', state: this.state });
-    this.status(this.speechStream ? '火山实时语音已连接' : '演示模式已启动，可用快捷语句模拟收音', 'success');
+    this.status(this.speechStream ? '正在连接火山实时语音' : '演示模式已启动，可用快捷语句模拟收音', this.speechStream ? 'neutral' : 'success');
   }
 
   stopListening(): void {
@@ -324,12 +329,16 @@ export class LiveSession {
     const transcripts = new Map<string, TranscriptSegment>();
     const results = new Map<string, ComplianceResult>();
     let selectedProductId = this.stateValue.product.id;
+    let productContextStartedAt = this.stateValue.productContextStartedAt;
     let maximumOffsetMs = 0;
 
     for (const event of timeline.events) {
       maximumOffsetMs = Math.max(maximumOffsetMs, event.offsetMs ?? 0);
       this.stateValue.lastEventAt = Math.max(this.stateValue.lastEventAt, event.occurredAt);
-      if (event.type === 'product.selected' && event.productId) selectedProductId = event.productId;
+      if (event.type === 'product.selected' && event.productId) {
+        selectedProductId = event.productId;
+        productContextStartedAt = event.occurredAt;
+      }
       if (event.type === 'transcript.final') {
         const segmentId = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
         const text = typeof event.payload.text === 'string' ? event.payload.text : '';
@@ -381,6 +390,7 @@ export class LiveSession {
     const allTranscripts = [...transcripts.values()].sort((first, second) => first.timestamp - second.timestamp);
     const allResults = [...results.values()].sort((first, second) => first.createdAt - second.createdAt);
     this.stateValue.product = this.stateValue.lineup.find((product) => product.id === selectedProductId) ?? this.stateValue.product;
+    this.stateValue.productContextStartedAt = productContextStartedAt;
     this.stateValue.transcriptHistory = allTranscripts.slice(-20);
     this.stateValue.latestCompliance = allResults.at(-1) ?? null;
     this.stateValue.alerts = allResults.filter((result) => result.risk !== 'safe').reverse().slice(0, 12);
