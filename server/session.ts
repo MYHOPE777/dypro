@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type WebSocket from 'ws';
 import { createDoubaoAnalyzer } from './services';
-import { createVolcSpeechStream, type VolcSpeechStream } from './providers/volcSpeech';
+import { buildStreamingAsrContext, createDoubaoStreamingAsr, type DoubaoStreamingAsr } from './providers/doubaoStreamingAsr';
 import type { TimelineWriter } from './timelineStore';
 import type { RecordingArchiveQueue } from './recordingArchive';
 import type { ComplianceAnalyzer } from '../src/compliance/engine';
@@ -31,7 +31,9 @@ export class LiveSession {
   readonly createdAt: number;
   private readonly clients = new Set<Client>();
   private readonly analyzer: ComplianceAnalyzer;
-  private speechStream: VolcSpeechStream | null = null;
+  private speechStream: DoubaoStreamingAsr | null = null;
+  private drainingSpeechStream: DoubaoStreamingAsr | null = null;
+  private speechDrainTimer: NodeJS.Timeout | null = null;
   private segmentNumber = 0;
   private productGeneration = 0;
   private analysisQueue: Promise<void> = Promise.resolve();
@@ -148,6 +150,7 @@ export class LiveSession {
 
   startListening(): void {
     if (this.stateValue.isListening) return;
+    this.releaseDrainingSpeechStream(this.drainingSpeechStream, true);
     this.archiveQueue?.pause?.(this.id);
     const occurredAt = this.now();
     this.recordingStartedAt ??= occurredAt;
@@ -155,6 +158,15 @@ export class LiveSession {
     this.currentCaptureSampleOffset = Math.floor((this.timelineStore?.getAudioByteLength(this.id) ?? 0) / 2);
     this.stateValue.isListening = true;
     this.stateValue.lastEventAt = occurredAt;
+    const currentProduct = this.stateValue.product;
+    const contextProducts = [currentProduct, ...this.stateValue.lineup.filter((product) => product.id !== currentProduct.id)];
+    const asrContext = buildStreamingAsrContext(
+      contextProducts.flatMap((product) => [product.name, product.sku]).filter(Boolean),
+      [
+        `当前直播商品：${currentProduct.name}；类目：${currentProduct.category}；规格：${currentProduct.description || '以商品页面为准'}`,
+        `本场直播商品清单：${contextProducts.map((product) => product.name).join('、')}`,
+      ],
+    );
     this.recordTimeline('capture.started', occurredAt, this.currentCaptureOffsetMs, this.stateValue.product.id, {
       audioSampleOffset: this.currentCaptureSampleOffset,
       encoding: 'pcm_s16le',
@@ -162,25 +174,42 @@ export class LiveSession {
       channels: 1,
       bitsPerSample: 16,
     });
-    this.speechStream = createVolcSpeechStream({
+    let stream: DoubaoStreamingAsr | null = null;
+    stream = createDoubaoStreamingAsr({
       onResult: ({ text, isFinal, startTimeMs, endTimeMs }) => {
-        if (this.stateValue.isListening) this.ingestTranscript(text, isFinal, { startTimeMs, endTimeMs });
+        if (this.stateValue.isListening || (isFinal && this.drainingSpeechStream === stream)) this.ingestTranscript(text, isFinal, { startTimeMs, endTimeMs });
       },
-      onError: (error) => this.handleSpeechFailure(error),
-      onReady: () => this.status('火山实时语音已连接', 'success'),
+      onError: (error) => {
+        if (this.stateValue.isListening) this.handleSpeechFailure(error);
+        else if (this.drainingSpeechStream === stream) {
+          this.status(`流式语音识别收尾失败，最后一句可能不完整：${error.message}`, 'error');
+          this.releaseDrainingSpeechStream(stream, true);
+        }
+      },
+      onReady: () => {
+        if (this.stateValue.isListening) this.status('豆包大模型流式语音识别已连接', 'success');
+      },
+      onClosed: () => this.releaseDrainingSpeechStream(stream, false),
+      context: asrContext,
     });
+    this.speechStream = stream;
     this.speechStream?.connect();
     this.broadcast({ type: 'state.snapshot', state: this.state });
-    this.status(this.speechStream ? '正在连接火山实时语音' : '演示模式已启动，可用快捷语句模拟收音', this.speechStream ? 'neutral' : 'success');
+    this.status(this.speechStream ? '正在连接豆包大模型流式语音识别' : '演示模式已启动，可用快捷语句模拟收音', this.speechStream ? 'neutral' : 'success');
   }
 
   stopListening(): void {
     if (!this.stateValue.isListening) return;
     const occurredAt = this.now();
-    this.speechStream?.finish();
-    this.speechStream?.close();
+    const stream = this.speechStream;
     this.speechStream = null;
+    if (stream) {
+      this.drainingSpeechStream = stream;
+      this.speechDrainTimer = setTimeout(() => this.releaseDrainingSpeechStream(stream, true), 2_000);
+      this.speechDrainTimer.unref();
+    }
     this.stateValue.isListening = false;
+    stream?.finish();
     this.stateValue.partialTranscript = '';
     this.stateValue.lastEventAt = occurredAt;
     this.recordTimeline('capture.stopped', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, {
@@ -213,7 +242,15 @@ export class LiveSession {
     this.recordTimeline('capture.failed', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, { message: error.message });
     this.archiveQueue?.enqueue(this.id);
     this.broadcast({ type: 'state.snapshot', state: this.state });
-    this.status(`火山语音连接异常，已停止收音：${error.message}`, 'error');
+    this.status(`豆包大模型流式语音识别连接异常，已停止收音：${error.message}`, 'error');
+  }
+
+  private releaseDrainingSpeechStream(stream: DoubaoStreamingAsr | null, close: boolean): void {
+    if (!stream || this.drainingSpeechStream !== stream) return;
+    if (this.speechDrainTimer) clearTimeout(this.speechDrainTimer);
+    this.speechDrainTimer = null;
+    this.drainingSpeechStream = null;
+    if (close) stream.close();
   }
 
   ingestTranscript(rawText: string, isFinal = true, timing: TranscriptTiming = {}): void {
@@ -317,7 +354,6 @@ export class LiveSession {
       policyRef: result.policyRef,
       confidence: result.confidence,
       source: result.source,
-      knowledgeEvidence: result.knowledgeEvidence ?? [],
     });
     this.broadcast({ type: 'compliance.result', result });
     this.broadcast({ type: 'state.snapshot', state: this.state });

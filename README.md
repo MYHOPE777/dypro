@@ -1,6 +1,6 @@
 # dypro · 抖音直播实时合规预警
 
-一个面向直播间的本地局域网工具：MacBook 采集蓝牙麦克风，火山引擎实时语音模型转录，豆包大模型判断抖音直播话术风险，主播在 MacBook 或 iPad/外接显示器上即时看到合规替代表达。
+一个面向直播间的本地局域网工具：MacBook 采集蓝牙麦克风，豆包大模型流式语音识别（ASR）转录，豆包大模型判断抖音直播话术风险，主播在 MacBook 或 iPad/外接显示器上即时看到合规替代表达。
 
 ## 快速启动
 
@@ -10,24 +10,24 @@ cp .env.example .env
 npm run dev
 ```
 
-所有环境变量、火山实时语音请求头、豆包请求体、方舟知识库网关和停播后 TOS 归档网关参数，见 [配置说明](docs/CONFIGURATION.md)。如果现在只接火山引擎，可直接参考 [`config/volcengine.env.example`](config/volcengine.env.example)。`.env.example` 和该模板都不包含真实密钥。
+所有环境变量、豆包大模型流式语音识别请求头、方舟 Responses API 请求体、方舟知识库搜索和停播后 TOS 归档网关参数，见 [配置说明](docs/CONFIGURATION.md)。如果现在只接火山引擎，可直接参考 [`config/volcengine.env.example`](config/volcengine.env.example)。`.env.example` 和该模板都不包含真实密钥。
 
 版本发布使用 `npm run release -- patch|minor|major`。命令会自动跑测试、更新版本号、创建 Git 标签、生成本地 bundle 备份并尝试推送 GitHub；断网时本地版本仍然保留。
 
 开发模式只绑定 MacBook 本机，打开 `http://localhost:5173` 进入控制台。点击“选择输入设备”选择已连接的蓝牙麦克风，再点击“开始收音”。需要让 iPad 或外接显示器通过局域网访问时，请按“生产构建”先执行 `npm run build` 和 `npm start`，再使用 `http://<MacBook局域网IP>:8787`；这样局域网设备只能打开只读主播屏，不会通过开发代理绕过控制台限制。
 
-没有配置密钥时，控制台仍可用“演示输入”按钮验证完整的预警和提词流程，结果会标注为 `LOCAL GUARDRAIL`。正式接入时，把火山引擎控制台提供的实时语音 App Key、Access Key，以及豆包/Ark 的 API Key 和 Endpoint ID 写入 `.env`，密钥只在 Node 服务端使用，不会下发到浏览器。
+没有配置密钥时，控制台仍可用“演示输入”按钮验证完整的预警和提词流程，结果会标注为 `LOCAL GUARDRAIL`。正式接入时，把火山引擎新版语音控制台提供的 App Key 写入 `X_API_KEY`，把方舟 API Key 和 Model ID 分别写入 `ARK_API_KEY`、`ARK_MODEL`；密钥只在 Node 服务端使用，不会下发到浏览器。
 
-控制台顶部会显示开播检查结果，包括火山实时语音、豆包、多人身份和数据存储状态。这里的“参数已填写”只确认环境变量存在，火山和豆包连接会在实际开始收音或分析首句话时验证；任一参数未配置时会明确标记为演示模式。
+控制台顶部会显示开播检查结果，包括豆包大模型流式语音识别、豆包、多人身份和数据存储状态。这里的“参数已填写”只确认环境变量存在，ASR 和方舟连接会在实际开始收音或分析首句话时验证；任一参数未配置时会明确标记为演示模式。
 
-当前优先保证 MacBook 本地模式可独立运行：不配置数据库、Redis、TOS 或方舟知识库时，商品、规则、时间线和原始音频仍写入 `.data/`，实时转录和本地规则不会被云端故障阻断。租户字段已经预留，但本地阶段默认使用 `tenant-default`，不会要求额外登录。
+当前优先保证 MacBook 本地模式可独立运行：不配置数据库、Redis、TOS 或方舟知识库时，商品、规则、时间线和原始音频仍写入 `.data/`，流式语音识别和本地规则不会被云端故障阻断。租户字段已经预留，但本地阶段默认使用 `tenant-default`，不会要求额外登录。
 
 ## 设备与网络
 
 - 蓝牙麦克风需要先在 macOS “系统设置 → 声音 → 输入”中连接。浏览器控制台首次收音会请求麦克风权限。
 - 控制台建议直接在 MacBook 的 `localhost` 打开；iPad 只访问主播屏，不需要麦克风权限。
 - iPad 与 MacBook 需要在同一局域网。若系统防火墙拦截，请允许 Node 接收局域网连接。
-- 浏览器收音使用 16kHz、单声道 PCM，服务端按火山实时语音 WebSocket 协议发送 gzip 二进制帧。
+- 浏览器收音使用 16kHz、单声道 PCM，服务端按豆包大模型流式语音识别 WebSocket（SAUC）协议发送 gzip 二进制帧。
 
 ## 生产构建
 
@@ -40,7 +40,7 @@ npm start
 
 ## 火山引擎参数
 
-实时语音连接使用 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel`，默认资源 ID 为 `volc.bigasr.sauc.duration`。服务端实现了官方协议中的 full client request、audio-only request、gzip 压缩和最终帧标记；如果账号开通的是其他资源 ID，只需修改 `VOLC_SPEECH_RESOURCE_ID`。
+流式语音识别连接使用双向流式优化版 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`，默认资源 ID 为 `volc.bigasr.sauc.duration`。服务端使用新版 `X-Api-Key` 鉴权，并实现官方协议中的 full client request、无序号 audio-only request、gzip 压缩、`request.corpus` 热词/替换词/上下文和最终帧标记；如果账号开通的是其他资源 ID，只需修改 `X_API_RESOURCE_ID`。
 
 ## 时间线与原始音频
 
@@ -48,22 +48,22 @@ npm start
 
 - `audio.source.json`：原始音频音轨清单；浏览器采样率变化时会自动分轨。
 - `audio.source.<track>.pcm`：浏览器采集到的原生采样率 PCM signed 16-bit little-endian、单声道，作为原始音频保留；`track` 从 0 开始。
-- `audio.pcm`：发送给火山实时语音的 16kHz PCM signed 16-bit little-endian、单声道副本。
+- `audio.pcm`：发送给豆包大模型流式语音识别的 16kHz PCM signed 16-bit little-endian、单声道副本。
 - `timeline.jsonl`：最终转录、转录纠错、商品清单与商品切换、收音启停和合规结果。每条记录同时包含 UTC 绝对时间、`Asia/Shanghai` 时区标识、相对开播毫秒数及 PCM 采样位置。纠错记录同时保留原文、修正文和操作人。
 
-收音期间不会上传音频。停止收音后，会话进入 `.data/archive/queue.json` 归档队列；只有配置 `TOS_ARCHIVE_GATEWAY_URL` 和 `TOS_ARCHIVE_GATEWAY_KEY` 时才会由后台上传。上传失败会保留本地文件并指数退避重试，不影响下一场实时转录。归档网关负责把文件写入火山引擎 TOS，接口约定为：先接收会话 manifest，再返回各音频资产的预签名 `uploadUrls`，服务端随后以流式 PUT 上传 PCM 文件。
+收音期间不会上传音频。停止收音后，会话进入 `.data/archive/queue.json` 归档队列；只有配置 `TOS_ARCHIVE_GATEWAY_URL` 和 `TOS_ARCHIVE_GATEWAY_KEY` 时才会由后台上传。上传失败会保留本地文件并指数退避重试，不影响下一场流式语音识别。归档网关负责把文件写入火山引擎 TOS，接口约定为：先接收会话 manifest，再返回各音频资产的预签名 `uploadUrls`，服务端随后以流式 PUT 上传 PCM 文件。
 
-如果停止后很快重新开始收音，正在进行的归档上传会被暂停并保留为本地待处理任务，避免归档流量与实时语音链路重叠；再次停止收音后由后台继续上传。
+如果停止后很快重新开始收音，正在进行的归档上传会被暂停并保留为本地待处理任务，避免归档流量与流式语音识别链路重叠；再次停止收音后由后台继续上传。
 
 预留给后续复盘工具的只读接口：
 
 - `GET /api/session/:id/timeline`：结构化 JSON 时间线与音频元数据。
 - `GET /api/session/:id/timeline.jsonl`：原始 JSONL 事件流。
-- `GET /api/session/:id/audio.pcm`：发送给火山实时语音的 16kHz PCM 副本。
+- `GET /api/session/:id/audio.pcm`：发送给豆包大模型流式语音识别的 16kHz PCM 副本。
 - `GET /api/session/:id/audio.wav`：给 16kHz PCM 副本增加 WAV 文件头，采样数据保持不变，便于播放器直接打开。
 - `GET /api/session/:id/audio-source.pcm?track=N` 和 `GET /api/session/:id/audio-source.wav?track=N`：第 `N` 条浏览器原生采样率原始音轨及 WAV 封装。收音进行中下载会返回 `409`，结束收音后再下载以保证文件长度和 WAV 头一致。
 
-- `GET /api/readiness`：分别显示实时语音、豆包、业务数据库、TOS 归档、Redis、方舟知识库和规则同步队列状态。
+- `GET /api/readiness`：分别显示豆包大模型流式语音识别、豆包、业务数据库、TOS 归档、Redis 和方舟知识库搜索状态。
 
 会话在最后一个页面断开后默认保留 30 分钟，时间由 `SESSION_IDLE_TTL_MS` 调整。服务重启或会话重新载入时，系统会从时间线恢复当前商品、最近转录、合规结果、告警和统计，不会因为浏览器刷新丢失直播现场。时间线和音频下载接口需要控制台身份。
 
@@ -84,7 +84,7 @@ npm start
 - 当前直播间规则保存后立即生效，只影响该直播间。
 - 共享规则由非审核人提交后进入“待审核”，只有 `RULE_REVIEWER_ACTOR_ID` 指定的系统审核人可以发布；发布后对所有直播间生效。
 - 规则编辑会生成新版本，控制台可回滚上一版。创建、审核、驳回、编辑和回滚都会写入 `.data/rules/catalog.json` 的审计日志。
-- 实时转录列表中的铅笔按钮可以修改识别错误。系统会撤销该片段旧告警和统计，以修正文重新执行规则和豆包判断，同时在时间线保留原始文字。
+- 流式语音识别列表中的铅笔按钮可以修改识别错误。系统会撤销该片段旧告警和统计，以修正文重新执行规则和豆包判断，同时在时间线保留原始文字。
 - `GET /api/rooms/:roomId/rules`、`POST /api/rooms/:roomId/rules`：规则列表与新增。
 - `PATCH /api/rules/:ruleId`：保存规则新版本。
 - `POST /api/rules/:ruleId/approve|reject|rollback`：审核、驳回与回滚。
@@ -123,11 +123,11 @@ npm run auth:hash -- '至少8位的强密码'
 
 实时会话只依赖 `ProductCatalog` 和 `RuleCatalog` interface，不直接依赖 JSON 文件。当前提供本地文件 adapter，尚未连接真实火山数据库。接入火山引擎 PostgreSQL/MySQL 时可在这两个接口增加数据库 adapter，并把商品、直播间、规则版本和审计日志迁移为事务表；实时会话、控制台和判定流程不需要改动。
 
-## 方舟知识库与规则同步
+## 方舟知识库搜索
 
-方舟知识库只作为平台规则、内部处罚案例的语义召回增强层，不是业务数据库。精确规则仍先在本地/业务数据库执行，召回证据才会作为上下文交给豆包；知识库超时或异常会快速降级。已发布规则、审核确认版本、回滚和停用会写入 `.data/knowledge/sync.json`，由后台队列重试索引；待审核规则不会进入知识库。
+方舟知识库只作为平台规则、内部处罚案例的语义召回增强层，不是业务数据库。精确规则仍先在本地/业务数据库执行，配置 `KNOWLEDGE_RESOURCE_ID` 后，合规请求通过 Responses API 官方 `knowledge_search` 工具将召回交给豆包；知识库超时或异常会快速降级。规则的创建、审核、回滚和停用不依赖未公开的知识库写入接口，先以本地/业务数据库为事实源。
 
-由于方舟知识库不同账号的检索地址和请求协议由控制台配置决定，代码使用显式 `ARK_KB_RETRIEVE_URL`、`ARK_KB_INDEX_URL` 网关适配器，不猜测未公开的固定路径。网关需返回 `items` 或 `data.items`，每项包含 `id`、`content/text`、可选 `title/source/score`。
+请求会发送 `ark-beta-knowledge-search: true`，并使用官方 `tools[].knowledge_resource_id` 与 `limit` 字段。方舟知识库仅支持旗舰版知识库搜索，具体资源 ID 从方舟控制台获取。
 
 ## 商用 SaaS 预留
 

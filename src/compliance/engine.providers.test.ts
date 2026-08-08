@@ -15,7 +15,7 @@ describe('DoubaoComplianceAnalyzer', () => {
 
   it('applies the non-downgradable local block before a lower custom rule or Doubao call', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      choices: [{ message: { content: JSON.stringify({ risk: 'warning', title: '豆包提醒', reason: '需要注意', alternative: '替代表达', policyRef: '平台规则', confidence: 0.8 }) } }],
+      output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ risk: 'warning', title: '豆包提醒', reason: '需要注意', alternative: '替代表达', policyRef: '平台规则', confidence: 0.8 }) }] }],
     }), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
     const rule: ComplianceRule = {
@@ -23,7 +23,7 @@ describe('DoubaoComplianceAnalyzer', () => {
       risk: 'warning', title: '内部提醒', reason: '需要注意', alternative: '替代表达', policyRef: '内部规则', enabled: true,
       status: 'published', version: 1, createdBy: 'owner', createdAt: 1, updatedAt: 1,
     };
-    const analyzer = new DoubaoComplianceAnalyzer({ DOUBAO_API_KEY: 'key', DOUBAO_ENDPOINT_ID: 'endpoint' });
+    const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model' });
 
     const result = await analyzer.analyze({ productId: 'serum', transcript: '保证三天全部消失', customRules: [rule] });
 
@@ -35,7 +35,7 @@ describe('DoubaoComplianceAnalyzer', () => {
     vi.stubGlobal('fetch', vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
       init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
     })));
-    const analyzer = new DoubaoComplianceAnalyzer({ DOUBAO_API_KEY: 'key', DOUBAO_ENDPOINT_ID: 'endpoint', DOUBAO_TIMEOUT_MS: '5' });
+    const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model', ARK_TIMEOUT_MS: '5' });
 
     const result = await analyzer.analyze({ productId: 'serum', transcript: '这款产品保证立刻见效' });
 

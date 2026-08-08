@@ -15,10 +15,9 @@ import { parseProductText } from './productParser';
 import { AuthService, allowsControlTransport, canAccessRoom, type AuthIdentity } from './auth';
 import { readSessionIdleTtlMs } from './config';
 import { canDisplayJoin, CaptureLease } from './sessionAccess';
-import { createKnowledgeBase } from './knowledgeBase';
-import { FileKnowledgeSyncQueue } from './knowledgeSync';
 import { createRecordingArchiveQueue } from './recordingArchive';
 import { createDoubaoAnalyzer } from './services';
+import { getArkKnowledgeSearchStatus } from './providers/ark';
 import type { ClientMessage, ComplianceRuleScope, RiskLevel, Product } from '../src/shared/types';
 
 const app = express();
@@ -38,11 +37,7 @@ const sessionExpiryTimers = new Map<string, NodeJS.Timeout>();
 const captureLeases = new CaptureLease<WebSocket>();
 const sessionIdleTtlMs = readSessionIdleTtlMs(process.env);
 const allowInsecureAuth = process.env.ALLOW_INSECURE_AUTH === 'true';
-const knowledgeBase = createKnowledgeBase();
-const complianceAnalyzer = createDoubaoAnalyzer(process.env, knowledgeBase);
-const knowledgeSyncQueue = new FileKnowledgeSyncQueue(knowledgeBase, process.env.KNOWLEDGE_SYNC_PATH ?? path.resolve(projectRoot, '../.data/knowledge/sync.json'));
-const knowledgeSyncTimer = setInterval(() => { void knowledgeSyncQueue.flush(); }, 5_000);
-knowledgeSyncTimer.unref();
+const complianceAnalyzer = createDoubaoAnalyzer(process.env);
 const recordingArchiveQueue = createRecordingArchiveQueue(timelineStore, process.env, (sessionId) => !sessions.get(sessionId)?.state.isListening);
 const recordingArchiveTimer = setInterval(() => { void recordingArchiveQueue.flush(); }, 10_000);
 recordingArchiveTimer.unref();
@@ -123,7 +118,7 @@ function getLanAddress(): string {
 }
 
 app.get('/api/health', (_request, response) => {
-  response.json({ ok: true, sessions: sessions.size, clients: [...sessions.values()].reduce((total, session) => total + session.clientCount, 0), websocketConnectionsAccepted, rooms: productCatalog.listRooms().length, volcConfigured: Boolean(process.env.VOLC_SPEECH_APP_KEY && process.env.VOLC_SPEECH_ACCESS_KEY), doubaoConfigured: Boolean(process.env.DOUBAO_API_KEY && process.env.DOUBAO_ENDPOINT_ID), authMode: authService.configured ? 'multi-user' : 'local-only' });
+  response.json({ ok: true, sessions: sessions.size, clients: [...sessions.values()].reduce((total, session) => total + session.clientCount, 0), websocketConnectionsAccepted, rooms: productCatalog.listRooms().length, streamingAsrConfigured: Boolean(process.env.X_API_KEY), arkResponsesConfigured: Boolean(process.env.ARK_API_KEY && process.env.ARK_MODEL), authMode: authService.configured ? 'multi-user' : 'local-only' });
 });
 
 function actorFromRequest(request: express.Request): string {
@@ -255,40 +250,31 @@ app.post('/api/auth/login', (request, response) => {
 });
 
 app.get('/api/readiness', (_request, response) => {
-  const volcConfigured = Boolean(process.env.VOLC_SPEECH_APP_KEY && process.env.VOLC_SPEECH_ACCESS_KEY);
-  const doubaoConfigured = Boolean(process.env.DOUBAO_API_KEY && process.env.DOUBAO_ENDPOINT_ID);
+  const streamingAsrConfigured = Boolean(process.env.X_API_KEY);
+  const arkResponsesConfigured = Boolean(process.env.ARK_API_KEY && process.env.ARK_MODEL);
   const databaseConfigured = Boolean(process.env.DATABASE_URL);
   const archiveStatus = recordingArchiveQueue.status();
   const objectStorageConfigured = archiveStatus.configured;
   const redisConfigured = Boolean(process.env.REDIS_URL);
-  const knowledge = knowledgeBase.status();
-  const knowledgeSync = knowledgeSyncQueue.status();
-  const liveConfigured = volcConfigured && doubaoConfigured;
-  const productionConfigured = liveConfigured && authService.configured && databaseConfigured && objectStorageConfigured && redisConfigured && knowledge.configured && knowledgeSync.configured;
+  const knowledge = getArkKnowledgeSearchStatus(process.env);
+  const liveConfigured = streamingAsrConfigured && arkResponsesConfigured;
+  const productionConfigured = liveConfigured && authService.configured && databaseConfigured && objectStorageConfigured && redisConfigured;
   response.json({
     readyForLive: liveConfigured,
     readyForProduction: productionConfigured,
     mode: productionConfigured ? 'production' : liveConfigured ? 'live-with-local-persistence' : 'demo',
-    speech: { configured: volcConfigured, label: volcConfigured ? '火山语音参数已填写' : '火山实时语音待配置' },
-    doubao: { configured: doubaoConfigured, label: doubaoConfigured ? '豆包参数已填写' : '豆包合规模型待配置' },
+    streamingAsr: { configured: streamingAsrConfigured, label: streamingAsrConfigured ? '豆包大模型流式语音识别参数已填写' : '豆包大模型流式语音识别待配置' },
+    arkResponses: { configured: arkResponsesConfigured, label: arkResponsesConfigured ? '火山方舟 Responses API 参数已填写' : '火山方舟 Responses API 待配置' },
     auth: { configured: authService.configured, label: authService.configured ? '多人身份已保护' : '仅限本机控制' },
     storage: { configured: databaseConfigured && objectStorageConfigured, label: databaseConfigured && objectStorageConfigured ? '数据库 + 对象存储已配置' : '本地文件存储（生产存储待配置）' },
     database: { configured: databaseConfigured, label: databaseConfigured ? '业务数据库参数已填写' : '业务数据库待配置' },
     objectStorage: { configured: objectStorageConfigured, label: objectStorageConfigured ? 'TOS 原始音频归档已配置' : 'TOS 原始音频归档待配置', status: archiveStatus },
     redis: { configured: redisConfigured, label: redisConfigured ? 'Redis 会话协调已配置' : 'Redis 会话协调待配置' },
     knowledge,
-    knowledgeSync,
   });
 });
 
-function scheduleKnowledgeSync(rule: Parameters<typeof knowledgeSyncQueue.enqueue>[0]): void {
-  const operation = rule.status === 'published' ? undefined : ruleCatalog.versions(rule.id).some((version) => version.status === 'published') ? 'remove' : null;
-  if (operation === null) return;
-  knowledgeSyncQueue.enqueue(rule, productCatalog.getRoom(rule.roomId) ?? undefined, operation);
-  void knowledgeSyncQueue.flush();
-}
-
-app.get('/api/knowledge/status', requireOperator, (_request, response) => response.json({ knowledge: knowledgeBase.status(), sync: knowledgeSyncQueue.status() }));
+app.get('/api/knowledge/status', requireOperator, (_request, response) => response.json({ knowledge: getArkKnowledgeSearchStatus(process.env) }));
 
 function isProductPayload(value: unknown): value is Product {
   if (!value || typeof value !== 'object') return false;
@@ -376,7 +362,6 @@ app.post('/api/rooms/:roomId/rules', requireOperator, requireRoomAccess, (reques
   if (!input) return response.status(400).json({ message: '规则资料格式不完整' });
   try {
     const rule = ruleCatalog.create(routeParam(request, 'roomId'), actorFromRequest(request), input);
-    scheduleKnowledgeSync(rule);
     return response.status(201).json(rule);
   } catch (error) {
     return response.status(400).json({ message: error instanceof Error ? error.message : '规则保存失败' });
@@ -389,7 +374,6 @@ app.patch('/api/rules/:ruleId', requireOperator, requireRuleAccess, (request, re
   if (!input) return response.status(400).json({ message: '规则资料格式不完整' });
   try {
     const rule = ruleCatalog.update(routeParam(request, 'ruleId'), actorFromRequest(request), input);
-    scheduleKnowledgeSync(rule);
     return response.json(rule);
   }
   catch (error) { return response.status(403).json({ message: error instanceof Error ? error.message : '规则更新失败' }); }
@@ -397,7 +381,6 @@ app.patch('/api/rules/:ruleId', requireOperator, requireRuleAccess, (request, re
 app.post('/api/rules/:ruleId/approve', requireOperator, requireRuleAccess, (request, response) => {
   try {
     const rule = ruleCatalog.approve(routeParam(request, 'ruleId'), actorFromRequest(request));
-    scheduleKnowledgeSync(rule);
     return response.json(rule);
   }
   catch (error) { return response.status(403).json({ message: error instanceof Error ? error.message : '规则审核失败' }); }
@@ -405,7 +388,6 @@ app.post('/api/rules/:ruleId/approve', requireOperator, requireRuleAccess, (requ
 app.post('/api/rules/:ruleId/reject', requireOperator, requireRuleAccess, (request, response) => {
   try {
     const rule = ruleCatalog.reject(routeParam(request, 'ruleId'), actorFromRequest(request), String(request.body?.reason ?? ''));
-    scheduleKnowledgeSync(rule);
     return response.json(rule);
   }
   catch (error) { return response.status(403).json({ message: error instanceof Error ? error.message : '规则驳回失败' }); }
@@ -415,7 +397,6 @@ app.post('/api/rules/:ruleId/rollback', requireOperator, requireRuleAccess, (req
   if (!Number.isSafeInteger(targetVersion) || targetVersion < 1) return response.status(400).json({ message: '目标版本无效' });
   try {
     const rule = ruleCatalog.rollback(routeParam(request, 'ruleId'), targetVersion, actorFromRequest(request));
-    scheduleKnowledgeSync(rule);
     return response.json(rule);
   }
   catch (error) { return response.status(403).json({ message: error instanceof Error ? error.message : '规则回滚失败' }); }
@@ -425,7 +406,6 @@ app.post('/api/rules/:ruleId/enabled', requireOperator, requireRuleAccess, (requ
   if (typeof request.body?.enabled !== 'boolean') return response.status(400).json({ message: 'enabled 必须是布尔值' });
   try {
     const rule = ruleCatalog.setEnabled(routeParam(request, 'ruleId'), request.body.enabled, actorFromRequest(request));
-    scheduleKnowledgeSync(rule);
     return response.json(rule);
   } catch (error) {
     return response.status(403).json({ message: error instanceof Error ? error.message : '规则启停失败' });

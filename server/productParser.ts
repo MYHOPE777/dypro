@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Product, ProductImportResponse } from '../src/shared/types';
+import { getArkConfig, requestArk } from './providers/ark';
 
 type ProductFields = {
   name?: unknown;
@@ -90,16 +91,6 @@ function localParse(sourceText: string, extraWarning = ''): ProductImportRespons
   };
 }
 
-function getDoubaoConfig(): { apiKey: string; endpointId: string; baseUrl: string; timeoutMs: number } | null {
-  if (!process.env.DOUBAO_API_KEY || !process.env.DOUBAO_ENDPOINT_ID) return null;
-  return {
-    apiKey: process.env.DOUBAO_API_KEY,
-    endpointId: process.env.DOUBAO_ENDPOINT_ID,
-    baseUrl: process.env.DOUBAO_BASE_URL ?? 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
-    timeoutMs: Number.isFinite(Number(process.env.DOUBAO_PRODUCT_PARSE_TIMEOUT_MS)) && Number(process.env.DOUBAO_PRODUCT_PARSE_TIMEOUT_MS) > 0 ? Number(process.env.DOUBAO_PRODUCT_PARSE_TIMEOUT_MS) : 10_000,
-  };
-}
-
 function parseJsonObject(content: string): ProductFields {
   const normalized = content.replace(/^```(?:json)?/iu, '').replace(/```$/u, '').trim();
   const start = normalized.indexOf('{');
@@ -146,37 +137,15 @@ export async function parseProductText(sourceText: string): Promise<ProductImpor
   const normalizedText = sourceText.trim();
   if (!normalizedText) throw new Error('请先粘贴商品信息');
   if (normalizedText.length > 20_000) throw new Error('商品信息不能超过 20000 个字符');
-  const config = getDoubaoConfig();
+  const config = getArkConfig(process.env, 'ARK_PRODUCT_PARSE_TIMEOUT_MS', 10_000);
   if (!config) return localParse(normalizedText);
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), config.timeoutMs);
-    let body: { choices?: Array<{ message?: { content?: string } }> };
-    try {
-      const response = await fetch(config.baseUrl, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: config.endpointId,
-          temperature: 0.1,
-          max_tokens: 800,
-          messages: [
-            {
-              role: 'system',
-              content: '你是商品资料结构化助手。把用户粘贴的商品详情整理成 JSON，不要补造未提供的库存和价格。只输出 JSON：{"name":"","category":"","price":"","stock":null,"sku":"","description":"","sellingPoints":[],"compliantPhrases":[],"image":"","accent":""}。compliantPhrases 必须是适合直播口播、避免绝对化和医疗功效承诺的表达。',
-            },
-            { role: 'user', content: normalizedText },
-          ],
-        }),
-        signal: controller.signal,
-      });
-      if (!response.ok) throw new Error(`豆包接口返回 ${response.status}`);
-      body = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
-    } finally {
-      clearTimeout(timer);
-    }
-    const content = body.choices?.[0]?.message?.content;
-    if (!content) throw new Error('豆包返回为空');
+    const content = await requestArk(
+      config,
+      '你是商品资料结构化助手。把用户粘贴的商品详情整理成 JSON，不要补造未提供的库存和价格。只输出 JSON：{"name":"","category":"","price":"","stock":null,"sku":"","description":"","sellingPoints":[],"compliantPhrases":[],"image":"","accent":""}。compliantPhrases 必须是适合直播口播、避免绝对化和医疗功效承诺的表达。',
+      normalizedText,
+      800,
+    );
     return normalizeDoubao(parseJsonObject(content), normalizedText);
   } catch (error) {
     return localParse(normalizedText, `豆包解析暂不可用，已切换本地识别：${error instanceof Error ? error.message : String(error)}`);

@@ -44,8 +44,8 @@ describe('room product catalogs', () => {
 
 describe('pasted product parsing', () => {
   it('extracts name, price, stock, SKU, category and selling points without credentials', async () => {
-    vi.stubEnv('DOUBAO_API_KEY', '');
-    vi.stubEnv('DOUBAO_ENDPOINT_ID', '');
+    vi.stubEnv('ARK_API_KEY', '');
+    vi.stubEnv('ARK_MODEL', '');
     const parsed = await parseProductText('商品名称：便携榨汁杯\n分类：小家电\n价格：99.9\n库存：1,200\nSKU：JUICE-01\n卖点：轻巧便携、USB 充电');
 
     expect(parsed.source).toBe('local-fallback');
@@ -54,8 +54,8 @@ describe('pasted product parsing', () => {
   });
 
   it('accepts compact pasted labels commonly copied from product cards', async () => {
-    vi.stubEnv('DOUBAO_API_KEY', '');
-    vi.stubEnv('DOUBAO_ENDPOINT_ID', '');
+    vi.stubEnv('ARK_API_KEY', '');
+    vi.stubEnv('ARK_MODEL', '');
     const parsed = await parseProductText('商品：轻盈防晒乳\n直播价：99元\n库存：260件\nSKU：SUN-099\n卖点：肤感清爽，适合日常通勤');
 
     expect(parsed.product).toMatchObject({ name: '轻盈防晒乳', price: '¥99', stock: 260, sku: 'SUN-099' });
@@ -64,9 +64,9 @@ describe('pasted product parsing', () => {
   });
 
   it('keeps missing Doubao stock as unknown instead of converting it to zero', async () => {
-    vi.stubEnv('DOUBAO_API_KEY', 'test-key');
-    vi.stubEnv('DOUBAO_ENDPOINT_ID', 'test-endpoint');
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ name: '同名水杯', price: '¥59', sku: 'CUP-A' }) } }] }), { status: 200 })));
+    vi.stubEnv('ARK_API_KEY', 'test-key');
+    vi.stubEnv('ARK_MODEL', 'test-model');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ name: '同名水杯', price: '¥59', sku: 'CUP-A' }) }] }] }), { status: 200 })));
 
     const parsed = await parseProductText('同名水杯，直播价 59 元');
 
@@ -75,8 +75,8 @@ describe('pasted product parsing', () => {
   });
 
   it('creates different product ids for the same name with different SKUs', async () => {
-    vi.stubEnv('DOUBAO_API_KEY', '');
-    vi.stubEnv('DOUBAO_ENDPOINT_ID', '');
+    vi.stubEnv('ARK_API_KEY', '');
+    vi.stubEnv('ARK_MODEL', '');
     const first = await parseProductText('商品：同名水杯\nSKU：CUP-A\n价格：59\n库存：10');
     const second = await parseProductText('商品：同名水杯\nSKU：CUP-B\n价格：69\n库存：20');
 
@@ -84,8 +84,8 @@ describe('pasted product parsing', () => {
   });
 
   it('rejects oversized pasted content before sending it to Doubao', async () => {
-    vi.stubEnv('DOUBAO_API_KEY', 'test-key');
-    vi.stubEnv('DOUBAO_ENDPOINT_ID', 'test-endpoint');
+    vi.stubEnv('ARK_API_KEY', 'test-key');
+    vi.stubEnv('ARK_MODEL', 'test-model');
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
 

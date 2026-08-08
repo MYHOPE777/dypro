@@ -38,15 +38,14 @@ type Readiness = {
   readyForLive: boolean;
   readyForProduction: boolean;
   mode: 'production' | 'live-with-local-persistence' | 'demo';
-  speech: { configured: boolean; label: string };
-  doubao: { configured: boolean; label: string };
+  streamingAsr: { configured: boolean; label: string };
+  arkResponses: { configured: boolean; label: string };
   auth: { configured: boolean; label: string };
   storage: { configured: boolean; label: string };
   database: { configured: boolean; label: string };
   objectStorage: { configured: boolean; label: string; status?: { pending: number; failed: number } };
   redis: { configured: boolean; label: string };
   knowledge: { configured: boolean; available: boolean; label: string; detail: string; lastError?: string };
-  knowledgeSync: { configured: boolean; available: boolean; label: string; detail: string; pending: number; failed: number; succeeded: number; lastSyncedAt: number | null };
 };
 
 function storedActorId(): string {
@@ -565,7 +564,7 @@ function TranscriptStage({ state, send }: { state: SessionState; send: (message:
   const lastFinal = state.transcriptHistory[state.transcriptHistory.length - 1];
   const latestIsCurrent = lastFinal && lastFinal.timestamp >= state.productContextStartedAt;
   return <section className="stage-section transcript-stage">
-    <div className="section-heading"><div><span className="section-kicker">实时转录 <span>VOLCENGINE ASR</span></span><h1>{state.partialTranscript || (latestIsCurrent ? lastFinal?.text : null) || '等待主播开口'}</h1></div><div className="asr-badge"><span className="signal-dot on" />{state.isListening ? 'STREAMING' : 'STANDBY'}</div></div>
+    <div className="section-heading"><div><span className="section-kicker">流式语音识别 <span>DOUBAO ASR</span></span><h1>{state.partialTranscript || (latestIsCurrent ? lastFinal?.text : null) || '等待主播开口'}</h1></div><div className="asr-badge"><span className="signal-dot on" />{state.isListening ? 'STREAMING' : 'STANDBY'}</div></div>
     <Waveform active={state.isListening} />
     <div className="transcript-feed">{state.transcriptHistory.slice(-4).map((segment, index) => <div className={`feed-line ${index === state.transcriptHistory.slice(-4).length - 1 ? 'current' : ''}`} key={segment.id}><time><span>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span><em>{formatReplayOffset(segment.offsetMs)}</em></time>{editingId === segment.id ? <form className="transcript-edit" onSubmit={(event) => { event.preventDefault(); if (draft.trim()) { send({ type: 'transcript.correct', segmentId: segment.id, text: draft.trim() }); setEditingId(null); } }}><input value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><button type="submit" title="保存纠错"><Save size={13} /></button><button type="button" title="取消纠错" onClick={() => setEditingId(null)}>×</button></form> : <><span>{segment.text}</span>{segment.isFinal && <button type="button" className="transcript-edit-button" title="纠正这句转录" onClick={() => { setEditingId(segment.id); setDraft(segment.text); }}><Pencil size={12} /></button>}</>}</div>)}</div>
   </section>;
@@ -588,7 +587,7 @@ function CompliancePanel({ result, pending = false }: { result: ComplianceResult
   const resolved = result ?? { risk: 'safe' as const, title: pending ? '正在分析当前话术' : '等待下一句', reason: pending ? '分析完成前先使用上方商品安全表达。' : '系统会在每个转录片段完成后即时分析。', policyRef: '豆包大模型 · 抖音直播规则', confidence: 0 };
   return <section className={`compliance-panel ${resolved.risk}`}>
     <div className="compliance-top"><div className="risk-pill"><RiskIcon risk={resolved.risk} /><span><RiskLabel risk={resolved.risk} /></span></div><span className="confidence">{resolved.confidence ? `${Math.round(resolved.confidence * 100)}% 置信` : '实时监测'}</span></div>
-    <h3>{resolved.title}</h3><p>{resolved.reason}</p><div className="policy-ref"><ShieldCheck size={14} />{resolved.policyRef}{result?.knowledgeEvidence?.length ? <span> · 知识库 {result.knowledgeEvidence.length} 条证据</span> : null}</div>
+    <h3>{resolved.title}</h3><p>{resolved.reason}</p><div className="policy-ref"><ShieldCheck size={14} />{resolved.policyRef}</div>
   </section>;
 }
 
@@ -608,7 +607,7 @@ function SessionStats({ state }: { state: SessionState }) {
 
 function ReadinessStrip({ readiness }: { readiness: Readiness | null }) {
   if (!readiness) return null;
-  const items = [readiness.speech, readiness.doubao, readiness.auth, readiness.database, readiness.objectStorage, readiness.redis, readiness.knowledge, readiness.knowledgeSync];
+  const items = [readiness.streamingAsr, readiness.arkResponses, readiness.auth, readiness.database, readiness.objectStorage, readiness.redis, readiness.knowledge];
   const headline = readiness.readyForProduction ? '生产依赖已就绪' : readiness.readyForLive ? '实时链路已就绪，本地持久化' : '当前为演示模式';
   return <section className={`readiness-strip ${readiness.readyForLive ? 'ready' : 'attention'}`} aria-label="开播检查">
     <div className="readiness-title"><Activity size={14} /><span>开播检查</span><strong>{headline}</strong><small>{readiness.mode === 'production' ? 'Production' : readiness.mode === 'live-with-local-persistence' ? 'Live + local fallback' : 'Demo'}</small></div>
@@ -631,7 +630,7 @@ function OperatorScreen({ access, readiness, onLogout }: { access: OperatorAcces
   const latestSegment = session.state.transcriptHistory.at(-1);
   const latestSegmentIsCurrent = Boolean(latestSegment && latestSegment.timestamp >= session.state.productContextStartedAt);
   const compliancePending = Boolean(session.state.partialTranscript || (latestSegmentIsCurrent && !currentCompliance));
-  return <div className="app-shell operator-shell"><AppHeader state={session.state} connected={session.connected} status={session.status} mode="operator" /><main className="operator-grid"><aside className="left-rail"><ProductRail state={session.state} send={session.send} onOpenLibrary={() => setWorkspaceOpen(true)} /><MicPanel isListening={session.state.isListening} connected={session.connected} captureDeniedVersion={session.captureDeniedVersion} send={session.send} /><div className="rail-footer"><Wifi size={14} />局域网地址可供 iPad 访问</div></aside><section className="main-stage"><div className="stage-context"><div><span className="eyebrow">TODAY'S LIVE · 01</span><h2>{session.state.product.name}</h2></div><div className="context-actions"><span className="ai-tag"><ShieldCheck size={14} />豆包合规引擎</span><span className="context-dot" />火山实时语音</div></div><ReadinessStrip readiness={readiness} /><TranscriptStage state={session.state} send={session.send} /><DemoInput send={session.send} /></section><aside className="coach-rail"><PromptPanel state={session.state} /><CompliancePanel result={currentCompliance} pending={compliancePending} /><section className="alert-history"><div className="section-kicker">近期提醒 <span>ALERT LOG</span></div>{session.state.alerts.length ? session.state.alerts.slice(0, 4).map((alert) => <div className="alert-row" key={alert.id}><div className={`alert-icon ${alert.risk}`}><RiskIcon risk={alert.risk} /></div><div><strong>{alert.title}</strong><small>{new Date(alert.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {alert.alternative.replace(/^可以改为：/u, '')}</small></div></div>) : <div className="empty-alert"><Check size={16} />暂无风险提醒</div>}</section></aside></main><footer className="operator-footer"><SessionStats state={session.state} /><div className="footer-note"><Activity size={15} />风险判断以豆包大模型为主，未配置密钥时使用本地规则即时兜底</div></footer>{workspaceOpen && <WorkspaceModal state={session.state} access={access} send={session.send} onClose={() => setWorkspaceOpen(false)} onLogout={onLogout} />}</div>;
+  return <div className="app-shell operator-shell"><AppHeader state={session.state} connected={session.connected} status={session.status} mode="operator" /><main className="operator-grid"><aside className="left-rail"><ProductRail state={session.state} send={session.send} onOpenLibrary={() => setWorkspaceOpen(true)} /><MicPanel isListening={session.state.isListening} connected={session.connected} captureDeniedVersion={session.captureDeniedVersion} send={session.send} /><div className="rail-footer"><Wifi size={14} />局域网地址可供 iPad 访问</div></aside><section className="main-stage"><div className="stage-context"><div><span className="eyebrow">TODAY'S LIVE · 01</span><h2>{session.state.product.name}</h2></div><div className="context-actions"><span className="ai-tag"><ShieldCheck size={14} />豆包合规引擎</span><span className="context-dot" />豆包大模型流式语音识别</div></div><ReadinessStrip readiness={readiness} /><TranscriptStage state={session.state} send={session.send} /><DemoInput send={session.send} /></section><aside className="coach-rail"><PromptPanel state={session.state} /><CompliancePanel result={currentCompliance} pending={compliancePending} /><section className="alert-history"><div className="section-kicker">近期提醒 <span>ALERT LOG</span></div>{session.state.alerts.length ? session.state.alerts.slice(0, 4).map((alert) => <div className="alert-row" key={alert.id}><div className={`alert-icon ${alert.risk}`}><RiskIcon risk={alert.risk} /></div><div><strong>{alert.title}</strong><small>{new Date(alert.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {alert.alternative.replace(/^可以改为：/u, '')}</small></div></div>) : <div className="empty-alert"><Check size={16} />暂无风险提醒</div>}</section></aside></main><footer className="operator-footer"><SessionStats state={session.state} /><div className="footer-note"><Activity size={15} />风险判断以豆包大模型为主，未配置密钥时使用本地规则即时兜底</div></footer>{workspaceOpen && <WorkspaceModal state={session.state} access={access} send={session.send} onClose={() => setWorkspaceOpen(false)} onLogout={onLogout} />}</div>;
 }
 
 function OperatorEntry() {

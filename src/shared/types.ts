@@ -100,16 +100,6 @@ export type ComplianceResult = {
   source: 'doubao' | 'local-fallback' | 'custom-rule';
   transcript: string;
   createdAt: number;
-  knowledgeEvidence?: KnowledgeEvidence[];
-};
-
-export type KnowledgeEvidence = {
-  id: string;
-  title: string;
-  content: string;
-  source: string;
-  score: number;
-  metadata?: Record<string, unknown>;
 };
 
 export type SessionStats = {
