@@ -115,19 +115,23 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 | `ARK_API_KEY` | 字符串 | 实时判定/商品解析必填 | 方舟 API Key，通过 `Authorization: Bearer <key>` 发送。 |
 | `ARK_MODEL` | 字符串 | 实时判定/商品解析必填 | 官方 Responses 请求体 `model`，可填写 Model ID 或已开通 Responses API 的 Endpoint ID，例如 `doubao-seed-2-1-pro-260628`。不要填写 API Key 名称；不支持 Responses API 的智能路由接入点会返回 `AccessDenied`。 |
 | `ARK_BASE_URL` | URL，默认 `https://ark.cn-beijing.volces.com/api/v3` | 否 | 官方 SDK 的 `base_url`；服务端自动请求 `${ARK_BASE_URL}/responses`。 |
+| `ARK_SERVICE_TIER` | `auto` 或 `fast`，默认 `auto` | 否 | 对应火山方舟 Responses API 官方 `service_tier` 参数。`auto` 使用在线推理（常规）；`fast` 使用在线推理（低延迟），需要控制台为当前模型开通低延迟服务。当前官方文档列出的 Fast 支持模型包括 `doubao-seed-2-1-turbo`、`doubao-seed-2-0-pro`、`doubao-seed-2-0-lite`、`doubao-seed-2-0-mini` 系列；实际以控制台为准。启用 `KNOWLEDGE_RESOURCE_ID` 时服务端自动使用 `auto`，因为低延迟 Responses API 不支持 `knowledge_search`。`fast` 超出限流时平台可自动降级到在线推理（常规）。 |
 | `ARK_TIMEOUT_MS` | 毫秒，默认 `5000` | 否 | 实时话术判定截止时间。常规在线推理建议 5000；低延迟推理接入点可调低。超时、非 2xx、返回非 JSON 时自动使用本地规则，保证主播不停播。 |
-| `ARK_COMPLIANCE_MAX_OUTPUT_TOKENS` | 160-800，默认 `320` | 否 | 合规 JSON 最大输出 token。系统要求豆包只输出结构化字段，减少无关解释可降低响应延迟。 |
+| `ARK_COMPLIANCE_MAX_OUTPUT_TOKENS` | 160-800，默认 `200` | 否 | 合规 JSON 最大输出 token。系统要求豆包只输出结构化字段，减少无关解释可降低响应延迟；200 已覆盖当前短标题、原因和替换话术约束，若业务话术明显更长再调高。 |
+| `ARK_LOCAL_FAST_PATH` | `true` 或 `false`，默认 `true` | 否 | 内置规则或已发布直播间规则命中 `warning` 时立即返回本地预警，不等待模型；`blocked` 本来就始终立即返回。设为 `false` 可用于对比模型结果。 |
+| `ARK_COMPLIANCE_CACHE_TTL_MS` | 非负毫秒，默认 `30000` | 否 | 相同直播间、商品、规则版本和转录文本的短时结果缓存，减少 ASR 重复片段造成的重复请求；设为 `0` 关闭。缓存只存在当前服务进程内，不写入云端。 |
 | `ARK_PRODUCT_PARSE_TIMEOUT_MS` | 毫秒，默认 `10000` | 否 | 商品粘贴识别的独立超时。失败时退回本地字段识别，并要求场控确认。 |
 
-合规请求体由服务端生成，结构如下。`store: false` 避免方舟为每句直播话术保存 Responses 上下文，未启用知识库时使用 `thinking: disabled` 降低流式判定延迟；启用 `KNOWLEDGE_RESOURCE_ID` 时按官方知识库工具要求自动切换 `thinking: auto`：
+合规请求体由服务端生成，结构如下。`store: false` 避免方舟为每句直播话术保存 Responses 上下文，未启用知识库时使用 `thinking: disabled`；`service_tier` 使用 `ARK_SERVICE_TIER` 的官方值。启用 `KNOWLEDGE_RESOURCE_ID` 时按官方知识库工具要求自动切换 `thinking: auto` 和 `service_tier: auto`：
 
 ```json
 {
   "model": "doubao-seed-2-1-pro-260628",
+  "service_tier": "auto",
   "store": false,
   "thinking": {"type": "disabled"},
   "text": {"format": {"type": "json_object"}},
-  "max_output_tokens": 500,
+  "max_output_tokens": 200,
   "input": [
     {"role": "system", "content": [{"type": "input_text", "text": "抖音直播合规审核规则..."}]},
     {"role": "user", "content": [{"type": "input_text", "text": "当前商品：...\n主播原话：..."}]}

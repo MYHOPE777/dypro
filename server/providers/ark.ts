@@ -3,6 +3,7 @@ export type ArkConfig = {
   model: string;
   baseUrl: string;
   timeoutMs: number;
+  serviceTier: 'auto' | 'fast';
   knowledgeResourceId?: string;
 };
 
@@ -23,6 +24,10 @@ function positiveTimeout(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function serviceTier(value: string | undefined): ArkConfig['serviceTier'] {
+  return value?.trim().toLowerCase() === 'fast' ? 'fast' : 'auto';
+}
+
 export function getArkConfig(
   env: NodeJS.ProcessEnv = process.env,
   timeoutVariable = 'ARK_TIMEOUT_MS',
@@ -33,7 +38,14 @@ export function getArkConfig(
   if (!apiKey || !model) return null;
   const baseUrl = (env.ARK_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/$/u, '');
   const knowledgeResourceId = env.KNOWLEDGE_RESOURCE_ID?.trim() || undefined;
-  return { apiKey, model, baseUrl, timeoutMs: positiveTimeout(env[timeoutVariable], fallbackTimeoutMs), knowledgeResourceId };
+  return {
+    apiKey,
+    model,
+    baseUrl,
+    timeoutMs: positiveTimeout(env[timeoutVariable], fallbackTimeoutMs),
+    serviceTier: serviceTier(env.ARK_SERVICE_TIER),
+    knowledgeResourceId,
+  };
 }
 
 export function getArkKnowledgeSearchStatus(env: NodeJS.ProcessEnv = process.env): ArkKnowledgeSearchStatus {
@@ -62,6 +74,8 @@ export function buildArkRequest(
   useKnowledgeSearch = false,
 ): RequestInit {
   const knowledgeSearchEnabled = useKnowledgeSearch && Boolean(config.knowledgeResourceId);
+  // 火山方舟在线推理（低延迟）的 Responses API 不支持 knowledge_search；保留知识库时回到 auto，避免整条语义链路失败。
+  const requestServiceTier = knowledgeSearchEnabled ? 'auto' : config.serviceTier;
   const headers = {
     Authorization: `Bearer ${config.apiKey}`,
     'Content-Type': 'application/json',
@@ -72,6 +86,7 @@ export function buildArkRequest(
     headers,
     body: JSON.stringify({
       model: config.model,
+      service_tier: requestServiceTier,
       store: false,
       input: [
         { role: 'system', content: [{ type: 'input_text', text: systemPrompt }] },
@@ -136,6 +151,10 @@ export async function requestArk(
     if (!response.ok) {
       const code = errorCode(body);
       const requestId = response.headers.get('x-request-id') || response.headers.get('x-client-request-id');
+      if (config.serviceTier === 'fast' && (code === 'ModelNotOpen' || code === 'AccessDenied')) {
+        // Fast 需要单独开通且只支持指定模型；不可用时按官方降级语义重试常规在线推理。
+        return requestArk({ ...config, serviceTier: 'auto' }, systemPrompt, userPrompt, maxTokens, useKnowledgeSearch);
+      }
       throw new Error(`豆包接口返回 ${response.status}${code ? ` (${code})` : ''}${requestId ? `（Request ID ${requestId}）` : ''}`);
     }
     const content = outputText(body);

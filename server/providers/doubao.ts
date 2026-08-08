@@ -5,9 +5,12 @@ import { getArkConfig, requestArk, type ArkConfig } from './ark';
 
 const severity = { safe: 0, warning: 1, blocked: 2 } as const;
 
-const SYSTEM_PROMPT = `你是抖音电商直播合规审核员。结合当前商品和主播原话，判断是否存在平台直播违规风险。
-只输出 JSON，不要 Markdown：{"risk":"safe|warning|blocked","title":"短标题","reason":"具体原因","alternative":"主播可以立即照读的合规替代表达","policyRef":"规则类别","confidence":0到1}。
-blocked 用于医疗功效、绝对化承诺、虚假或不可证明的结果保证；warning 用于极限词、紧迫性和需要核验的宣传；没有明显风险才用 safe。替代表达不能保留原违规承诺。`;
+const SYSTEM_PROMPT = `你是抖音电商直播合规审核员。结合当前商品和主播原话判断平台直播违规风险。
+只输出 JSON，不要 Markdown，字段顺序固定：{"risk":"safe|warning|blocked","title":"不超过12字","reason":"不超过45字的具体原因","alternative":"不超过60字、主播可立即照读且不保留违规承诺的替代表达","policyRef":"不超过20字的规则类别","confidence":0到1}。
+blocked 用于医疗功效、绝对化承诺、虚假或不可证明的结果保证；warning 用于极限词、紧迫性和需要核验的宣传；没有明显风险才用 safe。`;
+
+const DEFAULT_CACHE_TTL_MS = 30_000;
+const MAX_CACHE_ENTRIES = 128;
 
 export function parseArkJson(content: string): Record<string, unknown> {
   const normalized = content.replace(/^```(?:json)?/iu, '').replace(/```$/u, '').trim();
@@ -39,40 +42,74 @@ function fromDoubao(input: AnalysisInput, payload: Record<string, unknown>): Com
 export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
   private readonly config: ArkConfig | null;
   private readonly maxOutputTokens: number;
+  private readonly localFastPath: boolean;
+  private readonly cacheTtlMs: number;
+  private readonly cache = new Map<string, { expiresAt: number; result: ComplianceResult }>();
 
   constructor(env: NodeJS.ProcessEnv = process.env) {
     this.config = getArkConfig(env);
     const configuredMaxTokens = Number(env.ARK_COMPLIANCE_MAX_OUTPUT_TOKENS);
-    this.maxOutputTokens = Number.isInteger(configuredMaxTokens) && configuredMaxTokens >= 160 && configuredMaxTokens <= 800 ? configuredMaxTokens : 320;
+    this.maxOutputTokens = Number.isInteger(configuredMaxTokens) && configuredMaxTokens >= 160 && configuredMaxTokens <= 800 ? configuredMaxTokens : 200;
+    this.localFastPath = env.ARK_LOCAL_FAST_PATH?.trim().toLowerCase() !== 'false';
+    const configuredCacheTtl = Number(env.ARK_COMPLIANCE_CACHE_TTL_MS);
+    this.cacheTtlMs = Number.isFinite(configuredCacheTtl) && configuredCacheTtl >= 0 ? configuredCacheTtl : DEFAULT_CACHE_TTL_MS;
   }
 
   async analyze(input: AnalysisInput): Promise<ComplianceResult> {
     const localResult = await analyzeTranscript(input);
     // High-confidence local blocks are already actionable; do not spend the realtime budget waiting for a second opinion.
-    if (!this.config || localResult.risk === 'blocked') return localResult;
+    // Local warnings from the built-in or published room rules are also actionable and avoid a model round trip.
+    if (!this.config || localResult.risk === 'blocked' || (this.localFastPath && localResult.risk === 'warning')) return localResult;
+    const cacheKey = this.cacheKey(input);
+    const cached = this.cache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return structuredClone(cached.result);
+    if (cached) this.cache.delete(cacheKey);
     const compactRules = input.customRules?.slice(0, 20).map((rule) => ({
-      name: rule.name,
-      pattern: rule.pattern,
+      name: rule.name.slice(0, 40),
+      pattern: rule.pattern.slice(0, 100),
       risk: rule.risk,
-      reason: rule.reason,
-      alternative: rule.alternative,
-      policyRef: rule.policyRef,
+      reason: rule.reason.slice(0, 120),
+      alternative: rule.alternative.slice(0, 160),
+      policyRef: rule.policyRef.slice(0, 40),
     })) ?? [];
+    const product = input.product
+      ? {
+        id: input.product.id,
+        name: input.product.name,
+        category: input.product.category,
+        price: input.product.price,
+        compliantPhrases: input.product.compliantPhrases.slice(0, 3).map((phrase) => phrase.slice(0, 80)),
+      }
+      : { id: input.productId };
     try {
       const content = await requestArk(
         this.config,
         SYSTEM_PROMPT,
-        `当前商品：${JSON.stringify(input.product ?? { id: input.productId })}\n主播原话：${input.transcript}\n本直播间相关规则：${JSON.stringify(compactRules)}`,
+        `当前商品：${JSON.stringify(product)}\n主播原话：${input.transcript}\n本直播间相关规则：${JSON.stringify(compactRules)}`,
         this.maxOutputTokens,
         true,
       );
       const doubaoResult = fromDoubao(input, parseArkJson(content));
-      return severity[doubaoResult.risk] >= severity[localResult.risk] ? doubaoResult : localResult;
+      const result = severity[doubaoResult.risk] >= severity[localResult.risk] ? doubaoResult : localResult;
+      if (this.cacheTtlMs > 0) {
+        if (this.cache.size >= MAX_CACHE_ENTRIES) this.cache.delete(this.cache.keys().next().value as string);
+        this.cache.set(cacheKey, { expiresAt: Date.now() + this.cacheTtlMs, result: structuredClone(result) });
+      }
+      return result;
     } catch (error) {
       return {
         ...localResult,
         reason: `${localResult.reason} 豆包暂时不可用，已切换本地规则兜底。`,
       };
     }
+  }
+
+  private cacheKey(input: AnalysisInput): string {
+    return JSON.stringify({
+      roomId: input.roomId ?? '',
+      productId: input.productId,
+      transcript: input.transcript.trim(),
+      rules: input.customRules?.map((rule) => `${rule.id}:${rule.version}:${rule.enabled}:${rule.status}`).join('|') ?? '',
+    });
   }
 }

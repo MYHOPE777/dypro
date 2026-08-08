@@ -36,7 +36,7 @@ describe('DoubaoComplianceAnalyzer', () => {
       output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ risk: 'warning', title: '语义提醒', reason: '需要核验', alternative: '替代表达', policyRef: '平台规则', confidence: 0.8 }) }] }],
     }), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
-    const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model', ARK_COMPLIANCE_MAX_OUTPUT_TOKENS: '200' });
+    const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model', ARK_COMPLIANCE_MAX_OUTPUT_TOKENS: '200', ARK_LOCAL_FAST_PATH: 'false' });
 
     await analyzer.analyze({ productId: 'serum', transcript: '特别适合所有肤质' });
 
@@ -45,11 +45,38 @@ describe('DoubaoComplianceAnalyzer', () => {
     expect(request.input[1]?.content[0]?.text).toContain('本直播间相关规则');
   });
 
+  it('returns a high-confidence local warning without waiting for the model', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model' });
+
+    const result = await analyzer.analyze({ productId: 'serum', transcript: '这款商品适合所有肤质' });
+
+    expect(result).toMatchObject({ risk: 'warning', source: 'local-fallback' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('reuses a recent result for the same transcript and product', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      output_text: JSON.stringify({ risk: 'warning', title: '语义提醒', reason: '需要核验', alternative: '替代表达', policyRef: '平台规则', confidence: 0.8 }),
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model', ARK_LOCAL_FAST_PATH: 'false' });
+    const input = { productId: 'serum', transcript: '这款商品采用行业领先的特殊工艺', customRules: [] };
+
+    const first = await analyzer.analyze(input);
+    const second = await analyzer.analyze(input);
+
+    expect(second).toMatchObject({ risk: 'warning', source: 'doubao' });
+    expect(second.id).toBe(first.id);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it('falls back to local rules when Doubao exceeds the realtime deadline', async () => {
     vi.stubGlobal('fetch', vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
       init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
     })));
-    const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model', ARK_TIMEOUT_MS: '5' });
+    const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model', ARK_TIMEOUT_MS: '5', ARK_LOCAL_FAST_PATH: 'false' });
 
     const result = await analyzer.analyze({ productId: 'serum', transcript: '今天是全网最低价' });
 
