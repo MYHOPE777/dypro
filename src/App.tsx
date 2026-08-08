@@ -591,6 +591,9 @@ function MicPanel({ state, connected, captureDeniedVersion, send, onOpenReview }
   const endLive = () => {
     if (send({ type: 'control.end' })) microphone.stop();
   };
+  const pauseLive = () => {
+    if (send({ type: 'control.pause' })) microphone.stop();
+  };
   const deviceTitle = state.captureState === 'ended' ? '本场直播已结束'
     : state.captureState === 'paused' ? '直播收音已暂停'
       : state.captureState === 'live' ? microphone.capturing ? '直播收音运行中' : '其他控制台正在收音'
@@ -604,7 +607,7 @@ function MicPanel({ state, connected, captureDeniedVersion, send, onOpenReview }
     {microphone.error && <div className="inline-error"><AlertTriangle size={14} />{microphone.error}</div>}
     {microphone.capturing && <div className="mic-meter"><div className="mic-meter-track"><i style={{ width: `${Math.max(2, microphone.level)}%` }} /></div><span>{levelLabel}</span></div>}
     {state.captureState === 'idle' && <div className="mic-control-stack"><button type="button" className="test-control" onClick={() => microphone.capturing ? microphone.stop() : void microphone.start()} disabled={!connected}><Activity size={15} />{microphone.capturing ? '结束设备测试' : '检测并测试麦克风'}</button><button type="button" className="main-control start" onClick={() => void startLive()} disabled={!connected}><Radio size={16} />开始直播收音</button></div>}
-    {state.captureState === 'live' && <div className="mic-control-stack horizontal"><button type="button" className="test-control" onClick={() => send({ type: 'control.pause' })} disabled={!connected}><Pause size={15} fill="currentColor" />暂停</button><button type="button" className="main-control stop" onClick={endLive} disabled={!connected}><CircleStop size={16} />结束直播</button></div>}
+    {state.captureState === 'live' && <div className="mic-control-stack horizontal"><button type="button" className="test-control" onClick={pauseLive} disabled={!connected}><Pause size={15} fill="currentColor" />暂停</button><button type="button" className="main-control stop" onClick={endLive} disabled={!connected}><CircleStop size={16} />结束直播</button></div>}
     {state.captureState === 'paused' && <div className="mic-control-stack horizontal"><button type="button" className="main-control start" onClick={() => void startLive(true)} disabled={!connected}><Play size={16} fill="currentColor" />继续收音</button><button type="button" className="main-control stop" onClick={endLive} disabled={!connected}><CircleStop size={16} />结束直播</button></div>}
     {state.captureState === 'ended' && <button type="button" className="review-control" onClick={onOpenReview}><FileAudio size={16} />复核音频与转录</button>}
     <span className="capture-note"><span className={`capture-dot ${state.isListening ? 'active' : ''}`} />{state.captureState === 'live' ? 'ASR STREAMING' : state.captureState === 'paused' ? 'PAUSED' : state.captureState === 'ended' ? 'ARCHIVED LOCALLY' : microphone.capturing ? 'LOCAL TEST' : 'STANDBY'}</span>
