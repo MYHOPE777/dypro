@@ -104,8 +104,19 @@ export type ComplianceResult = {
   source: 'doubao' | 'local-fallback' | 'custom-rule';
   transcript: string;
   createdAt: number;
-  /** Milliseconds from final transcript receipt to completed compliance analysis. */
+  /** Milliseconds from final transcript receipt to the completed compliance result. */
   analysisMs?: number;
+  /** Detailed server-side stages retained for timeline diagnostics. */
+  analysisTiming?: ComplianceAnalysisTiming;
+};
+
+export type ComplianceAnalysisTiming = {
+  path: 'local' | 'cache' | 'ark' | 'fallback';
+  analyzerMs: number;
+  localGuardrailMs: number;
+  cacheLookupMs?: number;
+  arkRequestMs?: number;
+  responseParseMs?: number;
 };
 
 export type SessionStats = {

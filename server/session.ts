@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type WebSocket from 'ws';
 import { createDoubaoAnalyzer } from './services';
-import { buildStreamingAsrContext, createDoubaoStreamingAsr, type DoubaoStreamingAsr } from './providers/doubaoStreamingAsr';
+import { buildStreamingAsrContext, createDoubaoStreamingAsr, type DoubaoStreamingAsr, type StreamingAsrOptions } from './providers/doubaoStreamingAsr';
 import type { TimelineWriter } from './timelineStore';
 import type { RecordingArchiveQueue } from './recordingArchive';
 import type { ComplianceAnalyzer } from '../src/compliance/engine';
@@ -28,6 +28,7 @@ type LiveSessionOptions = {
   speechCorrectionCatalog?: SpeechCorrectionCatalog;
   archiveQueue?: RecordingArchiveQueue;
   analyzer?: ComplianceAnalyzer;
+  streamingAsrFactory?: (options: StreamingAsrOptions) => DoubaoStreamingAsr | null;
   roomId?: string;
   actorId?: string;
   now?: () => number;
@@ -45,6 +46,7 @@ export class LiveSession {
   readonly createdAt: number;
   private readonly clients = new Set<Client>();
   private readonly analyzer: ComplianceAnalyzer;
+  private readonly streamingAsrFactory: NonNullable<LiveSessionOptions['streamingAsrFactory']>;
   private speechStream: DoubaoStreamingAsr | null = null;
   private drainingSpeechStream: DoubaoStreamingAsr | null = null;
   private speechDrainTimer: NodeJS.Timeout | null = null;
@@ -79,6 +81,7 @@ export class LiveSession {
     this.speechCorrectionCatalog = options.speechCorrectionCatalog;
     this.archiveQueue = options.archiveQueue;
     this.analyzer = options.analyzer ?? createDoubaoAnalyzer();
+    this.streamingAsrFactory = options.streamingAsrFactory ?? createDoubaoStreamingAsr;
     this.roomId = options.roomId ?? 'room-default';
     this.actorId = options.actorId ?? 'owner';
     this.now = options.now ?? Date.now;
@@ -203,13 +206,13 @@ export class LiveSession {
       bitsPerSample: 16,
     });
     let stream: DoubaoStreamingAsr | null = null;
-    stream = createDoubaoStreamingAsr({
+    stream = this.streamingAsrFactory({
       onResult: ({ text, isFinal, startTimeMs, endTimeMs }) => {
         if (this.stateValue.isListening || (isFinal && this.drainingSpeechStream === stream)) this.ingestTranscript(text, isFinal, { startTimeMs, endTimeMs });
       },
       onError: (error) => {
-        if (this.stateValue.isListening) this.handleSpeechFailure(error);
-        else if (this.drainingSpeechStream === stream) {
+        if (this.stateValue.isListening && this.speechStream === stream) this.handleSpeechFailure(error);
+        else if (!this.stateValue.isListening && this.drainingSpeechStream === stream) {
           this.status(`流式语音识别收尾失败，最后一句可能不完整：${error.message}`, 'error');
           this.releaseDrainingSpeechStream(stream, true);
         }
@@ -445,15 +448,32 @@ export class LiveSession {
     const revision = this.segmentRevisions.get(segment.id) ?? 0;
     const requestNumber = ++this.analysisRequestNumber;
     this.latestAnalysisRequest = requestNumber;
-    void this.checkCompliance(segment.text, generation, product.id, product, segment, revision, requestNumber)
+    const queuedAt = performance.now();
+    void this.checkCompliance(segment.text, generation, product.id, product, segment, revision, requestNumber, queuedAt)
       .catch((error: unknown) => this.status(`合规分析暂时不可用：${error instanceof Error ? error.message : String(error)}`, 'error'));
   }
 
-  private async checkCompliance(transcript: string, generation: number, productId: string, product: Product, segment: TranscriptSegment, revision: number, requestNumber: number): Promise<void> {
+  private async checkCompliance(transcript: string, generation: number, productId: string, product: Product, segment: TranscriptSegment, revision: number, requestNumber: number, queuedAt: number): Promise<void> {
     const analysisStartedAt = performance.now();
+    const analysisStartedAtWallClock = this.now();
     const analyzed = await this.analyzer.analyze({ roomId: this.roomId, productId, transcript, product, customRules: this.ruleCatalog?.listActive(this.roomId) });
     if (generation !== this.productGeneration || productId !== this.stateValue.product.id || revision !== this.segmentRevisions.get(segment.id)) return;
-    const result = { ...analyzed, segmentId: segment.id, analysisMs: Math.max(0, Math.round(performance.now() - analysisStartedAt)) };
+    const complianceAnalysisMs = Math.max(0, Math.round(performance.now() - analysisStartedAt));
+    const completedAt = this.now();
+    const totalResponseMs = Math.max(0, completedAt - segment.timestamp);
+    const result = { ...analyzed, segmentId: segment.id, createdAt: completedAt, analysisMs: totalResponseMs };
+    const stageTimings = {
+      totalResponseMs,
+      asrAudioDurationMs: segment.startOffsetMs !== null && segment.endOffsetMs !== null ? Math.max(0, segment.endOffsetMs - segment.startOffsetMs) : null,
+      asrFinalizationMs: this.recordingStartedAt !== null && segment.endOffsetMs !== null
+        ? Math.max(0, segment.timestamp - (this.recordingStartedAt + segment.endOffsetMs))
+        : null,
+      complianceQueueMs: Math.max(0, Math.round(analysisStartedAt - queuedAt)),
+      complianceAnalysisMs,
+      analysisStartedAt: analysisStartedAtWallClock,
+      completedAt,
+      ...(analyzed.analysisTiming ? { analyzer: analyzed.analysisTiming } : {}),
+    };
     this.complianceBySegment.set(segment.id, result);
     if (requestNumber === this.latestAnalysisRequest) this.stateValue.latestCompliance = result;
     this.stateValue.stats[`${result.risk}Count` as 'safeCount' | 'warningCount' | 'blockedCount'] += 1;
@@ -470,6 +490,7 @@ export class LiveSession {
       confidence: result.confidence,
       source: result.source,
       analysisMs: result.analysisMs,
+      stageTimings,
     });
     this.broadcast({ type: 'compliance.result', result });
     this.broadcast({ type: 'state.snapshot', state: this.state });

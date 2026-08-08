@@ -1,6 +1,6 @@
 import type { ComplianceAnalyzer, AnalysisInput } from '../../src/compliance/engine';
 import { analyzeTranscript } from '../../src/compliance/engine';
-import type { ComplianceResult } from '../../src/shared/types';
+import type { ComplianceAnalysisTiming, ComplianceResult } from '../../src/shared/types';
 import { getArkConfig, requestArk, type ArkConfig } from './ark';
 
 const severity = { safe: 0, warning: 1, blocked: 2 } as const;
@@ -11,6 +11,10 @@ blocked 用于医疗功效、绝对化承诺、虚假或不可证明的结果保
 
 const DEFAULT_CACHE_TTL_MS = 30_000;
 const MAX_CACHE_ENTRIES = 128;
+
+function elapsedMs(startedAt: number): number {
+  return Math.max(0, Math.round(performance.now() - startedAt));
+}
 
 export function parseArkJson(content: string): Record<string, unknown> {
   const normalized = content.replace(/^```(?:json)?/iu, '').replace(/```$/u, '').trim();
@@ -56,13 +60,31 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
   }
 
   async analyze(input: AnalysisInput): Promise<ComplianceResult> {
+    const analyzerStartedAt = performance.now();
+    const localStartedAt = performance.now();
     const localResult = await analyzeTranscript(input);
+    const localGuardrailMs = elapsedMs(localStartedAt);
     // High-confidence local blocks are already actionable; do not spend the realtime budget waiting for a second opinion.
     // Local warnings from the built-in or published room rules are also actionable and avoid a model round trip.
-    if (!this.config || localResult.risk === 'blocked' || (this.localFastPath && localResult.risk === 'warning')) return localResult;
+    if (!this.config || localResult.risk === 'blocked' || (this.localFastPath && localResult.risk === 'warning')) {
+      const path: ComplianceAnalysisTiming['path'] = !this.config || localResult.risk === 'blocked' ? 'local' : 'fallback';
+      return { ...localResult, analysisTiming: { path, analyzerMs: elapsedMs(analyzerStartedAt), localGuardrailMs } };
+    }
+    const cacheStartedAt = performance.now();
     const cacheKey = this.cacheKey(input);
     const cached = this.cache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) return structuredClone(cached.result);
+    const cacheLookupMs = elapsedMs(cacheStartedAt);
+    if (cached && cached.expiresAt > Date.now()) {
+      return {
+        ...structuredClone(cached.result),
+        analysisTiming: {
+          path: 'cache',
+          analyzerMs: elapsedMs(analyzerStartedAt),
+          localGuardrailMs,
+          cacheLookupMs,
+        },
+      };
+    }
     if (cached) this.cache.delete(cacheKey);
     const compactRules = input.customRules?.slice(0, 20).map((rule) => ({
       name: rule.name.slice(0, 40),
@@ -82,6 +104,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
       }
       : { id: input.productId };
     try {
+      const arkStartedAt = performance.now();
       const content = await requestArk(
         this.config,
         SYSTEM_PROMPT,
@@ -89,17 +112,34 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
         this.maxOutputTokens,
         true,
       );
+      const arkRequestMs = elapsedMs(arkStartedAt);
+      const responseParseStartedAt = performance.now();
       const doubaoResult = fromDoubao(input, parseArkJson(content));
+      const responseParseMs = elapsedMs(responseParseStartedAt);
       const result = severity[doubaoResult.risk] >= severity[localResult.risk] ? doubaoResult : localResult;
+      const analysisTiming: ComplianceAnalysisTiming = {
+        path: 'ark',
+        analyzerMs: elapsedMs(analyzerStartedAt),
+        localGuardrailMs,
+        cacheLookupMs,
+        arkRequestMs,
+        responseParseMs,
+      };
       if (this.cacheTtlMs > 0) {
         if (this.cache.size >= MAX_CACHE_ENTRIES) this.cache.delete(this.cache.keys().next().value as string);
-        this.cache.set(cacheKey, { expiresAt: Date.now() + this.cacheTtlMs, result: structuredClone(result) });
+        this.cache.set(cacheKey, { expiresAt: Date.now() + this.cacheTtlMs, result: structuredClone({ ...result, analysisTiming }) });
       }
-      return result;
+      return { ...result, analysisTiming };
     } catch (error) {
       return {
         ...localResult,
         reason: `${localResult.reason} 豆包暂时不可用，已切换本地规则兜底。`,
+        analysisTiming: {
+          path: 'fallback',
+          analyzerMs: elapsedMs(analyzerStartedAt),
+          localGuardrailMs,
+          cacheLookupMs,
+        },
       };
     }
   }

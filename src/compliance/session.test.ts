@@ -6,6 +6,7 @@ import { LiveSession } from '../../server/session';
 import { FileTimelineStore } from '../../server/timelineStore';
 import type WebSocket from 'ws';
 import type { ComplianceResult } from '../shared/types';
+import type { DoubaoStreamingAsr, StreamingAsrOptions } from '../../server/providers/doubaoStreamingAsr';
 
 function fakeSocket() {
   return { readyState: 1, send: () => undefined } as unknown as WebSocket;
@@ -69,6 +70,22 @@ describe('LiveSession', () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(session.state).toMatchObject({ isListening: false, captureState: 'ended' });
     expect(enqueue).toHaveBeenCalledOnce();
+  });
+
+  it('does not let a paused stream error pause the stream created after resume', () => {
+    const streamOptions: StreamingAsrOptions[] = [];
+    const streamingAsrFactory = (options: StreamingAsrOptions) => {
+      streamOptions.push(options);
+      return { connect: () => undefined, finish: () => undefined, close: () => undefined, sendAudio: () => undefined } as unknown as DoubaoStreamingAsr;
+    };
+    const session = new LiveSession('stale-asr-error-session', { streamingAsrFactory });
+
+    session.startListening();
+    session.pauseListening();
+    session.resumeListening();
+    streamOptions[0]?.onError(new Error('旧连接延迟报错'));
+
+    expect(session.state).toMatchObject({ isListening: true, captureState: 'live' });
   });
 
   it('starts semantic checks concurrently and keeps the newest result current', async () => {

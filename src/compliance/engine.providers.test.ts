@@ -11,6 +11,11 @@ describe('DoubaoComplianceAnalyzer', () => {
 
     expect(result.source).toBe('local-fallback');
     expect(result.risk).toBe('blocked');
+    expect(result.analysisTiming).toMatchObject({
+      path: 'local',
+      analyzerMs: expect.any(Number),
+      localGuardrailMs: expect.any(Number),
+    });
   });
 
   it('returns an immediate local block without waiting for a lower-priority model result', async () => {

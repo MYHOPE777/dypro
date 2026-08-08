@@ -173,6 +173,13 @@ describe('session timeline export', () => {
     resumedSession.ingestAudio(Buffer.alloc(2));
 
     const timeline = timelineStore.exportSession('live-resume-test');
+    const complianceEvent = timeline?.events.find((event) => event.type === 'compliance.result');
+    expect(complianceEvent?.payload.stageTimings).toMatchObject({
+      totalResponseMs: expect.any(Number),
+      complianceQueueMs: expect.any(Number),
+      complianceAnalysisMs: expect.any(Number),
+    });
+    expect(complianceEvent?.payload.analysisMs).toBe((complianceEvent?.payload.stageTimings as { totalResponseMs: number }).totalResponseMs);
     expect(timeline?.events.filter((event) => event.type === 'session.created')).toHaveLength(1);
     const captureEvents = timeline?.events.filter((event) => event.type === 'capture.started' || event.type === 'capture.resumed');
     expect(captureEvents?.map((event) => event.offsetMs)).toEqual([0, 6_000]);
