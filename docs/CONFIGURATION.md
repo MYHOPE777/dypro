@@ -102,7 +102,7 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 
 火山引擎服务端在约 8 秒未收到下一音频包时会返回 `45000081` 并结束会话。主播停顿期间，服务端会在连续 2 秒未收到浏览器音频后发送约 100 ms 的静音 audio-only 帧作为保活；保活帧不会写入原始音频、16 kHz ASR 音频或时间线。暂停、结束直播或连接关闭时会立即清理保活定时器。
 
-浏览器会同时保留两条音轨：发送给 ASR 的 16 kHz PCM，以及蓝牙设备原始采样率 PCM。豆包大模型流式语音识别连接尚未 ready 时最多缓冲约 160 KB 音频，超过后会停止收音并提示连接异常。
+浏览器会同时保留两条音轨：发送给 ASR 的 16 kHz PCM，以及蓝牙设备原始采样率 PCM。服务端先把音频包聚合成约 256 KB 的切片，通过独立队列异步写入 `.data/timeline/<sessionId>/audio.chunks/`；停播后再顺序合并为完整 PCM 并删除临时切片，合并完成后才进入归档队列。音频写入和合并不占用语义合规分析队列。豆包大模型流式语音识别连接尚未 ready 时最多缓冲约 160 KB 音频，超过后会停止收音并提示连接异常。
 
 控制台的直播收音状态为：待开播、直播中、已暂停、已结束。设备测试只在浏览器本机计算音量，不上传也不写入音频文件；开始直播后才建立 ASR 和时间线。暂停会结束当前 ASR 流但保留同一场会话，继续时建立新的 ASR 流并保持直播绝对时间戳和音频采样位置；只有结束直播才进入停播归档队列。结束后可播放 16 kHz 识别音频并按片段时间戳修正文稿。
 
@@ -115,7 +115,8 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 | `ARK_API_KEY` | 字符串 | 实时判定/商品解析必填 | 方舟 API Key，通过 `Authorization: Bearer <key>` 发送。 |
 | `ARK_MODEL` | 字符串 | 实时判定/商品解析必填 | 官方 Responses 请求体 `model`，可填写 Model ID 或已开通 Responses API 的 Endpoint ID，例如 `doubao-seed-2-1-pro-260628`。不要填写 API Key 名称；不支持 Responses API 的智能路由接入点会返回 `AccessDenied`。 |
 | `ARK_BASE_URL` | URL，默认 `https://ark.cn-beijing.volces.com/api/v3` | 否 | 官方 SDK 的 `base_url`；服务端自动请求 `${ARK_BASE_URL}/responses`。 |
-| `ARK_TIMEOUT_MS` | 毫秒，默认 `2500` | 否 | 实时话术判定截止时间。超时、非 2xx、返回非 JSON 时自动使用本地规则，保证主播不停播。 |
+| `ARK_TIMEOUT_MS` | 毫秒，默认 `5000` | 否 | 实时话术判定截止时间。常规在线推理建议 5000；低延迟推理接入点可调低。超时、非 2xx、返回非 JSON 时自动使用本地规则，保证主播不停播。 |
+| `ARK_COMPLIANCE_MAX_OUTPUT_TOKENS` | 160-800，默认 `320` | 否 | 合规 JSON 最大输出 token。系统要求豆包只输出结构化字段，减少无关解释可降低响应延迟。 |
 | `ARK_PRODUCT_PARSE_TIMEOUT_MS` | 毫秒，默认 `10000` | 否 | 商品粘贴识别的独立超时。失败时退回本地字段识别，并要求场控确认。 |
 
 合规请求体由服务端生成，结构如下。`store: false` 避免方舟为每句直播话术保存 Responses 上下文，未启用知识库时使用 `thinking: disabled` 降低流式判定延迟；启用 `KNOWLEDGE_RESOURCE_ID` 时按官方知识库工具要求自动切换 `thinking: auto`：

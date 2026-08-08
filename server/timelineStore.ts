@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { SessionTimelineExport, TimelineAudioAsset, TimelineEvent, TimelineEventType } from '../src/shared/types';
@@ -21,9 +21,12 @@ export interface TimelineWriter {
   appendAudio(sessionId: string, audio: Buffer): void;
   getAudioByteLength(sessionId: string): number;
   appendSourceAudio(sessionId: string, audio: Buffer, sampleRate: number): void;
+  finalizeAudio(sessionId: string): void;
   getSessionTiming(sessionId: string): { createdAt: number | null; recordingStartedAt: number | null };
   exportSession(sessionId: string): SessionTimelineExport | null;
 }
+
+const AUDIO_CHUNK_DIRECTORY = 'audio.chunks';
 
 function assertSessionId(sessionId: string): void {
   if (!/^[a-z0-9-]{4,64}$/iu.test(sessionId)) throw new Error('invalid session id');
@@ -53,8 +56,7 @@ export class FileTimelineStore implements TimelineWriter {
   appendAudio(sessionId: string, audio: Buffer): void {
     if (audio.length === 0) return;
     if (audio.length % BYTES_PER_SAMPLE !== 0) throw new Error('PCM16 audio must contain complete samples');
-    const directory = this.ensureSessionDirectory(sessionId);
-    appendFileSync(path.join(directory, 'audio.pcm'), audio);
+    this.appendChunk(sessionId, 'asr', audio);
   }
 
   readAudio(sessionId: string): Buffer | null {
@@ -64,7 +66,7 @@ export class FileTimelineStore implements TimelineWriter {
 
   getAudioByteLength(sessionId: string): number {
     const audioPath = this.getAudioPath(sessionId);
-    return audioPath ? statSync(audioPath).size : 0;
+    return audioPath ? statSync(audioPath).size : this.chunkByteLength(sessionId, 'asr');
   }
 
   appendSourceAudio(sessionId: string, audio: Buffer, sampleRate: number): void {
@@ -82,12 +84,19 @@ export class FileTimelineStore implements TimelineWriter {
       writeFileSync(temporaryPath, JSON.stringify({ encoding: 'pcm_s16le', channels: 1, bitsPerSample: 16, tracks }), 'utf8');
       renameSync(temporaryPath, metadataPath);
     }
-    appendFileSync(path.join(directory, track.fileName), audio);
+    this.appendChunk(sessionId, `source-${tracks.indexOf(track)}`, audio);
   }
 
   getSourceAudioByteLength(sessionId: string, trackIndex = 0): number {
     const audioPath = this.getSourceAudioPath(sessionId, trackIndex);
-    return audioPath ? statSync(audioPath).size : 0;
+    return audioPath ? statSync(audioPath).size : this.chunkByteLength(sessionId, `source-${trackIndex}`);
+  }
+
+  finalizeAudio(sessionId: string): void {
+    const directory = this.ensureSessionDirectory(sessionId);
+    this.mergeChunks(sessionId, 'asr', path.join(directory, 'audio.pcm'));
+    const tracks = this.getSourceTracks(sessionId);
+    tracks.forEach((_track, index) => this.mergeChunks(sessionId, `source-${index}`, path.join(directory, tracks[index].fileName)));
   }
 
   readSourceAudio(sessionId: string, trackIndex = 0): Buffer | null {
@@ -210,6 +219,36 @@ export class FileTimelineStore implements TimelineWriter {
     const directory = this.sessionPath(sessionId);
     mkdirSync(directory, { recursive: true });
     return directory;
+  }
+
+  private appendChunk(sessionId: string, streamName: string, audio: Buffer): void {
+    const directory = path.join(this.ensureSessionDirectory(sessionId), AUDIO_CHUNK_DIRECTORY, streamName);
+    mkdirSync(directory, { recursive: true });
+    const index = this.chunkFiles(sessionId, streamName).length;
+    writeFileSync(path.join(directory, `${index.toString().padStart(8, '0')}.pcm`), audio, { flag: 'wx' });
+  }
+
+  private chunkFiles(sessionId: string, streamName: string): string[] {
+    const directory = this.sessionPath(sessionId, path.join(AUDIO_CHUNK_DIRECTORY, streamName));
+    if (!existsSync(directory)) return [];
+    return readdirSync(directory)
+      .filter((fileName) => /^\d{8}\.pcm$/u.test(fileName))
+      .sort()
+      .map((fileName) => path.join(directory, fileName));
+  }
+
+  private chunkByteLength(sessionId: string, streamName: string): number {
+    return this.chunkFiles(sessionId, streamName).reduce((total, filePath) => total + statSync(filePath).size, 0);
+  }
+
+  private mergeChunks(sessionId: string, streamName: string, targetPath: string): void {
+    const chunks = this.chunkFiles(sessionId, streamName);
+    if (chunks.length === 0) return;
+    const temporaryPath = `${targetPath}.tmp`;
+    rmSync(temporaryPath, { force: true });
+    for (const chunk of chunks) appendFileSync(temporaryPath, readFileSync(chunk));
+    renameSync(temporaryPath, targetPath);
+    rmSync(path.dirname(chunks[0]), { recursive: true, force: true });
   }
 
   private sessionPath(sessionId: string, fileName?: string): string {

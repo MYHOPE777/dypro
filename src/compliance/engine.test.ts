@@ -3,6 +3,20 @@ import { analyzeTranscript } from './engine';
 import type { ComplianceRule } from '../shared/types';
 
 describe('analyzeTranscript', () => {
+  it('flags semantic appearance claims without relying on a listed sensitive word', async () => {
+    const result = await analyzeTranscript({ productId: 'serum', transcript: '这款面霜用了之后毛孔看不见了，皮肤像婴儿一样' });
+
+    expect(result.risk).toBe('blocked');
+    expect(result.title).toContain('外观效果');
+  });
+
+  it('flags universal suitability claims as a warning', async () => {
+    const result = await analyzeTranscript({ productId: 'serum', transcript: '特别适合所有肤质，任何人都可以放心使用' });
+
+    expect(result.risk).toBe('warning');
+    expect(result.reason).toContain('所有人');
+  });
+
   it('flags an absolute efficacy claim and gives the host a product-safe replacement', async () => {
     const result = await analyzeTranscript({
       productId: 'serum',

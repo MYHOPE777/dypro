@@ -26,7 +26,7 @@ function positiveTimeout(value: string | undefined, fallback: number): number {
 export function getArkConfig(
   env: NodeJS.ProcessEnv = process.env,
   timeoutVariable = 'ARK_TIMEOUT_MS',
-  fallbackTimeoutMs = 2_500,
+  fallbackTimeoutMs = 5_000,
 ): ArkConfig | null {
   const apiKey = env.ARK_API_KEY?.trim();
   const model = env.ARK_MODEL?.trim();

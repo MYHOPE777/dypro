@@ -13,7 +13,7 @@ describe('DoubaoComplianceAnalyzer', () => {
     expect(result.risk).toBe('blocked');
   });
 
-  it('applies the non-downgradable local block before a lower custom rule or Doubao call', async () => {
+  it('returns an immediate local block without waiting for a lower-priority model result', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ risk: 'warning', title: '豆包提醒', reason: '需要注意', alternative: '替代表达', policyRef: '平台规则', confidence: 0.8 }) }] }],
     }), { status: 200 }));
@@ -28,7 +28,21 @@ describe('DoubaoComplianceAnalyzer', () => {
     const result = await analyzer.analyze({ productId: 'serum', transcript: '保证三天全部消失', customRules: [rule] });
 
     expect(result.risk).toBe('blocked');
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('uses a compact response budget for semantic checks', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ risk: 'warning', title: '语义提醒', reason: '需要核验', alternative: '替代表达', policyRef: '平台规则', confidence: 0.8 }) }] }],
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model', ARK_COMPLIANCE_MAX_OUTPUT_TOKENS: '200' });
+
+    await analyzer.analyze({ productId: 'serum', transcript: '特别适合所有肤质' });
+
+    const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as { max_output_tokens: number; input: Array<{ content: Array<{ text: string }> }> };
+    expect(request.max_output_tokens).toBe(200);
+    expect(request.input[1]?.content[0]?.text).toContain('本直播间相关规则');
   });
 
   it('falls back to local rules when Doubao exceeds the realtime deadline', async () => {
@@ -37,9 +51,9 @@ describe('DoubaoComplianceAnalyzer', () => {
     })));
     const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model', ARK_TIMEOUT_MS: '5' });
 
-    const result = await analyzer.analyze({ productId: 'serum', transcript: '这款产品保证立刻见效' });
+    const result = await analyzer.analyze({ productId: 'serum', transcript: '今天是全网最低价' });
 
-    expect(result).toMatchObject({ risk: 'blocked', source: 'local-fallback' });
+    expect(result).toMatchObject({ risk: 'warning', source: 'local-fallback' });
     expect(result.reason).toContain('豆包暂时不可用');
   });
 });

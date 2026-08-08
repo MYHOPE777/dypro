@@ -12,6 +12,27 @@ afterEach(() => {
 });
 
 describe('session timeline export', () => {
+  it('keeps audio in chunks during capture and merges it only when finalized', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'live-audio-chunks-'));
+    tempDirectories.push(directory);
+    const timelineStore = new FileTimelineStore(directory);
+    const sessionId = 'live-audio-chunks';
+    const first = Buffer.from([0x00, 0x01]);
+    const second = Buffer.from([0x02, 0x03]);
+
+    timelineStore.appendAudio(sessionId, first);
+    timelineStore.appendAudio(sessionId, second);
+
+    expect(timelineStore.getAudioPath(sessionId)).toBeNull();
+    expect(timelineStore.readAudio(sessionId)).toBeNull();
+    expect(timelineStore.getAudioByteLength(sessionId)).toBe(4);
+
+    timelineStore.finalizeAudio(sessionId);
+
+    expect(timelineStore.readAudio(sessionId)).toEqual(Buffer.concat([first, second]));
+    expect(timelineStore.getAudioPath(sessionId)).toBe(path.join(directory, sessionId, 'audio.pcm'));
+  });
+
   it('persists a final transcript with wall-clock and replay-relative timestamps', async () => {
     const directory = mkdtempSync(path.join(tmpdir(), 'live-timeline-'));
     tempDirectories.push(directory);
@@ -27,7 +48,8 @@ describe('session timeline export', () => {
     session.ingestSourceAudio(originalSourceAudio, 48_000);
     now += 900;
     session.ingestTranscript('这款耳机适合日常通勤使用', true, { startTimeMs: 120, endTimeMs: 820 });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    session.endLive();
+    await new Promise((resolve) => setTimeout(resolve, 5));
 
     const timeline = timelineStore.exportSession(session.id);
     const transcript = timeline?.events.find((event) => event.type === 'transcript.final');
@@ -55,6 +77,7 @@ describe('session timeline export', () => {
     const originalAudio = Buffer.from([0x00, 0x80, 0xff, 0x7f, 0x2a, 0x10]);
     timelineStore.appendEvent(sessionId, { type: 'session.created', occurredAt: 1, offsetMs: null, productId: 'serum' });
     timelineStore.appendAudio(sessionId, originalAudio);
+    timelineStore.finalizeAudio(sessionId);
 
     const header = timelineStore.getWavHeader(sessionId);
     expect(header?.toString('ascii', 0, 4)).toBe('RIFF');
@@ -73,6 +96,7 @@ describe('session timeline export', () => {
     timelineStore.appendEvent(sessionId, { type: 'session.created', occurredAt: 1, offsetMs: null, productId: 'serum' });
     timelineStore.appendSourceAudio(sessionId, first, 48_000);
     timelineStore.appendSourceAudio(sessionId, second, 44_100);
+    timelineStore.finalizeAudio(sessionId);
 
     const timeline = timelineStore.exportSession(sessionId);
     expect(timeline?.sourceAudio.map((asset) => [asset.assetId, asset.sampleRate, asset.byteLength])).toEqual([
@@ -103,6 +127,7 @@ describe('session timeline export', () => {
     writeFileSync(path.join(directory, sessionId, 'audio.source.json'), '{"tracks":[');
 
     expect(() => timelineStore.appendSourceAudio(sessionId, Buffer.from([1, 2]), 48_000)).not.toThrow();
+    timelineStore.finalizeAudio(sessionId);
     expect(timelineStore.exportSession(sessionId)?.sourceAudio).toHaveLength(1);
   });
 
@@ -123,11 +148,13 @@ describe('session timeline export', () => {
     now = 2_000;
     firstSession.startListening();
     firstSession.ingestAudio(Buffer.alloc(4));
+    await new Promise((resolve) => setImmediate(resolve));
     firstSession.selectProduct('headphones');
     now = 3_000;
     firstSession.ingestTranscript('今天是全网最低价');
     await new Promise((resolve) => setTimeout(resolve, 0));
     firstSession.pauseListening();
+    await new Promise((resolve) => setTimeout(resolve, 5));
 
     now = 7_000;
     const resumedSession = new LiveSession('live-resume-test', { timelineStore, now: () => now });

@@ -38,20 +38,32 @@ function fromDoubao(input: AnalysisInput, payload: Record<string, unknown>): Com
 
 export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
   private readonly config: ArkConfig | null;
+  private readonly maxOutputTokens: number;
 
   constructor(env: NodeJS.ProcessEnv = process.env) {
     this.config = getArkConfig(env);
+    const configuredMaxTokens = Number(env.ARK_COMPLIANCE_MAX_OUTPUT_TOKENS);
+    this.maxOutputTokens = Number.isInteger(configuredMaxTokens) && configuredMaxTokens >= 160 && configuredMaxTokens <= 800 ? configuredMaxTokens : 320;
   }
 
   async analyze(input: AnalysisInput): Promise<ComplianceResult> {
     const localResult = await analyzeTranscript(input);
-    if (!this.config) return localResult;
+    // High-confidence local blocks are already actionable; do not spend the realtime budget waiting for a second opinion.
+    if (!this.config || localResult.risk === 'blocked') return localResult;
+    const compactRules = input.customRules?.slice(0, 20).map((rule) => ({
+      name: rule.name,
+      pattern: rule.pattern,
+      risk: rule.risk,
+      reason: rule.reason,
+      alternative: rule.alternative,
+      policyRef: rule.policyRef,
+    })) ?? [];
     try {
       const content = await requestArk(
         this.config,
         SYSTEM_PROMPT,
-        `当前商品：${JSON.stringify(input.product ?? { id: input.productId })}\n主播原话：${input.transcript}\n本直播间已发布规则：${JSON.stringify(input.customRules ?? [])}`,
-        500,
+        `当前商品：${JSON.stringify(input.product ?? { id: input.productId })}\n主播原话：${input.transcript}\n本直播间相关规则：${JSON.stringify(compactRules)}`,
+        this.maxOutputTokens,
         true,
       );
       const doubaoResult = fromDoubao(input, parseArkJson(content));

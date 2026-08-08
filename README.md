@@ -46,12 +46,13 @@ npm start
 
 点击“开始直播收音”时会建立直播时间基准。服务端在 `.data/timeline/<sessionId>/` 下保存：
 
+- `audio.chunks/`：收音期间临时保存的约 256 KB PCM 切片；ASR 音轨和每个原始采样率音轨分别按顺序编号。
 - `audio.source.json`：原始音频音轨清单；浏览器采样率变化时会自动分轨。
 - `audio.source.<track>.pcm`：浏览器采集到的原生采样率 PCM signed 16-bit little-endian、单声道，作为原始音频保留；`track` 从 0 开始。
 - `audio.pcm`：发送给豆包大模型流式语音识别的 16kHz PCM signed 16-bit little-endian、单声道副本。
 - `timeline.jsonl`：最终转录、转录纠错、商品清单与商品切换、收音启停和合规结果。每条记录同时包含 UTC 绝对时间、`Asia/Shanghai` 时区标识、相对开播毫秒数及 PCM 采样位置。纠错记录同时保留原文、修正文和操作人。
 
-收音期间不会上传音频。暂停只停止当前 ASR 流并保留本场会话；点击“结束直播”后，会话才进入 `.data/archive/queue.json` 归档队列。只有配置 `TOS_ARCHIVE_GATEWAY_URL` 和 `TOS_ARCHIVE_GATEWAY_KEY` 时才会由后台上传。上传失败会保留本地文件并指数退避重试，不影响下一场流式语音识别。归档网关负责把文件写入火山引擎 TOS，接口约定为：先接收会话 manifest，再返回各音频资产的预签名 `uploadUrls`，服务端随后以流式 PUT 上传 PCM 文件。
+收音期间不会上传音频。音频包先在内存中聚合为约 256 KB 的切片，再通过独立写入队列保存到本地，不阻塞 ASR 或语义合规判定。暂停只停止当前 ASR 流并保留本场会话；点击“结束直播”后，服务端按编号合并切片为完整 PCM、删除临时切片，再把会话加入 `.data/archive/queue.json` 归档队列。只有配置 `TOS_ARCHIVE_GATEWAY_URL` 和 `TOS_ARCHIVE_GATEWAY_KEY` 时才会由后台上传。上传失败会保留本地文件并指数退避重试，不影响下一场流式语音识别。归档网关负责把文件写入火山引擎 TOS，接口约定为：先接收会话 manifest，再返回各音频资产的预签名 `uploadUrls`，服务端随后以流式 PUT 上传 PCM 文件。
 
 结束后可以在控制台播放本场 16 kHz 识别音频，按时间戳跳到对应转录并修正整句。修正时提取的“错误词 → 正确词”会写入 `.data/speech-corrections/catalog.json`，按直播间长期保存；下一场会自动修正文稿并把正确词加入 ASR 上下文。误学词条可以停用，记录与确认次数仍然保留。
 

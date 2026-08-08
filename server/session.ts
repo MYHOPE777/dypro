@@ -33,6 +33,8 @@ type LiveSessionOptions = {
   now?: () => number;
 };
 
+const AUDIO_CHUNK_BYTES = 256 * 1024;
+
 function createStats(): SessionStats {
   return { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 };
 }
@@ -48,7 +50,8 @@ export class LiveSession {
   private speechDrainTimer: NodeJS.Timeout | null = null;
   private segmentNumber = 0;
   private productGeneration = 0;
-  private analysisQueue: Promise<void> = Promise.resolve();
+  private analysisRequestNumber = 0;
+  private latestAnalysisRequest = 0;
   private readonly complianceBySegment = new Map<string, ComplianceResult>();
   private readonly segmentRevisions = new Map<string, number>();
   private readonly timelineStore?: TimelineWriter;
@@ -61,6 +64,11 @@ export class LiveSession {
   private recordingStartedAt: number | null = null;
   private currentCaptureOffsetMs: number | null = null;
   private currentCaptureSampleOffset = 0;
+  private audioWriteQueue: Promise<void> = Promise.resolve();
+  private pendingAsrAudioBytes = 0;
+  private pendingAsrChunk: Buffer[] = [];
+  private pendingAsrChunkBytes = 0;
+  private pendingSourceChunks = new Map<number, { buffers: Buffer[]; byteLength: number }>();
   private stateValue: SessionState;
 
   constructor(id = `live-${randomUUID().replaceAll('-', '').slice(0, 24)}`, options: LiveSessionOptions = {}) {
@@ -165,13 +173,14 @@ export class LiveSession {
 
   startListening(): void {
     if (this.stateValue.isListening || this.stateValue.captureState === 'ended') return;
+    this.flushAudioBuffers();
     const captureEvent = this.stateValue.captureState === 'paused' ? 'capture.resumed' : 'capture.started';
     this.releaseDrainingSpeechStream(this.drainingSpeechStream, true);
     this.archiveQueue?.pause?.(this.id);
     const occurredAt = this.now();
     this.recordingStartedAt ??= occurredAt;
     this.currentCaptureOffsetMs = this.offsetAt(occurredAt);
-    this.currentCaptureSampleOffset = Math.floor((this.timelineStore?.getAudioByteLength(this.id) ?? 0) / 2);
+    this.currentCaptureSampleOffset = Math.floor(this.currentAsrAudioByteLength() / 2);
     this.stateValue.isListening = true;
     this.stateValue.captureState = 'live';
     this.stateValue.lastEventAt = occurredAt;
@@ -220,6 +229,7 @@ export class LiveSession {
   pauseListening(): void {
     if (!this.stateValue.isListening) return;
     const occurredAt = this.now();
+    this.flushAudioBuffers();
     this.finishActiveSpeechStream();
     this.stateValue.captureState = 'paused';
     this.recordCaptureBoundary('capture.paused', occurredAt);
@@ -235,10 +245,14 @@ export class LiveSession {
   endLive(): void {
     if (this.stateValue.captureState === 'idle' || this.stateValue.captureState === 'ended') return;
     const occurredAt = this.now();
+    this.flushAudioBuffers();
     if (this.stateValue.isListening) this.finishActiveSpeechStream();
     this.stateValue.captureState = 'ended';
     this.recordCaptureBoundary('capture.ended', occurredAt);
-    this.archiveQueue?.enqueue(this.id);
+    void this.audioWriteQueue.then(() => {
+      this.timelineStore?.finalizeAudio(this.id);
+      this.archiveQueue?.enqueue(this.id);
+    }).catch((error: unknown) => this.status(`音频切片合成失败：${error instanceof Error ? error.message : String(error)}`, 'error'));
     this.broadcast({ type: 'state.snapshot', state: this.state });
     this.status('本场直播已结束，音频和转录可进行复核', 'success');
   }
@@ -263,19 +277,28 @@ export class LiveSession {
   private recordCaptureBoundary(type: 'capture.paused' | 'capture.ended', occurredAt: number): void {
     this.stateValue.lastEventAt = occurredAt;
     this.recordTimeline(type, occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, {
-      audioSampleOffset: Math.floor((this.timelineStore?.getAudioByteLength(this.id) ?? 0) / 2),
+      audioSampleOffset: Math.floor(this.currentAsrAudioByteLength() / 2),
     });
   }
 
   ingestAudio(audio: Buffer): void {
     if (!this.stateValue.isListening) return;
-    this.timelineStore?.appendAudio(this.id, audio);
     this.speechStream?.sendAudio(audio);
+    if (!this.timelineStore || audio.length === 0) return;
+    this.pendingAsrAudioBytes += audio.length;
+    this.pendingAsrChunk.push(audio);
+    this.pendingAsrChunkBytes += audio.length;
+    if (this.pendingAsrChunkBytes >= AUDIO_CHUNK_BYTES) this.flushAsrChunk();
   }
 
   ingestSourceAudio(audio: Buffer, sampleRate: number): void {
     if (!this.stateValue.isListening) return;
-    this.timelineStore?.appendSourceAudio(this.id, audio, sampleRate);
+    if (!this.timelineStore || audio.length === 0) return;
+    const pending = this.pendingSourceChunks.get(sampleRate) ?? { buffers: [], byteLength: 0 };
+    pending.buffers.push(audio);
+    pending.byteLength += audio.length;
+    this.pendingSourceChunks.set(sampleRate, pending);
+    if (pending.byteLength >= AUDIO_CHUNK_BYTES) this.flushSourceChunk(sampleRate);
   }
 
   private handleSpeechFailure(error: Error): void {
@@ -420,17 +443,18 @@ export class LiveSession {
     const generation = this.productGeneration;
     const product = this.stateValue.product;
     const revision = this.segmentRevisions.get(segment.id) ?? 0;
-    this.analysisQueue = this.analysisQueue
-      .then(() => this.checkCompliance(segment.text, generation, product.id, product, segment, revision))
+    const requestNumber = ++this.analysisRequestNumber;
+    this.latestAnalysisRequest = requestNumber;
+    void this.checkCompliance(segment.text, generation, product.id, product, segment, revision, requestNumber)
       .catch((error: unknown) => this.status(`合规分析暂时不可用：${error instanceof Error ? error.message : String(error)}`, 'error'));
   }
 
-  private async checkCompliance(transcript: string, generation: number, productId: string, product: Product, segment: TranscriptSegment, revision: number): Promise<void> {
+  private async checkCompliance(transcript: string, generation: number, productId: string, product: Product, segment: TranscriptSegment, revision: number, requestNumber: number): Promise<void> {
     const analyzed = await this.analyzer.analyze({ roomId: this.roomId, productId, transcript, product, customRules: this.ruleCatalog?.listActive(this.roomId) });
     if (generation !== this.productGeneration || productId !== this.stateValue.product.id || revision !== this.segmentRevisions.get(segment.id)) return;
     const result = { ...analyzed, segmentId: segment.id };
     this.complianceBySegment.set(segment.id, result);
-    this.stateValue.latestCompliance = result;
+    if (requestNumber === this.latestAnalysisRequest) this.stateValue.latestCompliance = result;
     this.stateValue.stats[`${result.risk}Count` as 'safeCount' | 'warningCount' | 'blockedCount'] += 1;
     if (result.risk !== 'safe') {
       this.stateValue.alerts = [result, ...this.stateValue.alerts].slice(0, 12);
@@ -447,6 +471,48 @@ export class LiveSession {
     });
     this.broadcast({ type: 'compliance.result', result });
     this.broadcast({ type: 'state.snapshot', state: this.state });
+  }
+
+  private currentAsrAudioByteLength(): number {
+    return (this.timelineStore?.getAudioByteLength(this.id) ?? 0) + this.pendingAsrAudioBytes;
+  }
+
+  private flushAudioBuffers(): void {
+    this.flushAsrChunk();
+    for (const sampleRate of this.pendingSourceChunks.keys()) this.flushSourceChunk(sampleRate);
+  }
+
+  private flushAsrChunk(): void {
+    if (!this.timelineStore || this.pendingAsrChunkBytes === 0) return;
+    const chunk = Buffer.concat(this.pendingAsrChunk, this.pendingAsrChunkBytes);
+    this.pendingAsrChunk = [];
+    this.pendingAsrChunkBytes = 0;
+    this.enqueueAudioWrite(chunk.length, () => this.timelineStore?.appendAudio(this.id, chunk));
+  }
+
+  private flushSourceChunk(sampleRate: number): void {
+    const pending = this.pendingSourceChunks.get(sampleRate);
+    if (!this.timelineStore || !pending || pending.byteLength === 0) return;
+    const chunk = Buffer.concat(pending.buffers, pending.byteLength);
+    this.pendingSourceChunks.delete(sampleRate);
+    this.enqueueAudioWrite(0, () => this.timelineStore?.appendSourceAudio(this.id, chunk, sampleRate));
+  }
+
+  private enqueueAudioWrite(byteLength: number, write: () => void): void {
+    this.audioWriteQueue = this.audioWriteQueue
+      .catch(() => undefined)
+      .then(() => new Promise<void>((resolve) => {
+        setImmediate(() => {
+          try {
+            write();
+          } catch (error) {
+            this.status(`音频切片保存失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+          } finally {
+            this.pendingAsrAudioBytes = Math.max(0, this.pendingAsrAudioBytes - byteLength);
+            resolve();
+          }
+        });
+      }));
   }
 
   private restorePersistedState(): void {
