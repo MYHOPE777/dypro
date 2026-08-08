@@ -10,6 +10,8 @@ cp .env.example .env
 npm run dev
 ```
 
+所有环境变量、火山实时语音请求头、豆包请求体、方舟知识库网关和停播后 TOS 归档网关参数，见 [配置说明](docs/CONFIGURATION.md)。`.env.example` 默认是本机演示模式，不包含任何真实密钥。
+
 开发模式只绑定 MacBook 本机，打开 `http://localhost:5173` 进入控制台。点击“选择输入设备”选择已连接的蓝牙麦克风，再点击“开始收音”。需要让 iPad 或外接显示器通过局域网访问时，请按“生产构建”先执行 `npm run build` 和 `npm start`，再使用 `http://<MacBook局域网IP>:8787`；这样局域网设备只能打开只读主播屏，不会通过开发代理绕过控制台限制。
 
 没有配置密钥时，控制台仍可用“演示输入”按钮验证完整的预警和提词流程，结果会标注为 `LOCAL GUARDRAIL`。正式接入时，把火山引擎控制台提供的实时语音 App Key、Access Key，以及豆包/Ark 的 API Key 和 Endpoint ID 写入 `.env`，密钥只在 Node 服务端使用，不会下发到浏览器。
