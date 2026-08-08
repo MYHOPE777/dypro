@@ -10,7 +10,7 @@ cp .env.example .env
 npm run dev
 ```
 
-所有环境变量、火山实时语音请求头、豆包请求体、方舟知识库网关和停播后 TOS 归档网关参数，见 [配置说明](docs/CONFIGURATION.md)。`.env.example` 默认是本机演示模式，不包含任何真实密钥。
+所有环境变量、火山实时语音请求头、豆包请求体、方舟知识库网关和停播后 TOS 归档网关参数，见 [配置说明](docs/CONFIGURATION.md)。如果现在只接火山引擎，可直接参考 [`config/volcengine.env.example`](config/volcengine.env.example)。`.env.example` 和该模板都不包含真实密钥。
 
 版本发布使用 `npm run release -- patch|minor|major`。命令会自动跑测试、更新版本号、创建 Git 标签、生成本地 bundle 备份并尝试推送 GitHub；断网时本地版本仍然保留。
 
