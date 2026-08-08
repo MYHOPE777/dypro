@@ -30,7 +30,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { DEFAULT_PRODUCT } from './shared/products';
-import { complianceForLatestSegment } from './compliance/currentCompliance';
+import { complianceForLatestSegment, complianceForPrompt } from './compliance/currentCompliance';
 import { canSelectInputDevice, switchInputDevice } from './microphoneDevice';
 import type { ComplianceResult, ComplianceRule, LiveRoom, Product, ProductImportResponse, RuleAuditEntry, ServerMessage, SessionState, SessionTimelineExport, SpeechCorrectionEntry, TimelineEvent, TranscriptSegment } from './shared/types';
 
@@ -767,11 +767,14 @@ function TranscriptStage({ state, send }: { state: SessionState; send: (message:
 }
 
 function PromptPanel({ state, compact = false }: { state: SessionState; compact?: boolean }) {
-  const latest = complianceForLatestSegment(state);
+  const latest = complianceForPrompt({ ...state, productId: state.product.id });
   const latestSegment = state.transcriptHistory.at(-1);
   const latestSegmentIsCurrent = Boolean(latestSegment && latestSegment.timestamp >= state.productContextStartedAt);
-  const pending = Boolean(state.partialTranscript || (latestSegmentIsCurrent && !latest));
-  const phrase = latest && latest.risk !== 'safe' ? latest.alternative : state.product.compliantPhrases[0];
+  const currentCompliance = complianceForLatestSegment(state);
+  const pending = Boolean(state.partialTranscript || (latestSegmentIsCurrent && !currentCompliance));
+  const phrase = latest && latest.risk !== 'safe'
+    ? latest.alternative
+    : state.product.compliantPhrases[0] || '根据商品页面信息介绍材质、规格和使用场景，价格与库存以页面实时信息为准。';
   return <section className={`prompt-panel ${latest?.risk ?? 'safe'} ${compact ? 'compact' : ''}`}>
     <div className="prompt-head"><div><span className="section-kicker">主播提词 <span>READY TO SAY</span></span><h2>{latest && latest.risk !== 'safe' ? '现在请替换为' : pending ? '分析中，先用安全表达' : '当前商品建议表达'}</h2></div><Sparkles size={20} /></div>
     <p className="prompt-quote">{phrase}</p>
@@ -840,13 +843,16 @@ function OperatorEntry() {
 function DisplayScreen() {
   const session = useLiveSession('display');
   const result = complianceForLatestSegment(session.state);
+  const promptCompliance = complianceForPrompt({ ...session.state, productId: session.state.product.id });
   const latestTranscript = session.state.transcriptHistory.at(-1);
   const latestSegment = latestTranscript && latestTranscript.timestamp >= session.state.productContextStartedAt ? latestTranscript : undefined;
   const latestSegmentIsCurrent = Boolean(latestSegment && latestSegment.timestamp >= session.state.productContextStartedAt);
   const pending = Boolean(session.state.partialTranscript || (latestSegmentIsCurrent && !result));
-  const risk = result?.risk ?? 'safe';
+  const risk = result?.risk ?? (promptCompliance?.risk !== 'safe' ? promptCompliance?.risk ?? 'safe' : 'safe');
+  const hasRetainedReplacement = promptCompliance?.risk === 'warning' || promptCompliance?.risk === 'blocked';
   const captureLabel = session.state.captureState === 'live' ? '正在收音' : session.state.captureState === 'paused' ? '直播暂停' : session.state.captureState === 'ended' ? '直播结束' : '等待开播';
-  return <div className={`app-shell display-shell risk-${risk}`}><AppHeader state={session.state} connected={session.connected} status={session.status} mode="display" /><main className="display-main"><div className="display-product"><img src={session.state.product.image} alt="" /><div><span className="eyebrow">ON AIR PRODUCT · {session.state.product.category}</span><h1>{session.state.product.name}</h1><strong>{session.state.product.price}</strong></div><div className="display-live"><span className={`signal-dot ${session.state.isListening ? 'on' : ''}`} />{captureLabel}</div></div><section className="display-voice"><div className="display-voice-label"><Volume2 size={17} />主播刚刚说 <span>{formatReplayOffset(latestSegment?.offsetMs ?? null)}</span></div><div className="display-transcript">{session.state.partialTranscript || latestSegment?.text || '等待下一句转录…'}</div><Waveform active={session.state.isListening} /></section><section className={`display-alert ${risk}`}><div className="display-alert-head"><div className="display-risk-icon"><RiskIcon risk={risk} /></div><div><span className="eyebrow">{result ? '即时合规提醒' : pending ? '正在分析当前话术' : '合规提词就绪'}</span><h2>{result ? <RiskLabel risk={risk} /> : pending ? '暂用当前商品安全表达' : '可以继续介绍当前商品'}</h2></div><span className="display-source">{pending ? 'ANALYZING' : result?.source === 'doubao' ? 'DOUBAO' : result?.source === 'custom-rule' ? 'CUSTOM RULE' : 'LOCAL GUARDRAIL'}</span></div><div className="display-divider" /><div className="display-prompt-label">{result && result.risk !== 'safe' ? '请立即替换为' : pending ? '分析完成前建议' : '推荐表达'}</div><p className="display-prompt">{result && result.risk !== 'safe' ? result.alternative : session.state.product.compliantPhrases[0]}</p>{result && result.risk !== 'safe' && <p className="display-reason"><AlertTriangle size={15} />{result.reason}</p>}</section></main><footer className="display-footer"><div><ShieldCheck size={15} />抖音直播合规实时预警</div><div className="display-footer-stats"><span>监测 {session.state.stats.words} 字</span><span>高风险 {session.state.stats.blockedCount}</span><span>需留意 {session.state.stats.warningCount}</span></div></footer></div>;
+  const safePhrase = session.state.product.compliantPhrases[0] || '根据商品页面信息介绍材质、规格和使用场景，价格与库存以页面实时信息为准。';
+  return <div className={`app-shell display-shell risk-${risk}`}><AppHeader state={session.state} connected={session.connected} status={session.status} mode="display" /><main className="display-main"><div className="display-product"><img src={session.state.product.image} alt="" /><div><span className="eyebrow">ON AIR PRODUCT · {session.state.product.category}</span><h1>{session.state.product.name}</h1><strong>{session.state.product.price}</strong></div><div className="display-live"><span className={`signal-dot ${session.state.isListening ? 'on' : ''}`} />{captureLabel}</div></div><section className="display-voice"><div className="display-voice-label"><Volume2 size={17} />主播刚刚说 <span>{formatReplayOffset(latestSegment?.offsetMs ?? null)}</span></div><div className="display-transcript">{session.state.partialTranscript || latestSegment?.text || '等待下一句转录…'}</div><Waveform active={session.state.isListening} /></section><section className={`display-alert ${risk}`}><div className="display-alert-head"><div className="display-risk-icon"><RiskIcon risk={risk} /></div><div><span className="eyebrow">{result ? '即时合规提醒' : hasRetainedReplacement ? '请继续使用替换话术' : pending ? '正在分析当前话术' : '合规提词就绪'}</span><h2>{result ? <RiskLabel risk={risk} /> : hasRetainedReplacement ? '替换话术保持显示' : pending ? '暂用当前商品安全表达' : '可以继续介绍当前商品'}</h2></div><span className="display-source">{pending ? 'ANALYZING' : promptCompliance?.source === 'doubao' ? 'DOUBAO' : promptCompliance?.source === 'custom-rule' ? 'CUSTOM RULE' : 'LOCAL GUARDRAIL'}</span></div><div className="display-divider" /><div className="display-prompt-label">{promptCompliance && promptCompliance.risk !== 'safe' ? '请立即替换为' : pending ? '分析完成前建议' : '推荐表达'}</div><p className="display-prompt">{promptCompliance && promptCompliance.risk !== 'safe' ? promptCompliance.alternative : safePhrase}</p>{promptCompliance && promptCompliance.risk !== 'safe' && <p className="display-reason"><AlertTriangle size={15} />{promptCompliance.reason}</p>}</section></main><footer className="display-footer"><div><ShieldCheck size={15} />抖音直播合规实时预警</div><div className="display-footer-stats"><span>监测 {session.state.stats.words} 字</span><span>高风险 {session.state.stats.blockedCount}</span><span>需留意 {session.state.stats.warningCount}</span></div></footer></div>;
 }
 
 export default function App() {

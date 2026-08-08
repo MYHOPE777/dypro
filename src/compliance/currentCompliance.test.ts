@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { complianceForLatestSegment } from './currentCompliance';
+import { complianceForLatestSegment, complianceForPrompt } from './currentCompliance';
 import type { ComplianceResult, TranscriptSegment } from '../shared/types';
 
 const segment = (id: string): TranscriptSegment => ({ id, text: id, isFinal: true, timestamp: 1, offsetMs: 1, startOffsetMs: 0, endOffsetMs: 1 });
@@ -21,6 +21,45 @@ describe('complianceForLatestSegment', () => {
       transcriptHistory: [{ ...segment('previous-product'), timestamp: 100 }],
       latestCompliance: result('previous-product'),
       productContextStartedAt: 200,
+    })).toBeNull();
+  });
+});
+
+describe('complianceForPrompt', () => {
+  it('keeps a replacement phrase visible while the host reads it', () => {
+    const warning = result('first');
+    expect(complianceForPrompt({
+      productId: 'product',
+      transcriptHistory: [segment('first')],
+      latestCompliance: warning,
+      partialTranscript: '改为这款商品适合日常使用',
+    })).toBe(warning);
+  });
+
+  it('keeps the previous replacement visible until the next sentence is analyzed', () => {
+    const warning = result('first');
+    expect(complianceForPrompt({
+      productId: 'product',
+      transcriptHistory: [segment('first'), segment('second')],
+      latestCompliance: warning,
+    })).toBe(warning);
+  });
+
+  it('clears the replacement after the new sentence is confirmed safe', () => {
+    const safe = { ...result('second'), risk: 'safe' as const };
+    expect(complianceForPrompt({
+      productId: 'product',
+      transcriptHistory: [segment('first'), segment('second')],
+      latestCompliance: safe,
+    })).toBe(safe);
+  });
+
+  it('does not carry a replacement into a different product context', () => {
+    const warning = result('first');
+    expect(complianceForPrompt({
+      productId: 'other-product',
+      transcriptHistory: [segment('first')],
+      latestCompliance: warning,
     })).toBeNull();
   });
 });
