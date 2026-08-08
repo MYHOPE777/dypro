@@ -26,6 +26,8 @@ describe('LiveSession', () => {
     expect(session.state.product.id).toBe('headphones');
     expect(session.state.latestCompliance?.productId).toBe('headphones');
     expect(session.state.latestCompliance?.risk).toBe('warning');
+    expect(session.state.latestCompliance?.analysisMs).toEqual(expect.any(Number));
+    expect(session.state.latestCompliance?.analysisMs).toBeGreaterThanOrEqual(0);
     expect(session.state.stats.warningCount).toBe(1);
     expect(session.state.alerts).toHaveLength(1);
   });

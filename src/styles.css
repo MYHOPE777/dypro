@@ -53,3 +53,8 @@ button { cursor: pointer; }
 
 .readiness-title small { grid-column: 2; color: #68776d; font-size: 8px; }.readiness-items { flex-wrap: wrap; gap: 8px 13px; }
 .icon-button:disabled { cursor: not-allowed; opacity: .45; }.rule-status.disabled { background: #303432; color: #8d9890; }.rule-actions button:disabled { cursor: not-allowed; opacity: .45; }
+
+.compliance-meta { display: grid; justify-items: end; gap: 3px; }
+.analysis-latency { color: #b7dc89; font-family: 'DM Mono', monospace; font-size: 9px; }
+.display-meta { display: grid; justify-items: end; gap: 7px; margin-left: auto; }
+.display-latency { color: rgb(255 255 255 / 76%); font-family: 'DM Mono', monospace; font-size: 10px; white-space: nowrap; }

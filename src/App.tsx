@@ -92,8 +92,10 @@ function useLiveSession(role: Role, access?: OperatorAccess) {
   const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState('正在连接会话');
   const [captureDeniedVersion, setCaptureDeniedVersion] = useState(0);
+  const [analysisStartedAt, setAnalysisStartedAt] = useState<number | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const sessionIdRef = useRef(sessionId);
+  const analysisSegmentRef = useRef<string | null>(null);
 
   useEffect(() => {
     let reconnectTimer: number | undefined;
@@ -115,9 +117,15 @@ function useLiveSession(role: Role, access?: OperatorAccess) {
           setStatus('会话已连接');
         } else if (message.type === 'state.snapshot') {
           setState(message.state);
+          if (message.state.latestCompliance?.segmentId === message.state.transcriptHistory.at(-1)?.id) {
+            analysisSegmentRef.current = null;
+            setAnalysisStartedAt(null);
+          }
         } else if (message.type === 'transcript.partial') {
           setState((current) => ({ ...current, partialTranscript: message.segment.text }));
         } else if (message.type === 'transcript.final') {
+          analysisSegmentRef.current = message.segment.id;
+          setAnalysisStartedAt(Date.now());
           setState((current) => {
             const existingIndex = current.transcriptHistory.findIndex((segment) => segment.id === message.segment.id);
             const transcriptHistory = existingIndex < 0
@@ -125,6 +133,11 @@ function useLiveSession(role: Role, access?: OperatorAccess) {
               : current.transcriptHistory.map((segment, index) => index === existingIndex ? message.segment : segment);
             return { ...current, partialTranscript: '', transcriptHistory };
           });
+        } else if (message.type === 'compliance.result') {
+          if (analysisSegmentRef.current === message.result.segmentId) {
+            analysisSegmentRef.current = null;
+            setAnalysisStartedAt(null);
+          }
         } else if (message.type === 'system.status') {
           setStatus(message.message);
         } else if (message.type === 'capture.denied') {
@@ -136,6 +149,8 @@ function useLiveSession(role: Role, access?: OperatorAccess) {
       };
       socket.onclose = () => {
         setConnected(false);
+        analysisSegmentRef.current = null;
+        setAnalysisStartedAt(null);
         if (!disposed) reconnectTimer = window.setTimeout(connect, 1800);
       };
       socket.onerror = () => setStatus('连接暂时不可用，正在重试');
@@ -154,7 +169,7 @@ function useLiveSession(role: Role, access?: OperatorAccess) {
     return true;
   }, []);
 
-  return { state, sessionId, roomId, actorId, connected, status, captureDeniedVersion, send };
+  return { state, sessionId, roomId, actorId, connected, status, captureDeniedVersion, analysisStartedAt, send };
 }
 
 function useOperatorAccess() {
@@ -782,10 +797,28 @@ function PromptPanel({ state, compact = false }: { state: SessionState; compact?
   </section>;
 }
 
-function CompliancePanel({ result, pending = false }: { result: ComplianceResult | null; pending?: boolean }) {
+function formatAnalysisLatency(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return '等待响应';
+  return ms < 1_000 ? `${ms} ms` : `${(ms / 1_000).toFixed(1)} s`;
+}
+
+function useAnalysisElapsed(pending: boolean, pendingSince: number | null): number | null {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!pending || pendingSince === null) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 100);
+    return () => window.clearInterval(timer);
+  }, [pending, pendingSince]);
+  return pending && pendingSince !== null ? Math.max(0, now - pendingSince) : null;
+}
+
+function CompliancePanel({ result, pending = false, pendingSince = null }: { result: ComplianceResult | null; pending?: boolean; pendingSince?: number | null }) {
+  const elapsedMs = useAnalysisElapsed(pending, pendingSince);
+  const latency = pending ? elapsedMs : result?.analysisMs;
   const resolved = result ?? { risk: 'safe' as const, title: pending ? '正在分析当前话术' : '等待下一句', reason: pending ? '分析完成前先使用上方商品安全表达。' : '系统会在每个转录片段完成后即时分析。', policyRef: '豆包大模型 · 抖音直播规则', confidence: 0 };
   return <section className={`compliance-panel ${resolved.risk}`}>
-    <div className="compliance-top"><div className="risk-pill"><RiskIcon risk={resolved.risk} /><span><RiskLabel risk={resolved.risk} /></span></div><span className="confidence">{resolved.confidence ? `${Math.round(resolved.confidence * 100)}% 置信` : '实时监测'}</span></div>
+    <div className="compliance-top"><div className="risk-pill"><RiskIcon risk={resolved.risk} /><span><RiskLabel risk={resolved.risk} /></span></div><div className="compliance-meta"><span className="analysis-latency">{pending ? `响应中 ${formatAnalysisLatency(latency)}` : latency === null || latency === undefined ? '实时监测' : `响应 ${formatAnalysisLatency(latency)}`}</span><span className="confidence">{resolved.confidence ? `${Math.round(resolved.confidence * 100)}% 置信` : ''}</span></div></div>
     <h3>{resolved.title}</h3><p>{resolved.reason}</p><div className="policy-ref"><ShieldCheck size={14} />{resolved.policyRef}</div>
   </section>;
 }
@@ -830,7 +863,7 @@ function OperatorScreen({ access, readiness, onLogout }: { access: OperatorAcces
   const latestSegment = session.state.transcriptHistory.at(-1);
   const latestSegmentIsCurrent = Boolean(latestSegment && latestSegment.timestamp >= session.state.productContextStartedAt);
   const compliancePending = Boolean(session.state.partialTranscript || (latestSegmentIsCurrent && !currentCompliance));
-  return <div className="app-shell operator-shell"><AppHeader state={session.state} connected={session.connected} status={session.status} mode="operator" /><main className="operator-grid"><aside className="left-rail"><ProductRail state={session.state} send={session.send} onOpenLibrary={() => setWorkspaceOpen(true)} /><MicPanel state={session.state} connected={session.connected} captureDeniedVersion={session.captureDeniedVersion} send={session.send} onOpenReview={() => setReviewOpen(true)} /><div className="rail-footer"><Wifi size={14} />局域网地址可供 iPad 访问</div></aside><section className="main-stage"><div className="stage-context"><div><span className="eyebrow">TODAY'S LIVE · 01</span><h2>{session.state.product.name}</h2></div><div className="context-actions"><span className="ai-tag"><ShieldCheck size={14} />豆包合规引擎</span><span className="context-dot" />豆包大模型流式语音识别</div></div><ReadinessStrip readiness={readiness} /><TranscriptStage state={session.state} send={session.send} /><DemoInput send={session.send} /></section><aside className="coach-rail"><PromptPanel state={session.state} /><CompliancePanel result={currentCompliance} pending={compliancePending} /><section className="alert-history"><div className="section-kicker">近期提醒 <span>ALERT LOG</span></div>{session.state.alerts.length ? session.state.alerts.slice(0, 4).map((alert) => <div className="alert-row" key={alert.id}><div className={`alert-icon ${alert.risk}`}><RiskIcon risk={alert.risk} /></div><div><strong>{alert.title}</strong><small>{new Date(alert.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {alert.alternative.replace(/^可以改为：/u, '')}</small></div></div>) : <div className="empty-alert"><Check size={16} />暂无风险提醒</div>}</section></aside></main><footer className="operator-footer"><SessionStats state={session.state} /><div className="footer-note"><Activity size={15} />风险判断以豆包大模型为主，未配置密钥时使用本地规则即时兜底</div></footer>{workspaceOpen && <WorkspaceModal state={session.state} access={access} send={session.send} onClose={() => setWorkspaceOpen(false)} onLogout={onLogout} />}{reviewOpen && <SessionReviewModal state={session.state} access={access} onClose={() => setReviewOpen(false)} />}</div>;
+  return <div className="app-shell operator-shell"><AppHeader state={session.state} connected={session.connected} status={session.status} mode="operator" /><main className="operator-grid"><aside className="left-rail"><ProductRail state={session.state} send={session.send} onOpenLibrary={() => setWorkspaceOpen(true)} /><MicPanel state={session.state} connected={session.connected} captureDeniedVersion={session.captureDeniedVersion} send={session.send} onOpenReview={() => setReviewOpen(true)} /><div className="rail-footer"><Wifi size={14} />局域网地址可供 iPad 访问</div></aside><section className="main-stage"><div className="stage-context"><div><span className="eyebrow">TODAY'S LIVE · 01</span><h2>{session.state.product.name}</h2></div><div className="context-actions"><span className="ai-tag"><ShieldCheck size={14} />豆包合规引擎</span><span className="context-dot" />豆包大模型流式语音识别</div></div><ReadinessStrip readiness={readiness} /><TranscriptStage state={session.state} send={session.send} /><DemoInput send={session.send} /></section><aside className="coach-rail"><PromptPanel state={session.state} /><CompliancePanel result={currentCompliance} pending={compliancePending} pendingSince={session.analysisStartedAt} /><section className="alert-history"><div className="section-kicker">近期提醒 <span>ALERT LOG</span></div>{session.state.alerts.length ? session.state.alerts.slice(0, 4).map((alert) => <div className="alert-row" key={alert.id}><div className={`alert-icon ${alert.risk}`}><RiskIcon risk={alert.risk} /></div><div><strong>{alert.title}</strong><small>{new Date(alert.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {alert.alternative.replace(/^可以改为：/u, '')}</small></div></div>) : <div className="empty-alert"><Check size={16} />暂无风险提醒</div>}</section></aside></main><footer className="operator-footer"><SessionStats state={session.state} /><div className="footer-note"><Activity size={15} />风险判断以豆包大模型为主，未配置密钥时使用本地规则即时兜底</div></footer>{workspaceOpen && <WorkspaceModal state={session.state} access={access} send={session.send} onClose={() => setWorkspaceOpen(false)} onLogout={onLogout} />}{reviewOpen && <SessionReviewModal state={session.state} access={access} onClose={() => setReviewOpen(false)} />}</div>;
 }
 
 function OperatorEntry() {
@@ -848,11 +881,13 @@ function DisplayScreen() {
   const latestSegment = latestTranscript && latestTranscript.timestamp >= session.state.productContextStartedAt ? latestTranscript : undefined;
   const latestSegmentIsCurrent = Boolean(latestSegment && latestSegment.timestamp >= session.state.productContextStartedAt);
   const pending = Boolean(session.state.partialTranscript || (latestSegmentIsCurrent && !result));
+  const elapsedMs = useAnalysisElapsed(pending, session.analysisStartedAt);
+  const latency = pending ? elapsedMs : result?.analysisMs;
   const risk = result?.risk ?? (promptCompliance?.risk !== 'safe' ? promptCompliance?.risk ?? 'safe' : 'safe');
   const hasRetainedReplacement = promptCompliance?.risk === 'warning' || promptCompliance?.risk === 'blocked';
   const captureLabel = session.state.captureState === 'live' ? '正在收音' : session.state.captureState === 'paused' ? '直播暂停' : session.state.captureState === 'ended' ? '直播结束' : '等待开播';
   const safePhrase = session.state.product.compliantPhrases[0] || '根据商品页面信息介绍材质、规格和使用场景，价格与库存以页面实时信息为准。';
-  return <div className={`app-shell display-shell risk-${risk}`}><AppHeader state={session.state} connected={session.connected} status={session.status} mode="display" /><main className="display-main"><div className="display-product"><img src={session.state.product.image} alt="" /><div><span className="eyebrow">ON AIR PRODUCT · {session.state.product.category}</span><h1>{session.state.product.name}</h1><strong>{session.state.product.price}</strong></div><div className="display-live"><span className={`signal-dot ${session.state.isListening ? 'on' : ''}`} />{captureLabel}</div></div><section className="display-voice"><div className="display-voice-label"><Volume2 size={17} />主播刚刚说 <span>{formatReplayOffset(latestSegment?.offsetMs ?? null)}</span></div><div className="display-transcript">{session.state.partialTranscript || latestSegment?.text || '等待下一句转录…'}</div><Waveform active={session.state.isListening} /></section><section className={`display-alert ${risk}`}><div className="display-alert-head"><div className="display-risk-icon"><RiskIcon risk={risk} /></div><div><span className="eyebrow">{result ? '即时合规提醒' : hasRetainedReplacement ? '请继续使用替换话术' : pending ? '正在分析当前话术' : '合规提词就绪'}</span><h2>{result ? <RiskLabel risk={risk} /> : hasRetainedReplacement ? '替换话术保持显示' : pending ? '暂用当前商品安全表达' : '可以继续介绍当前商品'}</h2></div><span className="display-source">{pending ? 'ANALYZING' : promptCompliance?.source === 'doubao' ? 'DOUBAO' : promptCompliance?.source === 'custom-rule' ? 'CUSTOM RULE' : 'LOCAL GUARDRAIL'}</span></div><div className="display-divider" /><div className="display-prompt-label">{promptCompliance && promptCompliance.risk !== 'safe' ? '请立即替换为' : pending ? '分析完成前建议' : '推荐表达'}</div><p className="display-prompt">{promptCompliance && promptCompliance.risk !== 'safe' ? promptCompliance.alternative : safePhrase}</p>{promptCompliance && promptCompliance.risk !== 'safe' && <p className="display-reason"><AlertTriangle size={15} />{promptCompliance.reason}</p>}</section></main><footer className="display-footer"><div><ShieldCheck size={15} />抖音直播合规实时预警</div><div className="display-footer-stats"><span>监测 {session.state.stats.words} 字</span><span>高风险 {session.state.stats.blockedCount}</span><span>需留意 {session.state.stats.warningCount}</span></div></footer></div>;
+  return <div className={`app-shell display-shell risk-${risk}`}><AppHeader state={session.state} connected={session.connected} status={session.status} mode="display" /><main className="display-main"><div className="display-product"><img src={session.state.product.image} alt="" /><div><span className="eyebrow">ON AIR PRODUCT · {session.state.product.category}</span><h1>{session.state.product.name}</h1><strong>{session.state.product.price}</strong></div><div className="display-live"><span className={`signal-dot ${session.state.isListening ? 'on' : ''}`} />{captureLabel}</div></div><section className="display-voice"><div className="display-voice-label"><Volume2 size={17} />主播刚刚说 <span>{formatReplayOffset(latestSegment?.offsetMs ?? null)}</span></div><div className="display-transcript">{session.state.partialTranscript || latestSegment?.text || '等待下一句转录…'}</div><Waveform active={session.state.isListening} /></section><section className={`display-alert ${risk}`}><div className="display-alert-head"><div className="display-risk-icon"><RiskIcon risk={risk} /></div><div><span className="eyebrow">{result ? '即时合规提醒' : hasRetainedReplacement ? '请继续使用替换话术' : pending ? '正在分析当前话术' : '合规提词就绪'}</span><h2>{result ? <RiskLabel risk={risk} /> : hasRetainedReplacement ? '替换话术保持显示' : pending ? '暂用当前商品安全表达' : '可以继续介绍当前商品'}</h2></div><div className="display-meta"><span className="display-source">{pending ? 'ANALYZING' : promptCompliance?.source === 'doubao' ? 'DOUBAO' : promptCompliance?.source === 'custom-rule' ? 'CUSTOM RULE' : 'LOCAL GUARDRAIL'}</span><span className="display-latency">{pending ? `响应中 ${formatAnalysisLatency(latency)}` : latency === null || latency === undefined ? '等待响应' : `响应 ${formatAnalysisLatency(latency)}`}</span></div></div><div className="display-divider" /><div className="display-prompt-label">{promptCompliance && promptCompliance.risk !== 'safe' ? '请立即替换为' : pending ? '分析完成前建议' : '推荐表达'}</div><p className="display-prompt">{promptCompliance && promptCompliance.risk !== 'safe' ? promptCompliance.alternative : safePhrase}</p>{promptCompliance && promptCompliance.risk !== 'safe' && <p className="display-reason"><AlertTriangle size={15} />{promptCompliance.reason}</p>}</section></main><footer className="display-footer"><div><ShieldCheck size={15} />抖音直播合规实时预警</div><div className="display-footer-stats"><span>监测 {session.state.stats.words} 字</span><span>高风险 {session.state.stats.blockedCount}</span><span>需留意 {session.state.stats.warningCount}</span></div></footer></div>;
 }
 
 export default function App() {

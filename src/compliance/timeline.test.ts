@@ -161,7 +161,12 @@ describe('session timeline export', () => {
     expect(resumedSession.createdAt).toBe(1_000);
     expect(resumedSession.state.product.id).toBe('headphones');
     expect(resumedSession.state.transcriptHistory.at(-1)?.text).toBe('今天是全网最低价');
-    expect(resumedSession.state.latestCompliance).toMatchObject({ risk: 'warning', productId: 'headphones' });
+    expect(resumedSession.state.latestCompliance).toMatchObject({
+      risk: 'warning',
+      productId: 'headphones',
+      analysisMs: expect.any(Number),
+    });
+    expect(resumedSession.state.latestCompliance?.analysisMs).toBeGreaterThanOrEqual(0);
     expect(resumedSession.state.stats).toMatchObject({ words: 8, warningCount: 1 });
     now = 8_000;
     resumedSession.startListening();

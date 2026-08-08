@@ -450,9 +450,10 @@ export class LiveSession {
   }
 
   private async checkCompliance(transcript: string, generation: number, productId: string, product: Product, segment: TranscriptSegment, revision: number, requestNumber: number): Promise<void> {
+    const analysisStartedAt = performance.now();
     const analyzed = await this.analyzer.analyze({ roomId: this.roomId, productId, transcript, product, customRules: this.ruleCatalog?.listActive(this.roomId) });
     if (generation !== this.productGeneration || productId !== this.stateValue.product.id || revision !== this.segmentRevisions.get(segment.id)) return;
-    const result = { ...analyzed, segmentId: segment.id };
+    const result = { ...analyzed, segmentId: segment.id, analysisMs: Math.max(0, Math.round(performance.now() - analysisStartedAt)) };
     this.complianceBySegment.set(segment.id, result);
     if (requestNumber === this.latestAnalysisRequest) this.stateValue.latestCompliance = result;
     this.stateValue.stats[`${result.risk}Count` as 'safeCount' | 'warningCount' | 'blockedCount'] += 1;
@@ -468,6 +469,7 @@ export class LiveSession {
       policyRef: result.policyRef,
       confidence: result.confidence,
       source: result.source,
+      analysisMs: result.analysisMs,
     });
     this.broadcast({ type: 'compliance.result', result });
     this.broadcast({ type: 'state.snapshot', state: this.state });
@@ -579,6 +581,7 @@ export class LiveSession {
           source,
           transcript: segment.text,
           createdAt: event.occurredAt,
+          ...(typeof event.payload.analysisMs === 'number' ? { analysisMs: Math.max(0, event.payload.analysisMs) } : {}),
         });
       }
     }

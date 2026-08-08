@@ -104,6 +104,8 @@ export type ComplianceResult = {
   source: 'doubao' | 'local-fallback' | 'custom-rule';
   transcript: string;
   createdAt: number;
+  /** Milliseconds from final transcript receipt to completed compliance analysis. */
+  analysisMs?: number;
 };
 
 export type SessionStats = {
