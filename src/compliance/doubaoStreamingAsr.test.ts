@@ -127,6 +127,30 @@ describe('Doubao streaming ASR frames', () => {
     expect(onClosed).toHaveBeenCalledOnce();
   });
 
+  it('uses legacy APP ID and Access Token headers when the new API key is absent', () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const headers: Record<string, string> = {};
+    const socket = {
+      readyState: WebSocket.CONNECTING as number,
+      on(event: string, listener: (...args: unknown[]) => void) { listeners.set(event, listener); return this; },
+      send() { undefined; },
+      close() { this.readyState = WebSocket.CLOSED; },
+    };
+    const stream = new DoubaoStreamingAsr(
+      { appKey: 'app-id', accessKey: 'access-token', resourceId: 'resource', endpoint: 'wss://speech.example', endWindowMs: 800 },
+      { onResult: vi.fn(), onError: vi.fn() },
+      (_endpoint: string, requestHeaders: Record<string, string>) => { Object.assign(headers, requestHeaders); return socket as never; },
+    );
+
+    stream.connect();
+    socket.readyState = WebSocket.OPEN;
+    listeners.get('open')?.();
+
+    expect(headers).toMatchObject({ 'X-Api-App-Key': 'app-id', 'X-Api-Access-Key': 'access-token', 'X-Api-Resource-Id': 'resource' });
+    expect(headers['X-Api-Key']).toBeUndefined();
+    stream.close();
+  });
+
   it('keeps an idle stream alive with audio-only silence frames', () => {
     vi.useFakeTimers();
     try {
@@ -167,10 +191,14 @@ describe('Doubao streaming ASR frames', () => {
     }
   });
 
-  it('loads only the official X-Api-Key configuration', () => {
+  it('loads official new and legacy console authentication configurations', () => {
     expect(getStreamingAsrConfig({ X_API_KEY: ' key ', X_API_RESOURCE_ID: 'resource', SPEECH_ENDPOINT: 'wss://example', END_WINDOW_SIZE: '600' })).toMatchObject({
       apiKey: 'key', resourceId: 'resource', endpoint: 'wss://example', endWindowMs: 600,
     });
+    expect(getStreamingAsrConfig({ X_API_APP_KEY: 'app-id', X_API_ACCESS_KEY: 'access-token', X_API_RESOURCE_ID: 'volc.bigasr.sauc.concurrent' })).toMatchObject({
+      appKey: 'app-id', accessKey: 'access-token', resourceId: 'volc.bigasr.sauc.concurrent',
+    });
+    expect(getStreamingAsrConfig({ X_API_APP_KEY: 'app-id' })).toBeNull();
     expect(getStreamingAsrConfig({ X_API_KEY: '' })).toBeNull();
   });
 });

@@ -14,7 +14,12 @@ export type StreamingAsrOptions = {
 };
 
 export type StreamingAsrConfig = {
-  apiKey: string;
+  /** New console App Key, sent as X-Api-Key. */
+  apiKey?: string;
+  /** Legacy console APP ID, sent as X-Api-App-Key. */
+  appKey?: string;
+  /** Legacy console Access Token, sent as X-Api-Access-Key. */
+  accessKey?: string;
   resourceId: string;
   endpoint: string;
   hotwordTableId?: string;
@@ -65,9 +70,11 @@ function endWindowMs(value: string | undefined): number {
 
 export function getStreamingAsrConfig(env: NodeJS.ProcessEnv = process.env): StreamingAsrConfig | null {
   const apiKey = env.X_API_KEY?.trim();
-  if (!apiKey) return null;
+  const appKey = optional(env.X_API_APP_KEY);
+  const accessKey = optional(env.X_API_ACCESS_KEY);
+  if (!apiKey && !(appKey && accessKey)) return null;
   return {
-    apiKey,
+    ...(apiKey ? { apiKey } : { appKey, accessKey }),
     resourceId: env.X_API_RESOURCE_ID?.trim() || 'volc.bigasr.sauc.duration',
     endpoint: env.SPEECH_ENDPOINT?.trim() || DEFAULT_ENDPOINT,
     hotwordTableId: optional(env.BOOSTING_TABLE_ID),
@@ -202,8 +209,11 @@ export class DoubaoStreamingAsr {
     this.logId = undefined;
     this.failureReported = false;
     const requestId = randomUUID();
+    const authHeaders: Record<string, string> = this.config.apiKey
+      ? { 'X-Api-Key': this.config.apiKey }
+      : { 'X-Api-App-Key': this.config.appKey!, 'X-Api-Access-Key': this.config.accessKey! };
     this.socket = this.socketFactory(this.config.endpoint, {
-      'X-Api-Key': this.config.apiKey,
+      ...authHeaders,
       'X-Api-Resource-Id': this.config.resourceId,
       'X-Api-Connect-Id': requestId,
       'X-Api-Request-Id': requestId,

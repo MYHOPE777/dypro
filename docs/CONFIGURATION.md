@@ -86,8 +86,10 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 
 | 参数 | 类型/默认值 | 是否必填 | 说明 |
 | --- | --- | --- | --- |
-| `X_API_KEY` | 字符串 | 流式识别必填 | 豆包语音新版控制台的 App Key，对应 WebSocket 请求头 `X-Api-Key`。不要放入前端。 |
-| `X_API_RESOURCE_ID` | 字符串，默认 `volc.bigasr.sauc.duration` | 否/按账号 | 已开通的流式语音识别资源 ID，对应 `X-Api-Resource-Id`。若控制台给出其他资源 ID，按控制台值替换。 |
+| `X_API_KEY` | 字符串 | 新版控制台流式识别必填 | 豆包语音新版控制台的 App Key，对应 WebSocket 请求头 `X-Api-Key`。不要放入前端。 |
+| `X_API_APP_KEY` | 字符串 | 旧版控制台可选 | 旧版控制台的 APP ID，对应官方请求头 `X-Api-App-Key`。仅当 `X_API_KEY` 留空时使用。 |
+| `X_API_ACCESS_KEY` | 字符串 | 旧版控制台可选 | 旧版控制台的 Access Token，对应官方请求头 `X-Api-Access-Key`。仅当 `X_API_KEY` 留空时使用；旧版页面里的 Secret Key 不直接发送到 SAUC WebSocket。 |
+| `X_API_RESOURCE_ID` | 字符串，默认 `volc.bigasr.sauc.duration` | 否/按账号 | 已开通的流式语音识别资源 ID，对应 `X-Api-Resource-Id`。并发版使用 `volc.bigasr.sauc.concurrent`，小时版使用 `volc.bigasr.sauc.duration`，实际以控制台为准。 |
 | `SPEECH_ENDPOINT` | URL，默认 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async` | 否 | 豆包大模型流式语音识别（双向流式优化版）WebSocket 地址。除非账号文档要求，否则不要改成 HTTP 地址。 |
 | `BOOSTING_TABLE_ID` / `BOOSTING_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `corpus.boosting_table_id` / `boosting_table_name`。每个实时连接只使用一张热词表，ID 优先。 |
 | `CORRECT_TABLE_ID` / `CORRECT_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `corpus.correct_table_id` / `correct_table_name`。每个实时连接只使用一张替换词表，ID 优先。 |
