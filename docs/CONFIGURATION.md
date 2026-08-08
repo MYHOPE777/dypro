@@ -21,6 +21,7 @@ PORT=8787
 TIMELINE_DATA_DIR=.data/timeline
 PRODUCT_CATALOG_PATH=.data/products/catalog.json
 RULE_CATALOG_PATH=.data/rules/catalog.json
+SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 ```
 
 ## 2. 环境变量逐项说明
@@ -34,6 +35,7 @@ RULE_CATALOG_PATH=.data/rules/catalog.json
 | `TIMELINE_DATA_DIR` | 路径，默认 `.data/timeline` | 否 | 保存每场 `timeline.jsonl`、16 kHz ASR PCM、原始采样率 PCM 和音轨元数据。原始音频必须保留时不要放在临时目录。 |
 | `PRODUCT_CATALOG_PATH` | 路径，默认 `.data/products/catalog.json` | 否 | 直播间、长期商品库和本场清单的本地 adapter 文件。 |
 | `RULE_CATALOG_PATH` | 路径，默认 `.data/rules/catalog.json` | 否 | 规则版本、启停状态、审核状态与审计日志的本地 adapter 文件。 |
+| `SPEECH_CORRECTION_CATALOG_PATH` | 路径，默认 `.data/speech-corrections/catalog.json` | 否 | 按直播间保存主播长期语音纠错词库。停播复核产生的错误词、正确词、确认次数、启停状态和最近来源会话都保存在这里。 |
 | `TENANT_ID` | 标识，默认 `tenant-default` | 否 | 多租户预留字段。SaaS 接入数据库、对象存储、Redis 和知识库时必须继续透传。 |
 | `RULE_REVIEWER_ACTOR_ID` | 账号 ID，默认 `owner` | 否 | 共享规则的审核人。多人模式下必须对应 `role` 为 `reviewer` 的账号。 |
 | `SESSION_IDLE_TTL_MS` | 毫秒，默认 `1800000` | 否 | 最后一个页面断开后保留会话的时间，最小按 60 秒处理。超时后只清理内存会话，已写入的本地时间线不删除。 |
@@ -98,9 +100,13 @@ RULE_CATALOG_PATH=.data/rules/catalog.json
 3. 发送 audio-only gzip 二进制帧；
 4. 收到最终结果后写入时间线并触发合规分析。
 
-火山引擎服务端在约 8 秒未收到下一音频包时会返回 `45000081` 并结束会话。主播停顿期间，服务端会在连续 2 秒未收到浏览器音频后发送约 100 ms 的静音 audio-only 帧作为保活；保活帧不会写入原始音频、16 kHz ASR 音频或时间线。停止收音或连接关闭时会立即清理保活定时器。
+火山引擎服务端在约 8 秒未收到下一音频包时会返回 `45000081` 并结束会话。主播停顿期间，服务端会在连续 2 秒未收到浏览器音频后发送约 100 ms 的静音 audio-only 帧作为保活；保活帧不会写入原始音频、16 kHz ASR 音频或时间线。暂停、结束直播或连接关闭时会立即清理保活定时器。
 
 浏览器会同时保留两条音轨：发送给 ASR 的 16 kHz PCM，以及蓝牙设备原始采样率 PCM。豆包大模型流式语音识别连接尚未 ready 时最多缓冲约 160 KB 音频，超过后会停止收音并提示连接异常。
+
+控制台的直播收音状态为：待开播、直播中、已暂停、已结束。设备测试只在浏览器本机计算音量，不上传也不写入音频文件；开始直播后才建立 ASR 和时间线。暂停会结束当前 ASR 流但保留同一场会话，继续时建立新的 ASR 流并保持直播绝对时间戳和音频采样位置；只有结束直播才进入停播归档队列。结束后可播放 16 kHz 识别音频并按片段时间戳修正文稿。
+
+转录修正可以同时生成当前直播间的长期“错误词 → 正确词”记录。后续识别结果会在合规判断前按启用词条自动修正，正确词还会写入下一条 ASR 连接的官方 `request.corpus.context`；误学词条可在停播复核中停用，历史记录不会删除。
 
 ### 2.4 豆包大模型
 

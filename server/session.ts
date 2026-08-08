@@ -7,8 +7,10 @@ import type { RecordingArchiveQueue } from './recordingArchive';
 import type { ComplianceAnalyzer } from '../src/compliance/engine';
 import type { ProductCatalog } from './productCatalog';
 import type { RuleCatalog } from './ruleCatalog';
+import { deriveSpeechCorrection, type SpeechCorrectionCatalog } from './speechCorrectionCatalog';
 import { DEFAULT_PRODUCT, PRODUCTS } from '../src/shared/products';
 import type {
+  CaptureState,
   ComplianceResult,
   Product,
   ServerMessage,
@@ -19,7 +21,17 @@ import type {
 
 type Client = { socket: WebSocket; role: 'operator' | 'display' };
 type TranscriptTiming = { startTimeMs?: number; endTimeMs?: number };
-type LiveSessionOptions = { timelineStore?: TimelineWriter; productCatalog?: ProductCatalog; ruleCatalog?: RuleCatalog; archiveQueue?: RecordingArchiveQueue; analyzer?: ComplianceAnalyzer; roomId?: string; actorId?: string; now?: () => number };
+type LiveSessionOptions = {
+  timelineStore?: TimelineWriter;
+  productCatalog?: ProductCatalog;
+  ruleCatalog?: RuleCatalog;
+  speechCorrectionCatalog?: SpeechCorrectionCatalog;
+  archiveQueue?: RecordingArchiveQueue;
+  analyzer?: ComplianceAnalyzer;
+  roomId?: string;
+  actorId?: string;
+  now?: () => number;
+};
 
 function createStats(): SessionStats {
   return { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 };
@@ -42,6 +54,7 @@ export class LiveSession {
   private readonly timelineStore?: TimelineWriter;
   private readonly productCatalog?: ProductCatalog;
   private readonly ruleCatalog?: RuleCatalog;
+  private readonly speechCorrectionCatalog?: SpeechCorrectionCatalog;
   private readonly archiveQueue?: RecordingArchiveQueue;
   private readonly actorId: string;
   private readonly now: () => number;
@@ -55,6 +68,7 @@ export class LiveSession {
     this.timelineStore = options.timelineStore;
     this.productCatalog = options.productCatalog;
     this.ruleCatalog = options.ruleCatalog;
+    this.speechCorrectionCatalog = options.speechCorrectionCatalog;
     this.archiveQueue = options.archiveQueue;
     this.analyzer = options.analyzer ?? createDoubaoAnalyzer();
     this.roomId = options.roomId ?? 'room-default';
@@ -71,6 +85,7 @@ export class LiveSession {
       product: initialProduct,
       lineup,
       isListening: false,
+      captureState: 'idle',
       partialTranscript: '',
       transcriptHistory: [],
       latestCompliance: null,
@@ -149,7 +164,8 @@ export class LiveSession {
   }
 
   startListening(): void {
-    if (this.stateValue.isListening) return;
+    if (this.stateValue.isListening || this.stateValue.captureState === 'ended') return;
+    const captureEvent = this.stateValue.captureState === 'paused' ? 'capture.resumed' : 'capture.started';
     this.releaseDrainingSpeechStream(this.drainingSpeechStream, true);
     this.archiveQueue?.pause?.(this.id);
     const occurredAt = this.now();
@@ -157,17 +173,20 @@ export class LiveSession {
     this.currentCaptureOffsetMs = this.offsetAt(occurredAt);
     this.currentCaptureSampleOffset = Math.floor((this.timelineStore?.getAudioByteLength(this.id) ?? 0) / 2);
     this.stateValue.isListening = true;
+    this.stateValue.captureState = 'live';
     this.stateValue.lastEventAt = occurredAt;
     const currentProduct = this.stateValue.product;
     const contextProducts = [currentProduct, ...this.stateValue.lineup.filter((product) => product.id !== currentProduct.id)];
+    const learnedCorrections = this.speechCorrectionCatalog?.list(this.roomId).filter((entry) => entry.enabled).slice(0, 12) ?? [];
     const asrContext = buildStreamingAsrContext(
-      contextProducts.flatMap((product) => [product.name, product.sku]).filter(Boolean),
+      [...learnedCorrections.map((entry) => entry.correctText), ...contextProducts.flatMap((product) => [product.name, product.sku]).filter(Boolean)],
       [
         `当前直播商品：${currentProduct.name}；类目：${currentProduct.category}；规格：${currentProduct.description || '以商品页面为准'}`,
         `本场直播商品清单：${contextProducts.map((product) => product.name).join('、')}`,
+        ...(learnedCorrections.length > 0 ? [`主播历史语音纠错：${learnedCorrections.map((entry) => `${entry.wrongText}应识别为${entry.correctText}`).join('；')}`] : []),
       ],
     );
-    this.recordTimeline('capture.started', occurredAt, this.currentCaptureOffsetMs, this.stateValue.product.id, {
+    this.recordTimeline(captureEvent, occurredAt, this.currentCaptureOffsetMs, this.stateValue.product.id, {
       audioSampleOffset: this.currentCaptureSampleOffset,
       encoding: 'pcm_s16le',
       sampleRate: 16000,
@@ -198,9 +217,37 @@ export class LiveSession {
     this.status(this.speechStream ? '正在连接豆包大模型流式语音识别' : '演示模式已启动，可用快捷语句模拟收音', this.speechStream ? 'neutral' : 'success');
   }
 
-  stopListening(): void {
+  pauseListening(): void {
     if (!this.stateValue.isListening) return;
     const occurredAt = this.now();
+    this.finishActiveSpeechStream();
+    this.stateValue.captureState = 'paused';
+    this.recordCaptureBoundary('capture.paused', occurredAt);
+    this.broadcast({ type: 'state.snapshot', state: this.state });
+    this.status('直播收音已暂停，可继续本场直播', 'warning');
+  }
+
+  resumeListening(): void {
+    if (this.stateValue.captureState !== 'paused') return;
+    this.startListening();
+  }
+
+  endLive(): void {
+    if (this.stateValue.captureState === 'idle' || this.stateValue.captureState === 'ended') return;
+    const occurredAt = this.now();
+    if (this.stateValue.isListening) this.finishActiveSpeechStream();
+    this.stateValue.captureState = 'ended';
+    this.recordCaptureBoundary('capture.ended', occurredAt);
+    this.archiveQueue?.enqueue(this.id);
+    this.broadcast({ type: 'state.snapshot', state: this.state });
+    this.status('本场直播已结束，音频和转录可进行复核', 'success');
+  }
+
+  stopListening(): void {
+    this.endLive();
+  }
+
+  private finishActiveSpeechStream(): void {
     const stream = this.speechStream;
     this.speechStream = null;
     if (stream) {
@@ -211,13 +258,13 @@ export class LiveSession {
     this.stateValue.isListening = false;
     stream?.finish();
     this.stateValue.partialTranscript = '';
+  }
+
+  private recordCaptureBoundary(type: 'capture.paused' | 'capture.ended', occurredAt: number): void {
     this.stateValue.lastEventAt = occurredAt;
-    this.recordTimeline('capture.stopped', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, {
+    this.recordTimeline(type, occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, {
       audioSampleOffset: Math.floor((this.timelineStore?.getAudioByteLength(this.id) ?? 0) / 2),
     });
-    this.archiveQueue?.enqueue(this.id);
-    this.broadcast({ type: 'state.snapshot', state: this.state });
-    this.status('已停止收音', 'neutral');
   }
 
   ingestAudio(audio: Buffer): void {
@@ -237,12 +284,12 @@ export class LiveSession {
     this.speechStream?.close();
     this.speechStream = null;
     this.stateValue.isListening = false;
+    this.stateValue.captureState = 'paused';
     this.stateValue.partialTranscript = '';
     this.stateValue.lastEventAt = occurredAt;
     this.recordTimeline('capture.failed', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, { message: error.message });
-    this.archiveQueue?.enqueue(this.id);
     this.broadcast({ type: 'state.snapshot', state: this.state });
-    this.status(`豆包大模型流式语音识别连接异常，已停止收音：${error.message}`, 'error');
+    this.status(`豆包大模型流式语音识别连接异常，本场已暂停：${error.message}`, 'error');
   }
 
   private releaseDrainingSpeechStream(stream: DoubaoStreamingAsr | null, close: boolean): void {
@@ -254,7 +301,9 @@ export class LiveSession {
   }
 
   ingestTranscript(rawText: string, isFinal = true, timing: TranscriptTiming = {}): void {
-    const text = rawText.trim();
+    const raw = rawText.trim();
+    const normalized = this.speechCorrectionCatalog?.apply(this.roomId, raw) ?? { text: raw, applied: [] };
+    const text = normalized.text.trim();
     if (!text) return;
     const occurredAt = this.now();
     const receivedOffsetMs = this.offsetAt(occurredAt);
@@ -282,6 +331,7 @@ export class LiveSession {
     this.recordTimeline('transcript.final', occurredAt, endOffsetMs, this.stateValue.product.id, {
       segmentId: segment.id,
       text,
+      ...(normalized.applied.length > 0 ? { rawText: raw, appliedSpeechCorrectionIds: normalized.applied.map((entry) => entry.id) } : {}),
       startOffsetMs,
       endOffsetMs,
       audioStartSample: timing.startTimeMs === undefined ? null : this.currentCaptureSampleOffset + Math.round((timing.startTimeMs / 1000) * 16000),
@@ -293,18 +343,29 @@ export class LiveSession {
     this.enqueueCompliance(segment);
   }
 
-  correctTranscript(segmentId: string, correctedText: string, actorId = this.actorId): void {
+  correctTranscript(
+    segmentId: string,
+    correctedText: string,
+    actorId = this.actorId,
+    learning: { learn?: boolean; wrongText?: string; correctText?: string } = {},
+  ): TranscriptSegment | null {
     const text = correctedText.trim();
-    if (!text) return;
+    if (!text) return null;
+    const explicitPair = learning.wrongText?.trim() && learning.correctText?.trim()
+      ? { wrongText: learning.wrongText.trim(), correctText: learning.correctText.trim() }
+      : undefined;
+    if (learning.learn && explicitPair && explicitPair.wrongText === explicitPair.correctText) throw new Error('错误词和正确词不能相同');
     const index = this.stateValue.transcriptHistory.findIndex((segment) => segment.id === segmentId && segment.isFinal);
-    if (index < 0) return;
-    const original = this.stateValue.transcriptHistory[index];
+    const original = index >= 0 ? this.stateValue.transcriptHistory[index] : this.findPersistedTranscript(segmentId);
+    if (!original) return null;
     const correctedAt = this.now();
     const corrected = { ...original, text };
     this.segmentRevisions.set(segmentId, (this.segmentRevisions.get(segmentId) ?? 0) + 1);
-    const history = [...this.stateValue.transcriptHistory];
-    history[index] = corrected;
-    this.stateValue.transcriptHistory = history;
+    if (index >= 0) {
+      const history = [...this.stateValue.transcriptHistory];
+      history[index] = corrected;
+      this.stateValue.transcriptHistory = history;
+    }
     this.stateValue.stats.words = Math.max(0, this.stateValue.stats.words - original.text.replace(/\s/g, '').length + text.replace(/\s/g, '').length);
     const previousResult = this.complianceBySegment.get(segmentId);
     if (previousResult) {
@@ -315,15 +376,44 @@ export class LiveSession {
     this.stateValue.alerts = this.stateValue.alerts.filter((alert) => alert.segmentId !== segmentId);
     if (this.stateValue.latestCompliance?.segmentId === segmentId) this.stateValue.latestCompliance = null;
     this.stateValue.lastEventAt = correctedAt;
+    const derived = deriveSpeechCorrection(original.text, text);
+    const pair = explicitPair ?? derived;
+    const learned = learning.learn && pair
+      ? this.speechCorrectionCatalog?.record(this.roomId, { ...pair, actorId, sessionId: this.id, segmentId })
+      : undefined;
     this.recordTimeline('transcript.corrected', correctedAt, corrected.endOffsetMs, this.stateValue.product.id, {
       segmentId,
       originalText: original.text,
       correctedText: text,
       actorId,
+      ...(learned ? { speechCorrectionId: learned.id, wrongText: learned.wrongText, correctText: learned.correctText } : {}),
     });
-    this.broadcast({ type: 'transcript.final', segment: corrected });
+    if (index >= 0) this.broadcast({ type: 'transcript.final', segment: corrected });
     this.broadcast({ type: 'state.snapshot', state: this.state });
     this.enqueueCompliance(corrected);
+    return corrected;
+  }
+
+  private findPersistedTranscript(segmentId: string): TranscriptSegment | null {
+    const events = this.timelineStore?.exportSession(this.id)?.events ?? [];
+    let segment: TranscriptSegment | null = null;
+    for (const event of events) {
+      if (event.type === 'transcript.final' && event.payload.segmentId === segmentId && typeof event.payload.text === 'string') {
+        segment = {
+          id: segmentId,
+          text: event.payload.text,
+          isFinal: true,
+          timestamp: event.occurredAt,
+          offsetMs: event.offsetMs,
+          startOffsetMs: typeof event.payload.startOffsetMs === 'number' ? event.payload.startOffsetMs : null,
+          endOffsetMs: typeof event.payload.endOffsetMs === 'number' ? event.payload.endOffsetMs : event.offsetMs,
+        };
+      }
+      if (segment && event.type === 'transcript.corrected' && event.payload.segmentId === segmentId && typeof event.payload.correctedText === 'string') {
+        segment = { ...segment, text: event.payload.correctedText };
+      }
+    }
+    return segment;
   }
 
   private enqueueCompliance(segment: TranscriptSegment): void {
@@ -367,10 +457,14 @@ export class LiveSession {
     let selectedProductId = this.stateValue.product.id;
     let productContextStartedAt = this.stateValue.productContextStartedAt;
     let maximumOffsetMs = 0;
+    let captureState: CaptureState = 'idle';
 
     for (const event of timeline.events) {
       maximumOffsetMs = Math.max(maximumOffsetMs, event.offsetMs ?? 0);
       this.stateValue.lastEventAt = Math.max(this.stateValue.lastEventAt, event.occurredAt);
+      if (event.type === 'capture.started' || event.type === 'capture.resumed') captureState = 'paused';
+      if (event.type === 'capture.paused' || event.type === 'capture.failed') captureState = 'paused';
+      if (event.type === 'capture.ended' || event.type === 'capture.stopped') captureState = 'ended';
       if (event.type === 'product.selected' && event.productId) {
         selectedProductId = event.productId;
         productContextStartedAt = event.occurredAt;
@@ -426,6 +520,7 @@ export class LiveSession {
     const allTranscripts = [...transcripts.values()].sort((first, second) => first.timestamp - second.timestamp);
     const allResults = [...results.values()].sort((first, second) => first.createdAt - second.createdAt);
     this.stateValue.product = this.stateValue.lineup.find((product) => product.id === selectedProductId) ?? this.stateValue.product;
+    this.stateValue.captureState = captureState;
     this.stateValue.productContextStartedAt = productContextStartedAt;
     this.stateValue.transcriptHistory = allTranscripts.slice(-20);
     this.stateValue.latestCompliance = allResults.at(-1) ?? null;

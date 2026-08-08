@@ -8,6 +8,7 @@ import {
   Database,
   ChevronRight,
   CircleStop,
+  FileAudio,
   ExternalLink,
   Headphones,
   Keyboard,
@@ -16,6 +17,7 @@ import {
   Mic,
   Monitor,
   Pencil,
+  Pause,
   Plus,
   Play,
   Radio,
@@ -29,7 +31,7 @@ import {
 } from 'lucide-react';
 import { DEFAULT_PRODUCT } from './shared/products';
 import { complianceForLatestSegment } from './compliance/currentCompliance';
-import type { ComplianceResult, ComplianceRule, LiveRoom, Product, ProductImportResponse, RuleAuditEntry, ServerMessage, SessionState } from './shared/types';
+import type { ComplianceResult, ComplianceRule, LiveRoom, Product, ProductImportResponse, RuleAuditEntry, ServerMessage, SessionState, SessionTimelineExport, SpeechCorrectionEntry, TimelineEvent, TranscriptSegment } from './shared/types';
 
 type Role = 'operator' | 'display';
 type AuthIdentity = { actorId: string; displayName: string; role: 'operator' | 'reviewer'; roomIds: string[] };
@@ -70,6 +72,7 @@ const EMPTY_STATE: SessionState = {
   product: DEFAULT_PRODUCT,
   lineup: [DEFAULT_PRODUCT],
   isListening: false,
+  captureState: 'idle',
   partialTranscript: '',
   transcriptHistory: [],
   latestCompliance: null,
@@ -210,15 +213,20 @@ function useOperatorAccess() {
   return { access, readiness, loading, message, login, logout };
 }
 
-function useMicrophone(send: (message: object) => void, isListening: boolean) {
+function useMicrophone(send: (message: object) => void, streamingEnabled: boolean) {
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState('');
   const [error, setError] = useState('');
   const [capturing, setCapturing] = useState(false);
+  const [level, setLevel] = useState(0);
   const streamRef = useRef<MediaStream | null>(null);
   const contextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const requestVersionRef = useRef(0);
+  const streamingRef = useRef(streamingEnabled);
+  const lastLevelUpdateRef = useRef(0);
+
+  useEffect(() => { streamingRef.current = streamingEnabled; }, [streamingEnabled]);
 
   const refresh = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -243,14 +251,13 @@ function useMicrophone(send: (message: object) => void, isListening: boolean) {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     setCapturing(false);
+    setLevel(0);
   }, []);
 
-  useEffect(() => {
-    if (!isListening) stop();
-    return stop;
-  }, [isListening, stop]);
+  useEffect(() => stop, [stop]);
 
   const start = useCallback(async () => {
+    if (streamRef.current) return true;
     const requestVersion = requestVersionRef.current + 1;
     requestVersionRef.current = requestVersion;
     try {
@@ -270,6 +277,15 @@ function useMicrophone(send: (message: object) => void, isListening: boolean) {
       processorRef.current = processor;
       processor.onaudioprocess = (event) => {
         const input = event.inputBuffer.getChannelData(0);
+        let energy = 0;
+        for (const sample of input) energy += sample * sample;
+        const now = performance.now();
+        if (now - lastLevelUpdateRef.current >= 80) {
+          const rms = Math.sqrt(energy / Math.max(1, input.length));
+          setLevel(Math.min(100, Math.round(rms * 360)));
+          lastLevelUpdateRef.current = now;
+        }
+        if (!streamingRef.current) return;
         const ratio = context.sampleRate / 16000;
         const rawOutput = new Int16Array(input.length);
         for (let index = 0; index < rawOutput.length; index += 1) {
@@ -295,14 +311,15 @@ function useMicrophone(send: (message: object) => void, isListening: boolean) {
       processor.connect(silentSink);
       silentSink.connect(context.destination);
       setCapturing(true);
+      void refresh();
       return true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '无法访问麦克风');
       return false;
     }
-  }, [deviceId, send]);
+  }, [deviceId, refresh, send]);
 
-  return { devices, deviceId, setDeviceId, start, stop, capturing, error, refresh };
+  return { devices, deviceId, setDeviceId, start, stop, capturing, level, error, refresh };
 }
 
 function RiskIcon({ risk }: { risk: ComplianceResult['risk'] }) {
@@ -530,28 +547,193 @@ function WorkspaceModal({ state, access, send, onClose, onLogout }: { state: Ses
   </section></div>;
 }
 
-function MicPanel({ isListening, connected, captureDeniedVersion, send }: { isListening: boolean; connected: boolean; captureDeniedVersion: number; send: (message: object) => boolean }) {
-  const microphone = useMicrophone(send, isListening);
+function MicPanel({ state, connected, captureDeniedVersion, send, onOpenReview }: { state: SessionState; connected: boolean; captureDeniedVersion: number; send: (message: object) => boolean; onOpenReview: () => void }) {
+  const microphone = useMicrophone(send, state.captureState === 'live' && state.isListening);
   const [showDevices, setShowDevices] = useState(false);
   const selected = microphone.devices.find((device) => device.deviceId === microphone.deviceId);
   useEffect(() => { if (captureDeniedVersion > 0) microphone.stop(); }, [captureDeniedVersion, microphone.stop]);
   useEffect(() => { if (!connected) microphone.stop(); }, [connected, microphone.stop]);
-  const toggleCapture = async () => {
-    if (isListening && microphone.capturing) {
-      microphone.stop();
-      send({ type: 'control.stop' });
-      return;
-    }
-    if (!isListening && await microphone.start() && !send({ type: 'control.start' })) microphone.stop();
+  useEffect(() => { if (state.captureState === 'ended') microphone.stop(); }, [microphone.stop, state.captureState]);
+
+  const startLive = async (resume = false) => {
+    if (!await microphone.start()) return;
+    if (!send({ type: resume ? 'control.resume' : 'control.start' })) microphone.stop();
   };
+  const endLive = () => {
+    if (send({ type: 'control.end' })) microphone.stop();
+  };
+  const deviceTitle = state.captureState === 'ended' ? '本场直播已结束'
+    : state.captureState === 'paused' ? '直播收音已暂停'
+      : state.captureState === 'live' ? microphone.capturing ? '直播收音运行中' : '其他控制台正在收音'
+        : microphone.capturing ? '正在测试输入音量' : '蓝牙麦克风待检测';
+  const levelLabel = microphone.level >= 18 ? '音量正常' : microphone.level >= 5 ? '声音偏低' : '等待声音';
   return <section className="rail-section mic-section">
-    <div className="section-kicker">收音设备 <span>INPUT</span></div>
-    <div className="mic-device-row"><div className={`mic-orb ${microphone.capturing ? 'active' : ''}`}><Mic size={21} /></div><div className="mic-device-name"><strong>{microphone.capturing ? '本机正在实时收音' : isListening ? '其他控制台正在收音' : '蓝牙麦克风待机'}</strong><small>{selected?.label || '请先允许浏览器访问麦克风'}</small></div></div>
-    <button type="button" className="device-toggle" disabled={isListening || !connected} onClick={() => { setShowDevices((value) => !value); void microphone.refresh(); }}><Headphones size={15} />选择输入设备 <ChevronRight size={14} className={showDevices ? 'rotate' : ''} /></button>
-    {showDevices && <div className="device-select-wrap"><select value={microphone.deviceId} onChange={(event) => microphone.setDeviceId(event.target.value)} aria-label="选择麦克风" disabled={isListening}><option value="">系统默认输入</option>{microphone.devices.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label || `麦克风 ${device.deviceId.slice(0, 5)}`}</option>)}</select></div>}
+    <div className="section-kicker">直播收音 <span>{state.captureState.toUpperCase()}</span></div>
+    <div className="mic-device-row"><div className={`mic-orb ${microphone.capturing ? 'active' : ''}`}><Mic size={21} /></div><div className="mic-device-name"><strong>{deviceTitle}</strong><small>{selected?.label || '尚未取得麦克风设备名称'}</small></div></div>
+    <button type="button" className="device-toggle" disabled={microphone.capturing || state.captureState !== 'idle' || !connected} onClick={() => { setShowDevices((value) => !value); void microphone.refresh(); }}><Headphones size={15} />选择输入设备 <ChevronRight size={14} className={showDevices ? 'rotate' : ''} /></button>
+    {showDevices && <div className="device-select-wrap"><select value={microphone.deviceId} onChange={(event) => microphone.setDeviceId(event.target.value)} aria-label="选择麦克风" disabled={microphone.capturing}><option value="">系统默认输入</option>{microphone.devices.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label || `麦克风 ${device.deviceId.slice(0, 5)}`}</option>)}</select></div>}
     {microphone.error && <div className="inline-error"><AlertTriangle size={14} />{microphone.error}</div>}
-    <div className="mic-control-row"><button type="button" className={`main-control ${isListening ? 'stop' : 'start'}`} onClick={() => void toggleCapture()} disabled={!connected || (isListening && !microphone.capturing)}>{isListening ? microphone.capturing ? <><CircleStop size={16} />停止收音</> : <><Radio size={16} />远端收音中</> : <><Play size={16} fill="currentColor" />开始收音</>}</button><span className="capture-note"><span className={`capture-dot ${microphone.capturing ? 'active' : ''}`} />{microphone.capturing ? '16kHz PCM' : isListening ? '只读监听' : '未连接'}</span></div>
+    {microphone.capturing && <div className="mic-meter"><div className="mic-meter-track"><i style={{ width: `${Math.max(2, microphone.level)}%` }} /></div><span>{levelLabel}</span></div>}
+    {state.captureState === 'idle' && <div className="mic-control-stack"><button type="button" className="test-control" onClick={() => microphone.capturing ? microphone.stop() : void microphone.start()} disabled={!connected}><Activity size={15} />{microphone.capturing ? '结束设备测试' : '检测并测试麦克风'}</button><button type="button" className="main-control start" onClick={() => void startLive()} disabled={!connected}><Radio size={16} />开始直播收音</button></div>}
+    {state.captureState === 'live' && <div className="mic-control-stack horizontal"><button type="button" className="test-control" onClick={() => send({ type: 'control.pause' })} disabled={!connected}><Pause size={15} fill="currentColor" />暂停</button><button type="button" className="main-control stop" onClick={endLive} disabled={!connected}><CircleStop size={16} />结束直播</button></div>}
+    {state.captureState === 'paused' && <div className="mic-control-stack horizontal"><button type="button" className="main-control start" onClick={() => void startLive(true)} disabled={!connected}><Play size={16} fill="currentColor" />继续收音</button><button type="button" className="main-control stop" onClick={endLive} disabled={!connected}><CircleStop size={16} />结束直播</button></div>}
+    {state.captureState === 'ended' && <button type="button" className="review-control" onClick={onOpenReview}><FileAudio size={16} />复核音频与转录</button>}
+    <span className="capture-note"><span className={`capture-dot ${state.isListening ? 'active' : ''}`} />{state.captureState === 'live' ? 'ASR STREAMING' : state.captureState === 'paused' ? 'PAUSED' : state.captureState === 'ended' ? 'ARCHIVED LOCALLY' : microphone.capturing ? 'LOCAL TEST' : 'STANDBY'}</span>
   </section>;
+}
+
+type ReviewTranscript = TranscriptSegment & {
+  audioStartMs: number | null;
+  audioEndMs: number | null;
+  revisions: number;
+};
+
+function buildReviewTranscripts(events: TimelineEvent[]): ReviewTranscript[] {
+  const transcripts = new Map<string, ReviewTranscript>();
+  for (const event of events) {
+    if (event.type === 'transcript.final') {
+      const segmentId = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
+      const text = typeof event.payload.text === 'string' ? event.payload.text : '';
+      if (!segmentId || !text) continue;
+      const audioStartSample = typeof event.payload.audioStartSample === 'number' ? event.payload.audioStartSample : null;
+      const audioEndSample = typeof event.payload.audioEndSample === 'number' ? event.payload.audioEndSample : null;
+      transcripts.set(segmentId, {
+        id: segmentId,
+        text,
+        isFinal: true,
+        timestamp: event.occurredAt,
+        offsetMs: event.offsetMs,
+        startOffsetMs: typeof event.payload.startOffsetMs === 'number' ? event.payload.startOffsetMs : null,
+        endOffsetMs: typeof event.payload.endOffsetMs === 'number' ? event.payload.endOffsetMs : event.offsetMs,
+        audioStartMs: audioStartSample === null ? null : Math.round((audioStartSample / 16_000) * 1_000),
+        audioEndMs: audioEndSample === null ? null : Math.round((audioEndSample / 16_000) * 1_000),
+        revisions: 0,
+      });
+    }
+    if (event.type === 'transcript.corrected') {
+      const segmentId = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
+      const correctedText = typeof event.payload.correctedText === 'string' ? event.payload.correctedText : '';
+      const existing = transcripts.get(segmentId);
+      if (existing && correctedText) transcripts.set(segmentId, { ...existing, text: correctedText, revisions: existing.revisions + 1 });
+    }
+  }
+  return [...transcripts.values()].sort((first, second) => first.timestamp - second.timestamp);
+}
+
+function deriveTextDifference(originalText: string, correctedText: string): { wrongText: string; correctText: string } | null {
+  const original = [...originalText];
+  const corrected = [...correctedText];
+  let prefix = 0;
+  while (prefix < original.length && prefix < corrected.length && original[prefix] === corrected[prefix]) prefix += 1;
+  let suffix = 0;
+  while (suffix < original.length - prefix && suffix < corrected.length - prefix && original[original.length - 1 - suffix] === corrected[corrected.length - 1 - suffix]) suffix += 1;
+  const wrongText = original.slice(prefix, original.length - suffix).join('').trim();
+  const correctText = corrected.slice(prefix, corrected.length - suffix).join('').trim();
+  return wrongText && correctText && wrongText !== correctText ? { wrongText, correctText } : null;
+}
+
+function SessionReviewModal({ state, access, onClose }: { state: SessionState; access: OperatorAccess; onClose: () => void }) {
+  const [timeline, setTimeline] = useState<SessionTimelineExport | null>(null);
+  const [corrections, setCorrections] = useState<SpeechCorrectionEntry[]>([]);
+  const [audioUrl, setAudioUrl] = useState('');
+  const [editing, setEditing] = useState<{ segment: ReviewTranscript; text: string; wrongText: string; correctText: string; learn: boolean; pairTouched: boolean } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('正在载入本场记录');
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUrlRef = useRef('');
+
+  const load = useCallback(async () => {
+    const headers = accessHeaders(access.actorId, access.token);
+    const [timelineResponse, correctionsResponse, audioResponse] = await Promise.all([
+      fetch(`/api/session/${state.sessionId}/timeline`, { headers }),
+      fetch(`/api/rooms/${state.roomId}/speech-corrections`, { headers }),
+      fetch(`/api/session/${state.sessionId}/audio.wav`, { headers }),
+    ]);
+    if (!timelineResponse.ok) throw new Error('本场时间线读取失败');
+    if (!correctionsResponse.ok) throw new Error('长期纠错词库读取失败');
+    setTimeline(await timelineResponse.json() as SessionTimelineExport);
+    setCorrections(await correctionsResponse.json() as SpeechCorrectionEntry[]);
+    if (audioResponse.ok) {
+      const nextUrl = URL.createObjectURL(await audioResponse.blob());
+      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
+      audioUrlRef.current = nextUrl;
+      setAudioUrl(nextUrl);
+    }
+    setMessage(audioResponse.ok ? '' : '本场没有可播放的音频');
+  }, [access.actorId, access.token, state.roomId, state.sessionId]);
+
+  useEffect(() => {
+    void load().catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error)));
+    const settleTimer = window.setTimeout(() => { void load().catch(() => undefined); }, 2_500);
+    return () => {
+      window.clearTimeout(settleTimer);
+      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
+    };
+  }, [load]);
+
+  const transcripts = buildReviewTranscripts(timeline?.events ?? []);
+  const beginEdit = (segment: ReviewTranscript) => setEditing({ segment, text: segment.text, wrongText: '', correctText: '', learn: true, pairTouched: false });
+  const updateDraft = (text: string) => setEditing((current) => {
+    if (!current) return null;
+    const derived = deriveTextDifference(current.segment.text, text);
+    return {
+      ...current,
+      text,
+      ...(!current.pairTouched ? { wrongText: derived?.wrongText ?? '', correctText: derived?.correctText ?? '' } : {}),
+    };
+  });
+  const saveCorrection = async () => {
+    if (!editing?.text.trim()) return;
+    setBusy(true);
+    setMessage('');
+    try {
+      const response = await fetch(`/api/session/${state.sessionId}/transcripts/${editing.segment.id}`, {
+        method: 'PATCH',
+        headers: accessHeaders(access.actorId, access.token, true),
+        body: JSON.stringify({ text: editing.text.trim(), learn: editing.learn, wrongText: editing.wrongText.trim() || undefined, correctText: editing.correctText.trim() || undefined }),
+      });
+      const result = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(result.message ?? '转录纠错失败');
+      setEditing(null);
+      await load();
+      setMessage(editing.learn && editing.wrongText && editing.correctText ? '转录已修正，并已加入直播间长期纠错词库' : '转录已修正');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const setCorrectionEnabled = async (correction: SpeechCorrectionEntry) => {
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/rooms/${state.roomId}/speech-corrections/${correction.id}/enabled`, {
+        method: 'POST', headers: accessHeaders(access.actorId, access.token, true), body: JSON.stringify({ enabled: !correction.enabled }),
+      });
+      if (!response.ok) throw new Error('纠错词状态更新失败');
+      await load();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const playSegment = (segment: ReviewTranscript) => {
+    if (!audioRef.current) return;
+    audioRef.current.currentTime = Math.max(0, (segment.audioStartMs ?? segment.startOffsetMs ?? segment.offsetMs ?? 0) / 1_000);
+    void audioRef.current.play();
+  };
+  const startNewSession = () => {
+    localStorage.removeItem('live-session');
+    window.location.assign(`/?room=${encodeURIComponent(state.roomId)}`);
+  };
+
+  return <div className="modal-backdrop" role="presentation"><section className="review-modal" role="dialog" aria-modal="true" aria-label="停播复核">
+    <header className="review-head"><div><span className="section-kicker">停播复核 <span>SESSION REVIEW</span></span><h2>音频与转录校对</h2><p>{state.sessionId} · {transcripts.length} 条最终转录 · 长期纠错 {corrections.length} 条</p></div><div className="review-head-actions"><button type="button" className="new-session-button" onClick={startNewSession}><Plus size={15} />新开一场直播</button><button type="button" className="modal-close" onClick={onClose} title="关闭">×</button></div></header>
+    <div className="review-audio"><div><FileAudio size={18} /><span><strong>本场 16 kHz 识别音频</strong><small>{timeline?.audio ? `${Math.round(timeline.audio.durationMs / 1000)} 秒 · ${Math.round(timeline.audio.byteLength / 1024)} KB` : '等待音频信息'}</small></span></div>{audioUrl ? <audio ref={audioRef} controls preload="metadata" src={audioUrl} /> : <span className="review-audio-empty">暂无音频</span>}</div>
+    <div className="review-grid"><section className="review-transcripts"><div className="pane-head"><div><strong>时间戳转录</strong><span>点击播放按钮定位到对应音频</span></div></div><div className="review-transcript-list">{transcripts.map((segment) => <div className="review-transcript-row" key={segment.id}><button type="button" className="segment-play" onClick={() => playSegment(segment)} disabled={!audioUrl} title="播放对应音频"><Play size={13} fill="currentColor" /></button><time><span>{formatReplayOffset(segment.offsetMs)}</span><small>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour12: false })}</small></time><div className="review-transcript-copy">{editing?.segment.id === segment.id ? <form onSubmit={(event) => { event.preventDefault(); void saveCorrection(); }}><textarea value={editing.text} onChange={(event) => updateDraft(event.target.value)} autoFocus /><div className="correction-pair"><label>错误词<input value={editing.wrongText} onChange={(event) => setEditing({ ...editing, wrongText: event.target.value, pairTouched: true })} placeholder="自动提取" /></label><span>→</span><label>正确词<input value={editing.correctText} onChange={(event) => setEditing({ ...editing, correctText: event.target.value, pairTouched: true })} placeholder="自动提取" /></label></div><label className="learn-toggle"><input type="checkbox" checked={editing.learn} onChange={(event) => setEditing({ ...editing, learn: event.target.checked })} />加入当前直播间长期纠错词库</label><div className="review-edit-actions"><button type="submit" disabled={busy || !editing.text.trim()}><Save size={13} />保存纠错</button><button type="button" onClick={() => setEditing(null)}>取消</button></div></form> : <><p>{segment.text}</p><div><span>{segment.revisions > 0 ? `已修正 ${segment.revisions} 次` : '原始转录'}</span><button type="button" title="纠正这句转录" onClick={() => beginEdit(segment)}><Pencil size={13} /></button></div></>}</div></div>)}</div>{transcripts.length === 0 && <div className="review-empty">本场还没有最终转录</div>}</section>
+      <aside className="correction-library"><div className="pane-head"><div><strong>长期纠错词库</strong><span>下一场自动修正并加入识别上下文</span></div></div><div className="correction-list">{corrections.map((correction) => <div className={`correction-row ${correction.enabled ? '' : 'disabled'}`} key={correction.id}><div><strong>{correction.wrongText}</strong><span>→</span><strong>{correction.correctText}</strong></div><small>确认 {correction.confirmations} 次 · {correction.enabled ? '已生效' : '已停用'}</small><button type="button" disabled={busy} onClick={() => void setCorrectionEnabled(correction)}>{correction.enabled ? '停用' : '重新启用'}</button></div>)}</div>{corrections.length === 0 && <div className="review-empty">修正转录后可沉淀主播专属词库</div>}</aside></div>
+    {message && <div className="review-message">{message}</div>}
+  </section></div>;
 }
 
 function Waveform({ active }: { active: boolean }) {
@@ -566,7 +748,7 @@ function TranscriptStage({ state, send }: { state: SessionState; send: (message:
   return <section className="stage-section transcript-stage">
     <div className="section-heading"><div><span className="section-kicker">流式语音识别 <span>DOUBAO ASR</span></span><h1>{state.partialTranscript || (latestIsCurrent ? lastFinal?.text : null) || '等待主播开口'}</h1></div><div className="asr-badge"><span className="signal-dot on" />{state.isListening ? 'STREAMING' : 'STANDBY'}</div></div>
     <Waveform active={state.isListening} />
-    <div className="transcript-feed">{state.transcriptHistory.slice(-4).map((segment, index) => <div className={`feed-line ${index === state.transcriptHistory.slice(-4).length - 1 ? 'current' : ''}`} key={segment.id}><time><span>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span><em>{formatReplayOffset(segment.offsetMs)}</em></time>{editingId === segment.id ? <form className="transcript-edit" onSubmit={(event) => { event.preventDefault(); if (draft.trim()) { send({ type: 'transcript.correct', segmentId: segment.id, text: draft.trim() }); setEditingId(null); } }}><input value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><button type="submit" title="保存纠错"><Save size={13} /></button><button type="button" title="取消纠错" onClick={() => setEditingId(null)}>×</button></form> : <><span>{segment.text}</span>{segment.isFinal && <button type="button" className="transcript-edit-button" title="纠正这句转录" onClick={() => { setEditingId(segment.id); setDraft(segment.text); }}><Pencil size={12} /></button>}</>}</div>)}</div>
+    <div className="transcript-feed">{state.transcriptHistory.slice(-4).map((segment, index) => <div className={`feed-line ${index === state.transcriptHistory.slice(-4).length - 1 ? 'current' : ''}`} key={segment.id}><time><span>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span><em>{formatReplayOffset(segment.offsetMs)}</em></time>{editingId === segment.id ? <form className="transcript-edit" onSubmit={(event) => { event.preventDefault(); if (draft.trim()) { send({ type: 'transcript.correct', segmentId: segment.id, text: draft.trim(), learn: true }); setEditingId(null); } }}><input value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><button type="submit" title="保存并学习纠错"><Save size={13} /></button><button type="button" title="取消纠错" onClick={() => setEditingId(null)}>×</button></form> : <><span>{segment.text}</span>{segment.isFinal && <button type="button" className="transcript-edit-button" title="纠正这句转录" onClick={() => { setEditingId(segment.id); setDraft(segment.text); }}><Pencil size={12} /></button>}</>}</div>)}</div>
   </section>;
 }
 
@@ -626,11 +808,12 @@ function LoginScreen({ readiness, message, onLogin }: { readiness: Readiness | n
 function OperatorScreen({ access, readiness, onLogout }: { access: OperatorAccess; readiness: Readiness | null; onLogout: () => void }) {
   const session = useLiveSession('operator', access);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
   const currentCompliance = complianceForLatestSegment(session.state);
   const latestSegment = session.state.transcriptHistory.at(-1);
   const latestSegmentIsCurrent = Boolean(latestSegment && latestSegment.timestamp >= session.state.productContextStartedAt);
   const compliancePending = Boolean(session.state.partialTranscript || (latestSegmentIsCurrent && !currentCompliance));
-  return <div className="app-shell operator-shell"><AppHeader state={session.state} connected={session.connected} status={session.status} mode="operator" /><main className="operator-grid"><aside className="left-rail"><ProductRail state={session.state} send={session.send} onOpenLibrary={() => setWorkspaceOpen(true)} /><MicPanel isListening={session.state.isListening} connected={session.connected} captureDeniedVersion={session.captureDeniedVersion} send={session.send} /><div className="rail-footer"><Wifi size={14} />局域网地址可供 iPad 访问</div></aside><section className="main-stage"><div className="stage-context"><div><span className="eyebrow">TODAY'S LIVE · 01</span><h2>{session.state.product.name}</h2></div><div className="context-actions"><span className="ai-tag"><ShieldCheck size={14} />豆包合规引擎</span><span className="context-dot" />豆包大模型流式语音识别</div></div><ReadinessStrip readiness={readiness} /><TranscriptStage state={session.state} send={session.send} /><DemoInput send={session.send} /></section><aside className="coach-rail"><PromptPanel state={session.state} /><CompliancePanel result={currentCompliance} pending={compliancePending} /><section className="alert-history"><div className="section-kicker">近期提醒 <span>ALERT LOG</span></div>{session.state.alerts.length ? session.state.alerts.slice(0, 4).map((alert) => <div className="alert-row" key={alert.id}><div className={`alert-icon ${alert.risk}`}><RiskIcon risk={alert.risk} /></div><div><strong>{alert.title}</strong><small>{new Date(alert.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {alert.alternative.replace(/^可以改为：/u, '')}</small></div></div>) : <div className="empty-alert"><Check size={16} />暂无风险提醒</div>}</section></aside></main><footer className="operator-footer"><SessionStats state={session.state} /><div className="footer-note"><Activity size={15} />风险判断以豆包大模型为主，未配置密钥时使用本地规则即时兜底</div></footer>{workspaceOpen && <WorkspaceModal state={session.state} access={access} send={session.send} onClose={() => setWorkspaceOpen(false)} onLogout={onLogout} />}</div>;
+  return <div className="app-shell operator-shell"><AppHeader state={session.state} connected={session.connected} status={session.status} mode="operator" /><main className="operator-grid"><aside className="left-rail"><ProductRail state={session.state} send={session.send} onOpenLibrary={() => setWorkspaceOpen(true)} /><MicPanel state={session.state} connected={session.connected} captureDeniedVersion={session.captureDeniedVersion} send={session.send} onOpenReview={() => setReviewOpen(true)} /><div className="rail-footer"><Wifi size={14} />局域网地址可供 iPad 访问</div></aside><section className="main-stage"><div className="stage-context"><div><span className="eyebrow">TODAY'S LIVE · 01</span><h2>{session.state.product.name}</h2></div><div className="context-actions"><span className="ai-tag"><ShieldCheck size={14} />豆包合规引擎</span><span className="context-dot" />豆包大模型流式语音识别</div></div><ReadinessStrip readiness={readiness} /><TranscriptStage state={session.state} send={session.send} /><DemoInput send={session.send} /></section><aside className="coach-rail"><PromptPanel state={session.state} /><CompliancePanel result={currentCompliance} pending={compliancePending} /><section className="alert-history"><div className="section-kicker">近期提醒 <span>ALERT LOG</span></div>{session.state.alerts.length ? session.state.alerts.slice(0, 4).map((alert) => <div className="alert-row" key={alert.id}><div className={`alert-icon ${alert.risk}`}><RiskIcon risk={alert.risk} /></div><div><strong>{alert.title}</strong><small>{new Date(alert.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {alert.alternative.replace(/^可以改为：/u, '')}</small></div></div>) : <div className="empty-alert"><Check size={16} />暂无风险提醒</div>}</section></aside></main><footer className="operator-footer"><SessionStats state={session.state} /><div className="footer-note"><Activity size={15} />风险判断以豆包大模型为主，未配置密钥时使用本地规则即时兜底</div></footer>{workspaceOpen && <WorkspaceModal state={session.state} access={access} send={session.send} onClose={() => setWorkspaceOpen(false)} onLogout={onLogout} />}{reviewOpen && <SessionReviewModal state={session.state} access={access} onClose={() => setReviewOpen(false)} />}</div>;
 }
 
 function OperatorEntry() {
@@ -648,7 +831,8 @@ function DisplayScreen() {
   const latestSegmentIsCurrent = Boolean(latestSegment && latestSegment.timestamp >= session.state.productContextStartedAt);
   const pending = Boolean(session.state.partialTranscript || (latestSegmentIsCurrent && !result));
   const risk = result?.risk ?? 'safe';
-  return <div className={`app-shell display-shell risk-${risk}`}><AppHeader state={session.state} connected={session.connected} status={session.status} mode="display" /><main className="display-main"><div className="display-product"><img src={session.state.product.image} alt="" /><div><span className="eyebrow">ON AIR PRODUCT · {session.state.product.category}</span><h1>{session.state.product.name}</h1><strong>{session.state.product.price}</strong></div><div className="display-live"><span className="signal-dot on" />{session.state.isListening ? '正在收音' : '等待收音'}</div></div><section className="display-voice"><div className="display-voice-label"><Volume2 size={17} />主播刚刚说 <span>{formatReplayOffset(latestSegment?.offsetMs ?? null)}</span></div><div className="display-transcript">{session.state.partialTranscript || latestSegment?.text || '等待下一句转录…'}</div><Waveform active={session.state.isListening} /></section><section className={`display-alert ${risk}`}><div className="display-alert-head"><div className="display-risk-icon"><RiskIcon risk={risk} /></div><div><span className="eyebrow">{result ? '即时合规提醒' : pending ? '正在分析当前话术' : '合规提词就绪'}</span><h2>{result ? <RiskLabel risk={risk} /> : pending ? '暂用当前商品安全表达' : '可以继续介绍当前商品'}</h2></div><span className="display-source">{pending ? 'ANALYZING' : result?.source === 'doubao' ? 'DOUBAO' : result?.source === 'custom-rule' ? 'CUSTOM RULE' : 'LOCAL GUARDRAIL'}</span></div><div className="display-divider" /><div className="display-prompt-label">{result && result.risk !== 'safe' ? '请立即替换为' : pending ? '分析完成前建议' : '推荐表达'}</div><p className="display-prompt">{result && result.risk !== 'safe' ? result.alternative : session.state.product.compliantPhrases[0]}</p>{result && result.risk !== 'safe' && <p className="display-reason"><AlertTriangle size={15} />{result.reason}</p>}</section></main><footer className="display-footer"><div><ShieldCheck size={15} />抖音直播合规实时预警</div><div className="display-footer-stats"><span>监测 {session.state.stats.words} 字</span><span>高风险 {session.state.stats.blockedCount}</span><span>需留意 {session.state.stats.warningCount}</span></div></footer></div>;
+  const captureLabel = session.state.captureState === 'live' ? '正在收音' : session.state.captureState === 'paused' ? '直播暂停' : session.state.captureState === 'ended' ? '直播结束' : '等待开播';
+  return <div className={`app-shell display-shell risk-${risk}`}><AppHeader state={session.state} connected={session.connected} status={session.status} mode="display" /><main className="display-main"><div className="display-product"><img src={session.state.product.image} alt="" /><div><span className="eyebrow">ON AIR PRODUCT · {session.state.product.category}</span><h1>{session.state.product.name}</h1><strong>{session.state.product.price}</strong></div><div className="display-live"><span className={`signal-dot ${session.state.isListening ? 'on' : ''}`} />{captureLabel}</div></div><section className="display-voice"><div className="display-voice-label"><Volume2 size={17} />主播刚刚说 <span>{formatReplayOffset(latestSegment?.offsetMs ?? null)}</span></div><div className="display-transcript">{session.state.partialTranscript || latestSegment?.text || '等待下一句转录…'}</div><Waveform active={session.state.isListening} /></section><section className={`display-alert ${risk}`}><div className="display-alert-head"><div className="display-risk-icon"><RiskIcon risk={risk} /></div><div><span className="eyebrow">{result ? '即时合规提醒' : pending ? '正在分析当前话术' : '合规提词就绪'}</span><h2>{result ? <RiskLabel risk={risk} /> : pending ? '暂用当前商品安全表达' : '可以继续介绍当前商品'}</h2></div><span className="display-source">{pending ? 'ANALYZING' : result?.source === 'doubao' ? 'DOUBAO' : result?.source === 'custom-rule' ? 'CUSTOM RULE' : 'LOCAL GUARDRAIL'}</span></div><div className="display-divider" /><div className="display-prompt-label">{result && result.risk !== 'safe' ? '请立即替换为' : pending ? '分析完成前建议' : '推荐表达'}</div><p className="display-prompt">{result && result.risk !== 'safe' ? result.alternative : session.state.product.compliantPhrases[0]}</p>{result && result.risk !== 'safe' && <p className="display-reason"><AlertTriangle size={15} />{result.reason}</p>}</section></main><footer className="display-footer"><div><ShieldCheck size={15} />抖音直播合规实时预警</div><div className="display-footer-stats"><span>监测 {session.state.stats.words} 字</span><span>高风险 {session.state.stats.blockedCount}</span><span>需留意 {session.state.stats.warningCount}</span></div></footer></div>;
 }
 
 export default function App() {

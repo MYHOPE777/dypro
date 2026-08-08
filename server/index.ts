@@ -11,6 +11,7 @@ import { LiveSession } from './session';
 import { FileTimelineStore } from './timelineStore';
 import { FileProductCatalog } from './productCatalog';
 import { FileRuleCatalog } from './ruleCatalog';
+import { FileSpeechCorrectionCatalog } from './speechCorrectionCatalog';
 import { parseProductText } from './productParser';
 import { AuthService, allowsControlTransport, canAccessRoom, type AuthIdentity } from './auth';
 import { readSessionIdleTtlMs } from './config';
@@ -30,6 +31,7 @@ const clientDir = path.resolve(projectRoot, '../dist/client');
 const timelineStore = new FileTimelineStore(process.env.TIMELINE_DATA_DIR ?? path.resolve(projectRoot, '../.data/timeline'));
 const productCatalog = new FileProductCatalog(process.env.PRODUCT_CATALOG_PATH ?? path.resolve(projectRoot, '../.data/products/catalog.json'));
 const ruleCatalog = new FileRuleCatalog(productCatalog, process.env.RULE_CATALOG_PATH ?? path.resolve(projectRoot, '../.data/rules/catalog.json'));
+const speechCorrectionCatalog = new FileSpeechCorrectionCatalog(process.env.SPEECH_CORRECTION_CATALOG_PATH ?? path.resolve(projectRoot, '../.data/speech-corrections/catalog.json'));
 const authService = new AuthService(process.env);
 const requestIdentities = new WeakMap<express.Request, AuthIdentity>();
 const loginAttempts = new Map<string, { failures: number; blockedUntil: number }>();
@@ -56,21 +58,25 @@ function getOrCreateSession(id?: string, roomId = 'room-default', actorId = 'own
     const existing = sessions.get(safeId)!;
     if (existing.roomId === roomId) return existing;
   }
-  const session = new LiveSession(safeId && !sessions.has(safeId) ? safeId : undefined, { timelineStore, productCatalog, ruleCatalog, archiveQueue: recordingArchiveQueue, analyzer: complianceAnalyzer, roomId, actorId });
+  const session = new LiveSession(safeId && !sessions.has(safeId) ? safeId : undefined, { timelineStore, productCatalog, ruleCatalog, speechCorrectionCatalog, archiveQueue: recordingArchiveQueue, analyzer: complianceAnalyzer, roomId, actorId });
   sessions.set(session.id, session);
   return session;
 }
 
 function detachSessionClient(session: LiveSession, socket: WebSocket): void {
-  if (captureLeases.release(session.id, socket)) session.stopListening();
+  if (captureLeases.release(session.id, socket)) session.pauseListening();
   session.removeClient(socket);
   if (session.clientCount !== 0) return;
-  session.stopListening();
+  session.pauseListening();
   const existingTimer = sessionExpiryTimers.get(session.id);
   if (existingTimer) clearTimeout(existingTimer);
   const sessionId = session.id;
   const timer = setTimeout(() => {
-    if (sessions.get(sessionId)?.clientCount === 0) sessions.delete(sessionId);
+    const expired = sessions.get(sessionId);
+    if (expired?.clientCount === 0) {
+      expired.endLive();
+      sessions.delete(sessionId);
+    }
     sessionExpiryTimers.delete(sessionId);
   }, sessionIdleTtlMs);
   timer.unref();
@@ -88,6 +94,9 @@ function isClientMessage(value: unknown): value is ClientMessage {
         && (message.token === undefined || typeof message.token === 'string')
         && (message.role === 'operator' || message.role === 'display');
     case 'control.start':
+    case 'control.pause':
+    case 'control.resume':
+    case 'control.end':
     case 'control.stop':
       return true;
     case 'product.select':
@@ -101,7 +110,11 @@ function isClientMessage(value: unknown): value is ClientMessage {
     case 'demo.transcript':
       return typeof message.text === 'string' && message.text.trim().length > 0 && message.text.length <= 2_000;
     case 'transcript.correct':
-      return typeof message.segmentId === 'string' && message.segmentId.length <= 128 && typeof message.text === 'string' && message.text.trim().length > 0 && message.text.length <= 2_000;
+      return typeof message.segmentId === 'string' && message.segmentId.length <= 128
+        && typeof message.text === 'string' && message.text.trim().length > 0 && message.text.length <= 2_000
+        && (message.learn === undefined || typeof message.learn === 'boolean')
+        && (message.wrongText === undefined || (typeof message.wrongText === 'string' && message.wrongText.length <= 80))
+        && (message.correctText === undefined || (typeof message.correctText === 'string' && message.correctText.length <= 80));
     default:
       return false;
   }
@@ -356,6 +369,18 @@ app.post('/api/rooms/:roomId/products', requireOperator, requireRoomAccess, (req
 
 app.get('/api/rooms/:roomId/rules', requireOperator, requireRoomAccess, (request, response) => response.json(ruleCatalog.list(routeParam(request, 'roomId'))));
 app.get('/api/rooms/:roomId/rules/audits', requireOperator, requireRoomAccess, (request, response) => response.json(ruleCatalog.audits(routeParam(request, 'roomId'))));
+app.get('/api/rooms/:roomId/speech-corrections', requireOperator, requireRoomAccess, (request, response) => response.json(speechCorrectionCatalog.list(routeParam(request, 'roomId'))));
+
+app.post('/api/rooms/:roomId/speech-corrections/:correctionId/enabled', requireOperator, requireRoomAccess, (request, response) => {
+  if (typeof request.body?.enabled !== 'boolean') return response.status(400).json({ message: 'enabled 必须是布尔值' });
+  try {
+    const correction = speechCorrectionCatalog.getById(routeParam(request, 'correctionId'));
+    if (!correction || correction.roomId !== routeParam(request, 'roomId')) return response.status(404).json({ message: '语音纠错记录不存在' });
+    return response.json(speechCorrectionCatalog.setEnabled(correction.id, request.body.enabled));
+  } catch (error) {
+    return response.status(400).json({ message: error instanceof Error ? error.message : '语音纠错状态更新失败' });
+  }
+});
 
 app.post('/api/rooms/:roomId/rules', requireOperator, requireRoomAccess, (request, response) => {
   const input = readRuleInput(request.body);
@@ -455,6 +480,26 @@ app.get('/api/session/:id/timeline.jsonl', requireOperator, requireSessionAccess
   response.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
   response.setHeader('Content-Disposition', `attachment; filename="${sessionId}.timeline.jsonl"`);
   return response.send(jsonLines);
+});
+
+app.patch('/api/session/:id/transcripts/:segmentId', requireOperator, requireSessionAccess, (request, response) => {
+  const text = typeof request.body?.text === 'string' ? request.body.text.trim() : '';
+  if (!text || text.length > 2_000) return response.status(400).json({ message: '修正后的转录不能为空且不能超过 2000 个字符' });
+  const wrongText = typeof request.body?.wrongText === 'string' ? request.body.wrongText.trim() : undefined;
+  const correctText = typeof request.body?.correctText === 'string' ? request.body.correctText.trim() : undefined;
+  if ((wrongText && wrongText.length > 80) || (correctText && correctText.length > 80)) return response.status(400).json({ message: '单个纠错词不能超过 80 个字符' });
+  const session = sessions.get(routeParam(request, 'id'));
+  if (!session) return response.status(404).json({ message: '直播会话尚未载入' });
+  try {
+    const segment = session.correctTranscript(routeParam(request, 'segmentId'), text, actorFromRequest(request), {
+      learn: request.body?.learn === true,
+      wrongText,
+      correctText,
+    });
+    return segment ? response.json({ segment }) : response.status(404).json({ message: '转录片段不存在' });
+  } catch (error) {
+    return response.status(400).json({ message: error instanceof Error ? error.message : '转录纠错失败' });
+  }
 });
 
 function parseTrackIndex(value: unknown): number | null {
@@ -559,13 +604,27 @@ wsServer.on('connection', (socket: WebSocket, request) => {
       if (role !== 'operator') return sendError('主播屏为只读模式');
       switch (message.type) {
         case 'control.start':
-          if (!session.state.isListening) captureLeases.clear(session.id);
+          if (session.state.captureState !== 'idle') return sendError('本场直播已经开始，请使用继续收音或新开一场直播');
+          captureLeases.clear(session.id);
           if (!captureLeases.acquire(session.id, socket)) return denyCapture();
           session.startListening();
           break;
+        case 'control.pause':
+          if (!captureLeases.owns(session.id, socket)) return denyCapture();
+          session.pauseListening();
+          break;
+        case 'control.resume':
+          if (!captureLeases.owns(session.id, socket) && !captureLeases.acquire(session.id, socket)) return denyCapture();
+          session.resumeListening();
+          break;
+        case 'control.end':
+          if (!captureLeases.owns(session.id, socket) && !captureLeases.acquire(session.id, socket)) return denyCapture();
+          session.endLive();
+          captureLeases.release(session.id, socket);
+          break;
         case 'control.stop':
           if (!captureLeases.owns(session.id, socket)) return denyCapture();
-          session.stopListening();
+          session.endLive();
           captureLeases.release(session.id, socket);
           break;
         case 'product.select':
@@ -586,7 +645,7 @@ wsServer.on('connection', (socket: WebSocket, request) => {
           session.ingestTranscript(message.text, true);
           break;
         case 'transcript.correct':
-          session.correctTranscript(message.segmentId, message.text, actorId);
+          session.correctTranscript(message.segmentId, message.text, actorId, message);
           break;
         default:
           break;

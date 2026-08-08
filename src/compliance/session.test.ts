@@ -1,5 +1,9 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { LiveSession } from '../../server/session';
+import { FileTimelineStore } from '../../server/timelineStore';
 import type WebSocket from 'ws';
 
 function fakeSocket() {
@@ -43,5 +47,37 @@ describe('LiveSession', () => {
     session.stopListening();
     expect(enqueue).toHaveBeenCalledOnce();
     expect(enqueue).toHaveBeenCalledWith('archive-session');
+  });
+
+  it('pauses and resumes one live session without archiving until it ends', () => {
+    const enqueue = vi.fn();
+    const session = new LiveSession('lifecycle-session', { archiveQueue: { enqueue } });
+
+    session.startListening();
+    expect(session.state).toMatchObject({ isListening: true, captureState: 'live' });
+    session.pauseListening();
+    expect(session.state).toMatchObject({ isListening: false, captureState: 'paused' });
+    expect(enqueue).not.toHaveBeenCalled();
+
+    session.resumeListening();
+    expect(session.state).toMatchObject({ isListening: true, captureState: 'live' });
+    session.endLive();
+    expect(session.state).toMatchObject({ isListening: false, captureState: 'ended' });
+    expect(enqueue).toHaveBeenCalledOnce();
+  });
+
+  it('can correct a transcript that has moved out of the live history window', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'session-review-'));
+    try {
+      const timelineStore = new FileTimelineStore(directory);
+      const session = new LiveSession('session-review-old-segment', { timelineStore });
+      for (let index = 0; index < 21; index += 1) session.ingestTranscript(`第${index}句`);
+      const corrected = session.correctTranscript('segment-0', '第一句', 'operator-a', { learn: false });
+
+      expect(corrected?.text).toBe('第一句');
+      expect(timelineStore.exportSession(session.id)?.events.at(-1)?.payload).toMatchObject({ segmentId: 'segment-0', correctedText: '第一句' });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

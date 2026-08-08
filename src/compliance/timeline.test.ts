@@ -127,7 +127,7 @@ describe('session timeline export', () => {
     now = 3_000;
     firstSession.ingestTranscript('今天是全网最低价');
     await new Promise((resolve) => setTimeout(resolve, 0));
-    firstSession.stopListening();
+    firstSession.pauseListening();
 
     now = 7_000;
     const resumedSession = new LiveSession('live-resume-test', { timelineStore, now: () => now });
@@ -142,7 +142,7 @@ describe('session timeline export', () => {
 
     const timeline = timelineStore.exportSession('live-resume-test');
     expect(timeline?.events.filter((event) => event.type === 'session.created')).toHaveLength(1);
-    const captureEvents = timeline?.events.filter((event) => event.type === 'capture.started');
+    const captureEvents = timeline?.events.filter((event) => event.type === 'capture.started' || event.type === 'capture.resumed');
     expect(captureEvents?.map((event) => event.offsetMs)).toEqual([0, 6_000]);
     expect(captureEvents?.map((event) => event.payload.audioSampleOffset)).toEqual([0, 2]);
   });

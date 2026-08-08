@@ -14,7 +14,7 @@ npm run dev
 
 版本发布使用 `npm run release -- patch|minor|major`。命令会自动跑测试、更新版本号、创建 Git 标签、生成本地 bundle 备份并尝试推送 GitHub；断网时本地版本仍然保留。
 
-开发模式只绑定 MacBook 本机，打开 `http://localhost:5173` 进入控制台。点击“选择输入设备”选择已连接的蓝牙麦克风，再点击“开始收音”。需要让 iPad 或外接显示器通过局域网访问时，请按“生产构建”先执行 `npm run build` 和 `npm start`，再使用 `http://<MacBook局域网IP>:8787`；这样局域网设备只能打开只读主播屏，不会通过开发代理绕过控制台限制。
+开发模式只绑定 MacBook 本机，打开 `http://localhost:5173` 进入控制台。选择蓝牙麦克风后先用“检测并测试麦克风”观察本机音量，再点击“开始直播收音”。直播中可以暂停和继续，只有“结束直播”才封存本场并进入复核。需要让 iPad 或外接显示器通过局域网访问时，请按“生产构建”先执行 `npm run build` 和 `npm start`，再使用 `http://<MacBook局域网IP>:8787`；这样局域网设备只能打开只读主播屏，不会通过开发代理绕过控制台限制。
 
 没有配置密钥时，控制台仍可用“演示输入”按钮验证完整的预警和提词流程，结果会标注为 `LOCAL GUARDRAIL`。正式接入时，把火山引擎新版语音控制台提供的 App Key 写入 `X_API_KEY`，把方舟 API Key 和 Model ID 分别写入 `ARK_API_KEY`、`ARK_MODEL`；密钥只在 Node 服务端使用，不会下发到浏览器。
 
@@ -44,16 +44,16 @@ npm start
 
 ## 时间线与原始音频
 
-点击“开始收音”时会建立直播时间基准。服务端在 `.data/timeline/<sessionId>/` 下保存：
+点击“开始直播收音”时会建立直播时间基准。服务端在 `.data/timeline/<sessionId>/` 下保存：
 
 - `audio.source.json`：原始音频音轨清单；浏览器采样率变化时会自动分轨。
 - `audio.source.<track>.pcm`：浏览器采集到的原生采样率 PCM signed 16-bit little-endian、单声道，作为原始音频保留；`track` 从 0 开始。
 - `audio.pcm`：发送给豆包大模型流式语音识别的 16kHz PCM signed 16-bit little-endian、单声道副本。
 - `timeline.jsonl`：最终转录、转录纠错、商品清单与商品切换、收音启停和合规结果。每条记录同时包含 UTC 绝对时间、`Asia/Shanghai` 时区标识、相对开播毫秒数及 PCM 采样位置。纠错记录同时保留原文、修正文和操作人。
 
-收音期间不会上传音频。停止收音后，会话进入 `.data/archive/queue.json` 归档队列；只有配置 `TOS_ARCHIVE_GATEWAY_URL` 和 `TOS_ARCHIVE_GATEWAY_KEY` 时才会由后台上传。上传失败会保留本地文件并指数退避重试，不影响下一场流式语音识别。归档网关负责把文件写入火山引擎 TOS，接口约定为：先接收会话 manifest，再返回各音频资产的预签名 `uploadUrls`，服务端随后以流式 PUT 上传 PCM 文件。
+收音期间不会上传音频。暂停只停止当前 ASR 流并保留本场会话；点击“结束直播”后，会话才进入 `.data/archive/queue.json` 归档队列。只有配置 `TOS_ARCHIVE_GATEWAY_URL` 和 `TOS_ARCHIVE_GATEWAY_KEY` 时才会由后台上传。上传失败会保留本地文件并指数退避重试，不影响下一场流式语音识别。归档网关负责把文件写入火山引擎 TOS，接口约定为：先接收会话 manifest，再返回各音频资产的预签名 `uploadUrls`，服务端随后以流式 PUT 上传 PCM 文件。
 
-如果停止后很快重新开始收音，正在进行的归档上传会被暂停并保留为本地待处理任务，避免归档流量与流式语音识别链路重叠；再次停止收音后由后台继续上传。
+结束后可以在控制台播放本场 16 kHz 识别音频，按时间戳跳到对应转录并修正整句。修正时提取的“错误词 → 正确词”会写入 `.data/speech-corrections/catalog.json`，按直播间长期保存；下一场会自动修正文稿并把正确词加入 ASR 上下文。误学词条可以停用，记录与确认次数仍然保留。
 
 预留给后续复盘工具的只读接口：
 
@@ -84,7 +84,9 @@ npm start
 - 当前直播间规则保存后立即生效，只影响该直播间。
 - 共享规则由非审核人提交后进入“待审核”，只有 `RULE_REVIEWER_ACTOR_ID` 指定的系统审核人可以发布；发布后对所有直播间生效。
 - 规则编辑会生成新版本，控制台可回滚上一版。创建、审核、驳回、编辑和回滚都会写入 `.data/rules/catalog.json` 的审计日志。
-- 流式语音识别列表中的铅笔按钮可以修改识别错误。系统会撤销该片段旧告警和统计，以修正文重新执行规则和豆包判断，同时在时间线保留原始文字。
+- 流式语音识别列表和停播复核中的铅笔按钮都可以修改识别错误。系统会撤销该片段旧告警和统计，以修正文重新执行规则和豆包判断，同时在时间线保留原始文字；选择长期学习后还会更新当前直播间纠错词库。
+- `GET /api/rooms/:roomId/speech-corrections`：直播间长期语音纠错词库。
+- `PATCH /api/session/:id/transcripts/:segmentId`：修正任意时间戳转录，并可沉淀错误词和正确词。
 - `GET /api/rooms/:roomId/rules`、`POST /api/rooms/:roomId/rules`：规则列表与新增。
 - `PATCH /api/rules/:ruleId`：保存规则新版本。
 - `POST /api/rules/:ruleId/approve|reject|rollback`：审核、驳回与回滚。

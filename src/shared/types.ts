@@ -1,4 +1,5 @@
 export type RiskLevel = 'safe' | 'warning' | 'blocked';
+export type CaptureState = 'idle' | 'live' | 'paused' | 'ended';
 
 export type LiveRoom = {
   id: string;
@@ -42,6 +43,9 @@ export type TranscriptSegment = {
 export type TimelineEventType =
   | 'session.created'
   | 'capture.started'
+  | 'capture.resumed'
+  | 'capture.paused'
+  | 'capture.ended'
   | 'capture.stopped'
   | 'capture.failed'
   | 'lineup.updated'
@@ -116,6 +120,7 @@ export type SessionState = {
   product: Product;
   lineup: Product[];
   isListening: boolean;
+  captureState: CaptureState;
   partialTranscript: string;
   transcriptHistory: TranscriptSegment[];
   latestCompliance: ComplianceResult | null;
@@ -129,10 +134,13 @@ export type SessionState = {
 export type ClientMessage =
   | { type: 'session.join'; sessionId?: string; roomId?: string; actorId?: string; token?: string; role: 'operator' | 'display' }
   | { type: 'control.start' }
+  | { type: 'control.pause' }
+  | { type: 'control.resume' }
+  | { type: 'control.end' }
   | { type: 'control.stop' }
   | { type: 'product.select'; productId: string }
   | { type: 'lineup.set'; productIds: string[] }
-  | { type: 'transcript.correct'; segmentId: string; text: string }
+  | { type: 'transcript.correct'; segmentId: string; text: string; learn?: boolean; wrongText?: string; correctText?: string }
   | { type: 'audio'; data: string }
   | { type: 'audio.raw'; data: string; sampleRate: number }
   | { type: 'demo.transcript'; text: string };
@@ -196,4 +204,18 @@ export type TranscriptCorrection = {
   correctedText: string;
   actorId: string;
   occurredAt: number;
+};
+
+export type SpeechCorrectionEntry = {
+  id: string;
+  roomId: string;
+  wrongText: string;
+  correctText: string;
+  enabled: boolean;
+  confirmations: number;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+  lastSessionId: string;
+  lastSegmentId: string;
 };
