@@ -40,7 +40,7 @@ npm start
 
 ## 火山引擎参数
 
-流式语音识别连接使用双向流式优化版 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`，默认资源 ID 为 `volc.bigasr.sauc.duration`。服务端使用新版 `X-Api-Key` 鉴权，并实现官方协议中的 full client request、无序号 audio-only request、gzip 压缩、`request.corpus` 热词/替换词/上下文和最终帧标记；如果账号开通的是其他资源 ID，只需修改 `X_API_RESOURCE_ID`。
+流式语音识别连接使用双向流式优化版 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`，默认资源 ID 为 `volc.bigasr.sauc.duration`。服务端使用新版 `X-Api-Key` 鉴权，并实现官方协议中的 full client request、无序号 audio-only request、gzip 压缩、`request.corpus` 热词/替换词/上下文和最终帧标记；如果账号开通的是其他资源 ID，只需修改 `X_API_RESOURCE_ID`。火山引擎服务端约 8 秒未收到下一音频包会返回 `45000081`，主播停顿时服务端会在 2 秒空闲后发送 100 ms 静音 audio-only 保活帧；该帧仅发给 ASR，不会保存到任何录音或时间线资产。
 
 ## 时间线与原始音频
 

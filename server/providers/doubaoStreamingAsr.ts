@@ -49,6 +49,9 @@ type SpeechSocketFactory = (endpoint: string, headers: Record<string, string>) =
 
 const DEFAULT_ENDPOINT = 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async';
 const MAX_PENDING_AUDIO_BYTES = 160_000;
+const KEEP_ALIVE_CHECK_INTERVAL_MS = 1_000;
+const KEEP_ALIVE_IDLE_MS = 2_000;
+const KEEP_ALIVE_AUDIO = Buffer.alloc(3_200);
 
 function optional(value: string | undefined): string | undefined {
   const normalized = value?.trim();
@@ -180,6 +183,8 @@ export class DoubaoStreamingAsr {
   private socket: SpeechSocket | null = null;
   private manuallyClosed = false;
   private finishRequested = false;
+  private keepAliveTimer: NodeJS.Timeout | null = null;
+  private lastAudioPacketAt = 0;
   private pendingAudio: Buffer[] = [];
   private pendingAudioBytes = 0;
   private logId: string | undefined;
@@ -205,10 +210,14 @@ export class DoubaoStreamingAsr {
     });
     this.socket.on('open', () => {
       this.socket?.send(buildFullClientRequest(this.config));
-      for (const audio of this.pendingAudio) this.socket?.send(buildAudioFrame(audio));
+      for (const audio of this.pendingAudio) {
+        this.socket?.send(buildAudioFrame(audio));
+        this.lastAudioPacketAt = Date.now();
+      }
       this.pendingAudio = [];
       this.pendingAudioBytes = 0;
       if (this.finishRequested) this.socket?.send(buildAudioFrame(Buffer.alloc(0), true));
+      else this.startKeepAlive();
       this.options.onReady?.(this.logId);
     });
     this.socket.on('upgrade', (response) => {
@@ -230,6 +239,7 @@ export class DoubaoStreamingAsr {
     });
     this.socket.on('error', (error) => this.reportError(error));
     this.socket.on('close', () => {
+      this.stopKeepAlive();
       if (!this.manuallyClosed && !this.finishRequested) this.reportError(new Error('豆包大模型流式语音识别连接已断开'));
       this.options.onClosed?.();
     });
@@ -246,9 +256,31 @@ export class DoubaoStreamingAsr {
     this.options.onError(new Error(`${error.message}${suffix}`));
   }
 
+  private startKeepAlive(): void {
+    this.stopKeepAlive();
+    this.lastAudioPacketAt = Date.now();
+    this.keepAliveTimer = setInterval(() => {
+      if (this.finishRequested || this.socket?.readyState !== WebSocket.OPEN) return;
+      const now = Date.now();
+      if (now - this.lastAudioPacketAt < KEEP_ALIVE_IDLE_MS) return;
+      // The provider's 8-second idle timeout is reset by any ordinary audio frame.
+      // Keepalive audio is sent only to ASR and is never persisted as source audio.
+      this.socket.send(buildAudioFrame(KEEP_ALIVE_AUDIO));
+      this.lastAudioPacketAt = now;
+    }, KEEP_ALIVE_CHECK_INTERVAL_MS);
+    this.keepAliveTimer.unref?.();
+  }
+
+  private stopKeepAlive(): void {
+    if (!this.keepAliveTimer) return;
+    clearInterval(this.keepAliveTimer);
+    this.keepAliveTimer = null;
+  }
+
   sendAudio(audio: Buffer): void {
     if (this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(buildAudioFrame(audio));
+      this.lastAudioPacketAt = Date.now();
       return;
     }
     if (this.socket?.readyState !== WebSocket.CONNECTING) return;
@@ -263,6 +295,7 @@ export class DoubaoStreamingAsr {
 
   finish(): void {
     this.finishRequested = true;
+    this.stopKeepAlive();
     if (this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(buildAudioFrame(Buffer.alloc(0), true));
     }
@@ -271,6 +304,7 @@ export class DoubaoStreamingAsr {
   close(): void {
     this.manuallyClosed = true;
     this.finishRequested = true;
+    this.stopKeepAlive();
     this.socket?.close();
     this.socket = null;
     this.pendingAudio = [];

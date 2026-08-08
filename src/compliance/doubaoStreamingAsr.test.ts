@@ -127,6 +127,46 @@ describe('Doubao streaming ASR frames', () => {
     expect(onClosed).toHaveBeenCalledOnce();
   });
 
+  it('keeps an idle stream alive with audio-only silence frames', () => {
+    vi.useFakeTimers();
+    try {
+      const listeners = new Map<string, (...args: unknown[]) => void>();
+      const sent: Buffer[] = [];
+      const socket = {
+        readyState: WebSocket.CONNECTING as number,
+        on(event: string, listener: (...args: unknown[]) => void) { listeners.set(event, listener); return this; },
+        send(data: Buffer) { sent.push(data); },
+        close() { this.readyState = WebSocket.CLOSED; },
+      };
+      const onError = vi.fn();
+      const stream = new DoubaoStreamingAsr(
+        { apiKey: 'api-key', resourceId: 'resource', endpoint: 'wss://speech.example', endWindowMs: 800 },
+        { onResult: vi.fn(), onError },
+        () => socket as never,
+      );
+
+      stream.connect();
+      socket.readyState = WebSocket.OPEN;
+      listeners.get('open')?.();
+      expect(sent).toHaveLength(1);
+
+      vi.advanceTimersByTime(9_000);
+
+      const keepAliveFrames = sent.slice(1);
+      expect(keepAliveFrames.length).toBeGreaterThanOrEqual(3);
+      expect(keepAliveFrames.every((frame) => frame[1] === 0x20)).toBe(true);
+      expect(keepAliveFrames.every((frame) => gunzipSync(frame.subarray(8)).equals(Buffer.alloc(3200)))).toBe(true);
+      expect(onError).not.toHaveBeenCalled();
+
+      stream.close();
+      const sentBeforeCleanup = sent.length;
+      vi.advanceTimersByTime(3_000);
+      expect(sent).toHaveLength(sentBeforeCleanup);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('loads only the official X-Api-Key configuration', () => {
     expect(getStreamingAsrConfig({ X_API_KEY: ' key ', X_API_RESOURCE_ID: 'resource', SPEECH_ENDPOINT: 'wss://example', END_WINDOW_SIZE: '600' })).toMatchObject({
       apiKey: 'key', resourceId: 'resource', endpoint: 'wss://example', endWindowMs: 600,
