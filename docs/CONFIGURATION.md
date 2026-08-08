@@ -255,3 +255,40 @@ curl http://localhost:8787/api/health
 ```
 
 `/api/readiness` 会分别显示实时语音、豆包、认证、TOS、方舟知识库、数据库和 Redis 的配置状态；状态为“已配置”只表示环境变量完整，真实可用性仍需通过一次对应业务请求验证。
+
+## 6. 版本发布与本地备份
+
+每次功能更新完成后，在项目根目录运行一次发布命令。命令参数使用 SemVer：
+
+```bash
+# 修复/小改动：0.1.0 -> 0.1.1
+npm run release -- patch
+
+# 新功能：0.1.1 -> 0.2.0
+npm run release -- minor
+
+# 直接指定版本
+npm run release -- 1.0.0
+```
+
+命令会依次执行：
+
+1. 运行 `npm test` 和 `npm run build`，失败时不会改版本；
+2. 同步更新 `package.json` 与 `package-lock.json`；
+3. 创建 `release: vX.Y.Z` Git 提交和 `vX.Y.Z` 标签；
+4. 在 `.git/backups/dypro-vX.Y.Z.bundle` 生成可迁移的本地 Git bundle；
+5. 推送当前分支和标签到 GitHub。
+
+网络不可用时，第 4 步仍会先完成，随后命令提示推送失败并保留本地提交、标签和 bundle。恢复网络后执行提示中的命令即可同步：
+
+```bash
+git push origin codex/local-first-foundation --follow-tags
+```
+
+如需只做本地版本发布、不连接 GitHub：
+
+```bash
+npm run release -- patch --no-push
+```
+
+不要手工修改版本号后跳过发布命令，否则容易缺少标签和本地备份。`.git/backups` 在 Git 元数据目录内，不会进入业务代码提交；建议定期把 bundle 复制到独立备份磁盘。

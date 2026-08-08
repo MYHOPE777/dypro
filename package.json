@@ -1,6 +1,6 @@
 {
   "name": "douyin-live-compliance-copilot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,6 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "start": "tsx server/index.ts",
     "auth:hash": "tsx server/hashPassword.ts",
+    "release": "node scripts/release.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },
