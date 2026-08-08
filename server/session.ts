@@ -36,6 +36,13 @@ type LiveSessionOptions = {
 
 const AUDIO_CHUNK_BYTES = 256 * 1024;
 
+function speechFailureMessage(error: Error): string {
+  if (/45000292|quota exceeded for types:\s*concurrency/iu.test(error.message)) {
+    return '语音识别并发额度已满，本场已暂停。请关闭其他正在收音的会话；若控制台并发额度为 0，请开通额度或切换到已开通的小时版资源。';
+  }
+  return `豆包大模型流式语音识别连接异常，本场已暂停：${error.message}`;
+}
+
 function createStats(): SessionStats {
   return { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 };
 }
@@ -315,7 +322,7 @@ export class LiveSession {
     this.stateValue.lastEventAt = occurredAt;
     this.recordTimeline('capture.failed', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, { message: error.message });
     this.broadcast({ type: 'state.snapshot', state: this.state });
-    this.status(`豆包大模型流式语音识别连接异常，本场已暂停：${error.message}`, 'error');
+    this.status(speechFailureMessage(error), 'error');
   }
 
   private releaseDrainingSpeechStream(stream: DoubaoStreamingAsr | null, close: boolean): void {

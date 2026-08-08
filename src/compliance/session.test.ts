@@ -12,6 +12,10 @@ function fakeSocket() {
   return { readyState: 1, send: () => undefined } as unknown as WebSocket;
 }
 
+function recordingSocket(messages: string[]) {
+  return { readyState: 1, send: (message: string) => messages.push(message) } as unknown as WebSocket;
+}
+
 describe('LiveSession', () => {
   it('uses an unguessable id for a new display session', () => {
     expect(new LiveSession().id).toMatch(/^live-[a-f0-9]{24}$/u);
@@ -86,6 +90,26 @@ describe('LiveSession', () => {
     streamOptions[0]?.onError(new Error('旧连接延迟报错'));
 
     expect(session.state).toMatchObject({ isListening: true, captureState: 'live' });
+  });
+
+  it('turns a provider concurrency error into an actionable operator message', () => {
+    const streamOptions: StreamingAsrOptions[] = [];
+    const streamingAsrFactory = (options: StreamingAsrOptions) => {
+      streamOptions.push(options);
+      return { connect: () => undefined, finish: () => undefined, close: () => undefined, sendAudio: () => undefined } as unknown as DoubaoStreamingAsr;
+    };
+    const messages: string[] = [];
+    const session = new LiveSession('asr-concurrency-session', { streamingAsrFactory });
+    session.addClient(recordingSocket(messages), 'operator');
+
+    session.startListening();
+    streamOptions[0]?.onError(new Error('豆包大模型流式语音识别错误 45000292: {"error":"quota exceeded for types: concurrency"}（Logid test-logid）'));
+
+    const status = messages.map((message) => JSON.parse(message) as { type: string; message?: string }).filter((message) => message.type === 'system.status').at(-1);
+    expect(session.state).toMatchObject({ isListening: false, captureState: 'paused' });
+    expect(status?.message).toContain('并发额度已满');
+    expect(status?.message).not.toContain('45000292');
+    expect(status?.message).not.toContain('Logid');
   });
 
   it('starts semantic checks concurrently and keeps the newest result current', async () => {

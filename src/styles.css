@@ -58,3 +58,24 @@ button { cursor: pointer; }
 .analysis-latency { color: #b7dc89; font-family: 'DM Mono', monospace; font-size: 9px; }
 .display-meta { display: grid; justify-items: end; gap: 7px; margin-left: auto; }
 .display-latency { color: rgb(255 255 255 / 76%); font-family: 'DM Mono', monospace; font-size: 10px; white-space: nowrap; }
+
+.transcript-feed { gap: 8px; padding-right: 2px; }
+.feed-line { grid-template-columns: 92px minmax(0, 1fr) 28px; align-items: center; gap: 14px; min-height: 54px; padding: 9px 11px; border: 1px solid transparent; border-radius: 6px; background: #131816; color: #96a29a; }
+.feed-line.current { border-color: #35463b; background: #18211c; box-shadow: inset 3px 0 #a9dc73; color: #e1e8e0; }
+.feed-line time { gap: 4px; padding-top: 0; }
+.feed-line time span { color: #85928a; font-size: 9px; }
+.feed-line time em { width: max-content; padding: 2px 5px; border-radius: 3px; background: #222a25; color: #9aae91; font-size: 8px; }
+.feed-line > span { min-width: 0; overflow-wrap: anywhere; line-height: 1.55; }
+.feed-line.current > span { font-weight: 600; }
+.feed-line .transcript-edit-button { margin-left: 0; }
+
+.demo-bar { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px 12px; }
+.demo-actions { min-width: 0; flex-wrap: wrap; }
+.demo-chip { min-width: 0; flex: 1 1 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.demo-form { grid-column: 1 / -1; min-width: 0; }
+
+@media (max-width: 650px) {
+  .feed-line { grid-template-columns: 76px minmax(0, 1fr) 28px; gap: 9px; padding: 9px; }
+  .demo-bar { grid-template-columns: 1fr; }
+  .demo-actions, .demo-form { grid-column: 1; }
+}

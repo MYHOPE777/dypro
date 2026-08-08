@@ -369,6 +369,10 @@ function formatReplayOffset(offsetMs: number | null): string {
   return `+${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${milliseconds.toString().padStart(3, '0')}`;
 }
 
+function formatTranscriptOffset(offsetMs: number | null): string {
+  return offsetMs === null ? '演示话术' : formatReplayOffset(offsetMs);
+}
+
 function AppHeader({ state, connected, status, mode }: { state: SessionState; connected: boolean; status: string; mode: Role }) {
   const [lanOrigin, setLanOrigin] = useState(window.location.origin);
   useEffect(() => {
@@ -401,7 +405,6 @@ function ProductRail({ state, send, onOpenLibrary }: { state: SessionState; send
         </button>)}
       </div>
       <button type="button" className="library-button" onClick={onOpenLibrary}><ClipboardPaste size={14} />管理商品库与本场清单</button>
-      <div className="product-now"><img src={state.product.image} alt="" /><div><span>ON AIR PRODUCT</span><strong>{state.product.name}</strong><small>{state.product.category} · {state.product.price}</small></div></div>
     </section>
   );
 }
@@ -780,7 +783,7 @@ function TranscriptStage({ state, send }: { state: SessionState; send: (message:
   return <section className="stage-section transcript-stage">
     <div className="section-heading"><div><span className="section-kicker">流式语音识别 <span>DOUBAO ASR</span></span><h1>{state.partialTranscript || (latestIsCurrent ? lastFinal?.text : null) || '等待主播开口'}</h1></div><div className="asr-badge"><span className="signal-dot on" />{state.isListening ? 'STREAMING' : 'STANDBY'}</div></div>
     <Waveform active={state.isListening} />
-    <div className="transcript-feed">{state.transcriptHistory.slice(-4).map((segment, index) => <div className={`feed-line ${index === state.transcriptHistory.slice(-4).length - 1 ? 'current' : ''}`} key={segment.id}><time><span>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span><em>{formatReplayOffset(segment.offsetMs)}</em></time>{editingId === segment.id ? <form className="transcript-edit" onSubmit={(event) => { event.preventDefault(); if (draft.trim()) { send({ type: 'transcript.correct', segmentId: segment.id, text: draft.trim(), learn: true }); setEditingId(null); } }}><input value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><button type="submit" title="保存并学习纠错"><Save size={13} /></button><button type="button" title="取消纠错" onClick={() => setEditingId(null)}>×</button></form> : <><span>{segment.text}</span>{segment.isFinal && <button type="button" className="transcript-edit-button" title="纠正这句转录" onClick={() => { setEditingId(segment.id); setDraft(segment.text); }}><Pencil size={12} /></button>}</>}</div>)}</div>
+    <div className="transcript-feed">{state.transcriptHistory.slice(-4).map((segment, index) => <div className={`feed-line ${index === state.transcriptHistory.slice(-4).length - 1 ? 'current' : ''}`} key={segment.id}><time><span>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span><em>{formatTranscriptOffset(segment.offsetMs)}</em></time>{editingId === segment.id ? <form className="transcript-edit" onSubmit={(event) => { event.preventDefault(); if (draft.trim()) { send({ type: 'transcript.correct', segmentId: segment.id, text: draft.trim(), learn: true }); setEditingId(null); } }}><input value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><button type="submit" title="保存并学习纠错"><Save size={13} /></button><button type="button" title="取消纠错" onClick={() => setEditingId(null)}>×</button></form> : <><span>{segment.text}</span>{segment.isFinal && <button type="button" className="transcript-edit-button" title="纠正这句转录" onClick={() => { setEditingId(segment.id); setDraft(segment.text); }}><Pencil size={12} /></button>}</>}</div>)}</div>
   </section>;
 }
 
@@ -826,28 +829,14 @@ function CompliancePanel({ result, pending = false, pendingSince = null }: { res
   </section>;
 }
 
-function DemoInput({ send }: { send: (message: object) => void }) {
+function DemoInput({ state, send }: { state: SessionState; send: (message: object) => void }) {
   const [text, setText] = useState('');
-  const examples = [
-    { label: '安全表达', text: '这款精华质地清爽，适合日常护肤，肤感因人而异。', tone: 'safe' },
-    { label: '极限词', text: '今天是全网最低价，错过这一次就没有了！', tone: 'warning' },
-    { label: '绝对承诺', text: '这款精华用了三天保证你脸上的斑全部消失！', tone: 'blocked' },
-  ];
-  return <section className="demo-bar"><div className="demo-label"><Radio size={15} />演示输入 <span>无密钥也可体验</span></div><div className="demo-actions">{examples.map((example) => <button type="button" className={`demo-chip ${example.tone}`} key={example.label} onClick={() => send({ type: 'demo.transcript', text: example.text })}>{example.label}</button>)}</div><form onSubmit={(event) => { event.preventDefault(); if (text.trim()) { send({ type: 'demo.transcript', text: text.trim() }); setText(''); } }} className="demo-form"><input value={text} onChange={(event) => setText(event.target.value)} placeholder="输入一句主播话术模拟分析" /><button type="submit" title="发送模拟话术"><ArrowUpRight size={16} /></button></form></section>;
+  const examples = state.product.compliantPhrases.slice(0, 3);
+  return <section className="demo-bar"><div className="demo-label"><ClipboardPaste size={15} />预设话术 <span>{state.product.name}</span></div><div className="demo-actions">{examples.map((example) => <button type="button" className="demo-chip" key={example} title="填入输入框" onClick={() => setText(example)}>{example}</button>)}</div><form onSubmit={(event) => { event.preventDefault(); if (text.trim()) { send({ type: 'demo.transcript', text: text.trim() }); setText(''); } }} className="demo-form"><input value={text} onChange={(event) => setText(event.target.value)} placeholder="输入或选择一句预设话术" /><button type="submit" title="发送模拟话术"><ArrowUpRight size={16} /></button></form></section>;
 }
 
 function SessionStats({ state }: { state: SessionState }) {
   return <div className="session-stats"><div><span>已播时长</span><strong>{Math.floor(state.stats.speakingSeconds / 60).toString().padStart(2, '0')}:{(state.stats.speakingSeconds % 60).toString().padStart(2, '0')}</strong></div><div><span>识别字数</span><strong>{state.stats.words}</strong></div><div><span>高风险</span><strong className="danger-text">{state.stats.blockedCount}</strong></div><div><span>需留意</span><strong className="warning-text">{state.stats.warningCount}</strong></div></div>;
-}
-
-function ReadinessStrip({ readiness }: { readiness: Readiness | null }) {
-  if (!readiness) return null;
-  const items = [readiness.streamingAsr, readiness.arkResponses, readiness.auth, readiness.database, readiness.objectStorage, readiness.redis, readiness.knowledge];
-  const headline = readiness.readyForProduction ? '生产依赖已就绪' : readiness.readyForLive ? '实时链路已就绪，本地持久化' : '当前为演示模式';
-  return <section className={`readiness-strip ${readiness.readyForLive ? 'ready' : 'attention'}`} aria-label="开播检查">
-    <div className="readiness-title"><Activity size={14} /><span>开播检查</span><strong>{headline}</strong><small>{readiness.mode === 'production' ? 'Production' : readiness.mode === 'live-with-local-persistence' ? 'Live + local fallback' : 'Demo'}</small></div>
-    <div className="readiness-items">{items.map((item) => <span className={item.configured && ('available' in item ? item.available : true) ? 'ok' : 'pending'} key={item.label} title={item.label}><i />{item.label}</span>)}</div>
-  </section>;
 }
 
 function LoginScreen({ readiness, message, onLogin }: { readiness: Readiness | null; message: string; onLogin: (actorId: string, password: string) => Promise<void> }) {
@@ -858,7 +847,7 @@ function LoginScreen({ readiness, message, onLogin }: { readiness: Readiness | n
   return <div className="access-shell"><div className="access-brand"><span className="brand-mark"><ShieldCheck size={19} /></span><strong>dypro</strong></div><section className="access-panel"><div className="access-icon"><LockKeyhole size={23} /></div><span className="section-kicker">控制台身份 <span>DYPRO ACCESS</span></span><h1>{localOnlyBlocked ? '当前设备仅可查看主播屏' : '登录直播控制台'}</h1>{localOnlyBlocked ? <p>多人账号尚未配置，控制操作仅允许在 MacBook 本机完成。</p> : <form onSubmit={(event) => { event.preventDefault(); setBusy(true); void onLogin(actorId.trim(), password).finally(() => setBusy(false)); }}><label>账号<input value={actorId} onChange={(event) => setActorId(event.target.value)} autoComplete="username" /></label><label>密码<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" /></label><button type="submit" disabled={busy || !actorId.trim() || !password}><LockKeyhole size={15} />{busy ? '正在登录' : '登录'}</button></form>}{message && <div className="access-message">{message}</div>}</section></div>;
 }
 
-function OperatorScreen({ access, readiness, onLogout }: { access: OperatorAccess; readiness: Readiness | null; onLogout: () => void }) {
+function OperatorScreen({ access, onLogout }: { access: OperatorAccess; onLogout: () => void }) {
   const session = useLiveSession('operator', access);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
@@ -866,14 +855,14 @@ function OperatorScreen({ access, readiness, onLogout }: { access: OperatorAcces
   const latestSegment = session.state.transcriptHistory.at(-1);
   const latestSegmentIsCurrent = Boolean(latestSegment && latestSegment.timestamp >= session.state.productContextStartedAt);
   const compliancePending = Boolean(session.state.partialTranscript || (latestSegmentIsCurrent && !currentCompliance));
-  return <div className="app-shell operator-shell"><AppHeader state={session.state} connected={session.connected} status={session.status} mode="operator" /><main className="operator-grid"><aside className="left-rail"><ProductRail state={session.state} send={session.send} onOpenLibrary={() => setWorkspaceOpen(true)} /><MicPanel state={session.state} connected={session.connected} captureDeniedVersion={session.captureDeniedVersion} send={session.send} onOpenReview={() => setReviewOpen(true)} /><div className="rail-footer"><Wifi size={14} />局域网地址可供 iPad 访问</div></aside><section className="main-stage"><div className="stage-context"><div><span className="eyebrow">TODAY'S LIVE · 01</span><h2>{session.state.product.name}</h2></div><div className="context-actions"><span className="ai-tag"><ShieldCheck size={14} />豆包合规引擎</span><span className="context-dot" />豆包大模型流式语音识别</div></div><ReadinessStrip readiness={readiness} /><TranscriptStage state={session.state} send={session.send} /><DemoInput send={session.send} /></section><aside className="coach-rail"><PromptPanel state={session.state} /><CompliancePanel result={currentCompliance} pending={compliancePending} pendingSince={session.analysisStartedAt} /><section className="alert-history"><div className="section-kicker">近期提醒 <span>ALERT LOG</span></div>{session.state.alerts.length ? session.state.alerts.slice(0, 4).map((alert) => <div className="alert-row" key={alert.id}><div className={`alert-icon ${alert.risk}`}><RiskIcon risk={alert.risk} /></div><div><strong>{alert.title}</strong><small>{new Date(alert.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {alert.alternative.replace(/^可以改为：/u, '')}</small></div></div>) : <div className="empty-alert"><Check size={16} />暂无风险提醒</div>}</section></aside></main><footer className="operator-footer"><SessionStats state={session.state} /><div className="footer-note"><Activity size={15} />风险判断以豆包大模型为主，未配置密钥时使用本地规则即时兜底</div></footer>{workspaceOpen && <WorkspaceModal state={session.state} access={access} send={session.send} onClose={() => setWorkspaceOpen(false)} onLogout={onLogout} />}{reviewOpen && <SessionReviewModal state={session.state} access={access} onClose={() => setReviewOpen(false)} />}</div>;
+  return <div className="app-shell operator-shell"><AppHeader state={session.state} connected={session.connected} status={session.status} mode="operator" /><main className="operator-grid"><aside className="left-rail"><ProductRail state={session.state} send={session.send} onOpenLibrary={() => setWorkspaceOpen(true)} /><MicPanel state={session.state} connected={session.connected} captureDeniedVersion={session.captureDeniedVersion} send={session.send} onOpenReview={() => setReviewOpen(true)} /><div className="rail-footer"><Wifi size={14} />局域网地址可供 iPad 访问</div></aside><section className="main-stage"><div className="stage-context"><div><span className="eyebrow">TODAY'S LIVE · 01</span><h2>{session.state.product.name}</h2></div><div className="context-actions"><span className="ai-tag"><ShieldCheck size={14} />豆包合规引擎</span><span className="context-dot" />豆包大模型流式语音识别</div></div><TranscriptStage state={session.state} send={session.send} /><DemoInput state={session.state} send={session.send} /></section><aside className="coach-rail"><PromptPanel state={session.state} /><CompliancePanel result={currentCompliance} pending={compliancePending} pendingSince={session.analysisStartedAt} /><section className="alert-history"><div className="section-kicker">近期提醒 <span>ALERT LOG</span></div>{session.state.alerts.length ? session.state.alerts.slice(0, 4).map((alert) => <div className="alert-row" key={alert.id}><div className={`alert-icon ${alert.risk}`}><RiskIcon risk={alert.risk} /></div><div><strong>{alert.title}</strong><small>{new Date(alert.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {alert.alternative.replace(/^可以改为：/u, '')}</small></div></div>) : <div className="empty-alert"><Check size={16} />暂无风险提醒</div>}</section></aside></main><footer className="operator-footer"><SessionStats state={session.state} /><div className="footer-note"><Activity size={15} />风险判断以豆包大模型为主，未配置密钥时使用本地规则即时兜底</div></footer>{workspaceOpen && <WorkspaceModal state={session.state} access={access} send={session.send} onClose={() => setWorkspaceOpen(false)} onLogout={onLogout} />}{reviewOpen && <SessionReviewModal state={session.state} access={access} onClose={() => setReviewOpen(false)} />}</div>;
 }
 
 function OperatorEntry() {
   const auth = useOperatorAccess();
   if (auth.loading) return <div className="access-shell"><div className="access-loading">正在验证控制台身份</div></div>;
   if (!auth.access) return <LoginScreen readiness={auth.readiness} message={auth.message} onLogin={auth.login} />;
-  return <OperatorScreen access={auth.access} readiness={auth.readiness} onLogout={auth.logout} />;
+  return <OperatorScreen access={auth.access} onLogout={auth.logout} />;
 }
 
 function DisplayScreen() {
