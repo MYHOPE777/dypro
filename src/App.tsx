@@ -31,6 +31,7 @@ import {
 } from 'lucide-react';
 import { DEFAULT_PRODUCT } from './shared/products';
 import { complianceForLatestSegment } from './compliance/currentCompliance';
+import { canSelectInputDevice, switchInputDevice } from './microphoneDevice';
 import type { ComplianceResult, ComplianceRule, LiveRoom, Product, ProductImportResponse, RuleAuditEntry, ServerMessage, SessionState, SessionTimelineExport, SpeechCorrectionEntry, TimelineEvent, TranscriptSegment } from './shared/types';
 
 type Role = 'operator' | 'display';
@@ -223,6 +224,7 @@ function useMicrophone(send: (message: object) => void, streamingEnabled: boolea
   const contextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const requestVersionRef = useRef(0);
+  const deviceIdRef = useRef('');
   const streamingRef = useRef(streamingEnabled);
   const lastLevelUpdateRef = useRef(0);
 
@@ -233,8 +235,12 @@ function useMicrophone(send: (message: object) => void, streamingEnabled: boolea
     const list = await navigator.mediaDevices.enumerateDevices();
     const inputs = list.filter((device) => device.kind === 'audioinput');
     setDevices(inputs);
-    if (!deviceId && inputs[0]) setDeviceId(inputs[0].deviceId);
-  }, [deviceId]);
+    const selectedStillExists = deviceIdRef.current && inputs.some((input) => input.deviceId === deviceIdRef.current);
+    if ((!deviceIdRef.current || !selectedStillExists) && inputs[0]) {
+      deviceIdRef.current = inputs[0].deviceId;
+      setDeviceId(inputs[0].deviceId);
+    }
+  }, []);
 
   useEffect(() => {
     void refresh();
@@ -256,14 +262,14 @@ function useMicrophone(send: (message: object) => void, streamingEnabled: boolea
 
   useEffect(() => stop, [stop]);
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (requestedDeviceId = deviceIdRef.current) => {
     if (streamRef.current) return true;
     const requestVersion = requestVersionRef.current + 1;
     requestVersionRef.current = requestVersion;
     try {
       setError('');
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { deviceId: deviceId ? { exact: deviceId } : undefined, channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        audio: { deviceId: requestedDeviceId ? { exact: requestedDeviceId } : undefined, channelCount: 1, echoCancellation: true, noiseSuppression: true },
       });
       if (requestVersionRef.current !== requestVersion) {
         stream.getTracks().forEach((track) => track.stop());
@@ -317,9 +323,16 @@ function useMicrophone(send: (message: object) => void, streamingEnabled: boolea
       setError(cause instanceof Error ? cause.message : '无法访问麦克风');
       return false;
     }
-  }, [deviceId, refresh, send]);
+  }, [refresh, send]);
 
-  return { devices, deviceId, setDeviceId, start, stop, capturing, level, error, refresh };
+  const selectDevice = useCallback(async (nextDeviceId: string) => {
+    if (deviceIdRef.current === nextDeviceId) return true;
+    deviceIdRef.current = nextDeviceId;
+    setDeviceId(nextDeviceId);
+    return switchInputDevice(nextDeviceId, { capturing: Boolean(streamRef.current), stop, start });
+  }, [start, stop]);
+
+  return { devices, deviceId, selectDevice, start, stop, capturing, level, error, refresh };
 }
 
 function RiskIcon({ risk }: { risk: ComplianceResult['risk'] }) {
@@ -551,6 +564,7 @@ function MicPanel({ state, connected, captureDeniedVersion, send, onOpenReview }
   const microphone = useMicrophone(send, state.captureState === 'live' && state.isListening);
   const [showDevices, setShowDevices] = useState(false);
   const selected = microphone.devices.find((device) => device.deviceId === microphone.deviceId);
+  const canSelectDevice = canSelectInputDevice(state.captureState, connected);
   useEffect(() => { if (captureDeniedVersion > 0) microphone.stop(); }, [captureDeniedVersion, microphone.stop]);
   useEffect(() => { if (!connected) microphone.stop(); }, [connected, microphone.stop]);
   useEffect(() => { if (state.captureState === 'ended') microphone.stop(); }, [microphone.stop, state.captureState]);
@@ -570,8 +584,8 @@ function MicPanel({ state, connected, captureDeniedVersion, send, onOpenReview }
   return <section className="rail-section mic-section">
     <div className="section-kicker">直播收音 <span>{state.captureState.toUpperCase()}</span></div>
     <div className="mic-device-row"><div className={`mic-orb ${microphone.capturing ? 'active' : ''}`}><Mic size={21} /></div><div className="mic-device-name"><strong>{deviceTitle}</strong><small>{selected?.label || '尚未取得麦克风设备名称'}</small></div></div>
-    <button type="button" className="device-toggle" disabled={microphone.capturing || state.captureState !== 'idle' || !connected} onClick={() => { setShowDevices((value) => !value); void microphone.refresh(); }}><Headphones size={15} />选择输入设备 <ChevronRight size={14} className={showDevices ? 'rotate' : ''} /></button>
-    {showDevices && <div className="device-select-wrap"><select value={microphone.deviceId} onChange={(event) => microphone.setDeviceId(event.target.value)} aria-label="选择麦克风" disabled={microphone.capturing}><option value="">系统默认输入</option>{microphone.devices.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label || `麦克风 ${device.deviceId.slice(0, 5)}`}</option>)}</select></div>}
+    <button type="button" className="device-toggle" disabled={!canSelectDevice} onClick={() => { setShowDevices((value) => !value); void microphone.refresh(); }}><Headphones size={15} />选择输入设备 <ChevronRight size={14} className={showDevices ? 'rotate' : ''} /></button>
+    {showDevices && <div className="device-select-wrap"><select value={microphone.deviceId} onChange={(event) => { void microphone.selectDevice(event.target.value); }} aria-label="选择麦克风" disabled={!canSelectDevice}><option value="">系统默认输入</option>{microphone.devices.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label || `麦克风 ${device.deviceId.slice(0, 5)}`}</option>)}</select></div>}
     {microphone.error && <div className="inline-error"><AlertTriangle size={14} />{microphone.error}</div>}
     {microphone.capturing && <div className="mic-meter"><div className="mic-meter-track"><i style={{ width: `${Math.max(2, microphone.level)}%` }} /></div><span>{levelLabel}</span></div>}
     {state.captureState === 'idle' && <div className="mic-control-stack"><button type="button" className="test-control" onClick={() => microphone.capturing ? microphone.stop() : void microphone.start()} disabled={!connected}><Activity size={15} />{microphone.capturing ? '结束设备测试' : '检测并测试麦克风'}</button><button type="button" className="main-control start" onClick={() => void startLive()} disabled={!connected}><Radio size={16} />开始直播收音</button></div>}
