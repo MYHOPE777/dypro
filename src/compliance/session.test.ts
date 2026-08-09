@@ -295,6 +295,40 @@ describe('LiveSession', () => {
     }
   });
 
+  it('replays audio captured while waiting for ASR recovery', () => {
+    vi.useFakeTimers();
+    try {
+      const streamOptions: StreamingAsrOptions[] = [];
+      const streams: Array<{ connect: ReturnType<typeof vi.fn>; sendAudio: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }> = [];
+      const streamingAsrFactory = (options: StreamingAsrOptions) => {
+        streamOptions.push(options);
+        const stream = { connect: vi.fn(), sendAudio: vi.fn(), close: vi.fn(), finish: vi.fn() };
+        streams.push(stream);
+        return stream as unknown as DoubaoStreamingAsr;
+      };
+      const session = new LiveSession('asr-recovery-audio-session', { streamingAsrFactory });
+
+      session.startListening();
+      streamOptions[0]?.onReady?.();
+      streamOptions[0]?.onError(new Error('豆包大模型流式语音识别错误 45000081: Timeout waiting next packet'));
+      const audio = Buffer.from([1, 2, 3, 4]);
+      session.ingestAudio(audio);
+      vi.advanceTimersByTime(250);
+      expect(streams[1]?.sendAudio).toHaveBeenCalledWith(audio);
+
+      const audioWhileConnecting = Buffer.from([5, 6]);
+      session.ingestAudio(audioWhileConnecting);
+      streamOptions[1]?.onError(new Error('豆包大模型流式语音识别错误 45000081: Timeout waiting next packet'));
+      vi.advanceTimersByTime(500);
+
+      expect(streams[2]?.sendAudio).toHaveBeenNthCalledWith(1, audio);
+      expect(streams[2]?.sendAudio).toHaveBeenNthCalledWith(2, audioWhileConnecting);
+      streamOptions[2]?.onReady?.();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('pauses only after bounded next-packet timeout recovery attempts are exhausted', () => {
     vi.useFakeTimers();
     try {

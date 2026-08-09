@@ -44,6 +44,7 @@ type LiveSessionOptions = {
 };
 
 const AUDIO_CHUNK_BYTES = 256 * 1024;
+const RECOVERY_AUDIO_MAX_BYTES = 160_000;
 const SPEECH_RECOVERY_DELAYS_MS = [250, 500, 1_000] as const;
 const SPEECH_RECOVERY_STABLE_MS = 30_000;
 
@@ -93,6 +94,9 @@ export class LiveSession {
   private speechRecoveryResetTimer: NodeJS.Timeout | null = null;
   private speechRecoveryAttempt = 0;
   private speechRecoveryStartedAt: number | null = null;
+  private speechStreamReady = false;
+  private recoveryAudio: Buffer[] = [];
+  private recoveryAudioBytes = 0;
   private segmentNumber = 0;
   private productGeneration = 0;
   private analysisRequestNumber = 0;
@@ -305,6 +309,7 @@ export class LiveSession {
   private connectSpeechStream(context: string | undefined): void {
     let stream: DoubaoStreamingAsr | null = null;
     const recoveryAttempt = this.speechRecoveryAttempt;
+    this.speechStreamReady = false;
     stream = this.streamingAsrFactory({
       onResult: ({ text, isFinal, startTimeMs, endTimeMs }) => {
         const isActiveStream = this.stateValue.isListening && this.speechStream === stream;
@@ -320,12 +325,17 @@ export class LiveSession {
         }
       },
       onReady: () => {
-        if (!this.stateValue.isListening || this.speechStream !== stream) return;
+        if (!this.stateValue.isListening || !stream || this.speechStream !== stream) return;
+        this.speechStreamReady = true;
+        const replayedAudioBytes = this.recoveryAudioBytes;
+        this.recoveryAudio = [];
+        this.recoveryAudioBytes = 0;
         if (recoveryAttempt > 0) {
           const occurredAt = this.now();
           this.recordTimeline('asr.recovery.succeeded', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, {
             attempt: recoveryAttempt,
             recoveryMs: this.speechRecoveryStartedAt === null ? null : Math.max(0, occurredAt - this.speechRecoveryStartedAt),
+            replayedAudioBytes,
           });
           this.status('豆包大模型流式语音识别已自动恢复，收音继续', 'success');
         } else {
@@ -338,6 +348,9 @@ export class LiveSession {
     });
     this.speechStream = stream;
     this.speechStream?.connect();
+    if (recoveryAttempt > 0 && stream && this.speechStream === stream) {
+      for (const audio of this.recoveryAudio) stream.sendAudio(audio);
+    }
   }
 
   pauseListening(): void {
@@ -404,7 +417,15 @@ export class LiveSession {
 
   ingestAudio(audio: Buffer): void {
     if (!this.stateValue.isListening) return;
-    this.speechStream?.sendAudio(audio);
+    if (this.speechStream) this.speechStream.sendAudio(audio);
+    if (this.speechRecoveryStartedAt !== null && !this.speechStreamReady && audio.length > 0) {
+      const available = Math.max(0, RECOVERY_AUDIO_MAX_BYTES - this.recoveryAudioBytes);
+      if (available > 0) {
+        const buffered = Buffer.from(audio.subarray(0, available));
+        this.recoveryAudio.push(buffered);
+        this.recoveryAudioBytes += buffered.length;
+      }
+    }
     if (!this.timelineStore || audio.length === 0) return;
     this.pendingAsrAudioBytes += audio.length;
     this.pendingAsrChunk.push(audio);
@@ -445,6 +466,7 @@ export class LiveSession {
   private beginSpeechRecovery(error: Error, failedStream: DoubaoStreamingAsr | null, context: string | undefined): void {
     const occurredAt = this.now();
     this.clearSpeechRecoveryTimers();
+    this.speechStreamReady = false;
     if (this.speechStream === failedStream) this.speechStream = null;
     failedStream?.close();
     this.speechRecoveryAttempt += 1;
@@ -488,6 +510,9 @@ export class LiveSession {
 
   private cancelSpeechRecovery(resetAttempt: boolean): void {
     this.clearSpeechRecoveryTimers();
+    this.speechStreamReady = false;
+    this.recoveryAudio = [];
+    this.recoveryAudioBytes = 0;
     if (!resetAttempt) return;
     this.speechRecoveryAttempt = 0;
     this.speechRecoveryStartedAt = null;
