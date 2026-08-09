@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { DisplayLinkRegistry } from '../../server/displayLink';
 
@@ -26,5 +29,20 @@ describe('DisplayLinkRegistry', () => {
     expect(second.alias).not.toBe(first.alias);
     expect(registry.resolve(first.alias)).toBeNull();
     expect(registry.resolve(second.alias)).toEqual(second);
+  });
+
+  it('keeps an unexpired display link valid after the server restarts', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'display-link-registry-'));
+    try {
+      const filePath = path.join(directory, 'links.json');
+      const firstProcess = new DisplayLinkRegistry(10_000, () => 1_000, filePath);
+      const link = firstProcess.getOrCreate('live-session-1', 'room-default');
+
+      const restartedProcess = new DisplayLinkRegistry(10_000, () => 2_000, filePath);
+
+      expect(restartedProcess.resolve(link.alias)).toEqual(link);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

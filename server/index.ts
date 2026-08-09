@@ -16,7 +16,7 @@ import { parseProductText } from './productParser';
 import { AuthService, allowsControlTransport, canAccessRoom, type AuthIdentity } from './auth';
 import { readSessionIdleTtlMs } from './config';
 import { canDisplayJoin, CaptureLease } from './sessionAccess';
-import { DisplayLinkRegistry } from './displayLink';
+import { DisplayLinkRegistry, DISPLAY_LINK_TTL_MS } from './displayLink';
 import { createRecordingArchiveQueue } from './recordingArchive';
 import { createRuleSyncQueue } from './ruleSync';
 import { FilePresenterPhraseLibrary } from './presenterPhraseLibrary';
@@ -46,7 +46,11 @@ const requestIdentities = new WeakMap<express.Request, AuthIdentity>();
 const loginAttempts = new Map<string, { failures: number; blockedUntil: number }>();
 const sessionExpiryTimers = new Map<string, NodeJS.Timeout>();
 const captureLeases = new CaptureLease<WebSocket>();
-const displayLinks = new DisplayLinkRegistry();
+const displayLinks = new DisplayLinkRegistry(
+  DISPLAY_LINK_TTL_MS,
+  Date.now,
+  process.env.DISPLAY_LINK_REGISTRY_PATH ?? path.resolve(projectRoot, '../.data/display-links/registry.json'),
+);
 const sessionIdleTtlMs = readSessionIdleTtlMs(process.env);
 const allowInsecureAuth = process.env.ALLOW_INSECURE_AUTH === 'true';
 const complianceAnalyzer = createDoubaoAnalyzer(process.env);

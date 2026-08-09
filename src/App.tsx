@@ -391,7 +391,7 @@ function AppHeader({ state, connected, status, mode, access }: { state: SessionS
   const [shareError, setShareError] = useState('');
   const [copied, setCopied] = useState(false);
   useEffect(() => {
-    if (mode !== 'operator' || !state.sessionId || !access) {
+    if (mode !== 'operator' || !state.sessionId || !access || !connected) {
       setDisplayLink(null);
       setQrCode('');
       return;
@@ -407,7 +407,7 @@ function AppHeader({ state, connected, status, mode, access }: { state: SessionS
       .then((payload) => { if (!disposed) setDisplayLink(payload); })
       .catch((error: unknown) => { if (!disposed) setShareError(error instanceof Error ? error.message : '主播屏入口生成失败'); });
     return () => { disposed = true; };
-  }, [access?.actorId, access?.token, mode, state.sessionId]);
+  }, [access?.actorId, access?.token, connected, mode, state.sessionId]);
   useEffect(() => {
     if (!displayLink) return;
     let disposed = false;
@@ -1117,10 +1117,19 @@ function DisplayScreen() {
   const captureLabel = session.state.captureState === 'live' ? '正在收音' : session.state.captureState === 'paused' ? '直播暂停' : session.state.captureState === 'ended' ? '直播结束' : '等待开播';
   const coachLatency = suggestions.find((suggestion) => suggestion.latencyMs !== undefined)?.latencyMs;
   const riskAlternative = promptCompliance && promptCompliance.risk !== 'safe' ? promptCompliance.alternative.replace(/^可以改为：/u, '') : '';
+  const streamingText = session.state.partialTranscript || latestTranscript?.text || '等待主播开口';
+  const streamingSpeaker = session.state.partialTranscript ? 'host' : latestTranscript?.speaker ?? 'host';
+  const streamingTime = session.state.partialTranscript
+    ? '识别中'
+    : latestTranscript ? new Date(latestTranscript.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '待识别';
   return <div className={`app-shell display-shell risk-${risk}`}>
     <AppHeader state={session.state} connected={session.connected} status={session.status} mode="display" />
     <main className="display-main">
       <div className="display-product"><img src={session.state.product.image} alt="" /><div><span className="eyebrow">ON AIR PRODUCT · {session.state.product.category}</span><h1>{session.state.product.name}</h1><strong>{session.state.product.price}</strong></div><div className="display-live"><span className={`signal-dot ${session.state.isListening ? 'on' : ''}`} />{captureLabel}</div></div>
+      <section className={`display-live-transcript ${session.state.partialTranscript ? 'partial' : ''}`}>
+        <header><div><span className="eyebrow">流式话术转录</span><strong>{streamingTime}</strong></div><span className={`display-transcript-speaker ${streamingSpeaker}`}>{streamingSpeaker === 'other' ? <UsersRound size={12} /> : <UserRound size={12} />}{streamingSpeaker === 'other' ? '其他人' : '主播'}</span></header>
+        <p>{transcriptMarkup(streamingText, session.state.partialTranscript ? null : result)}</p>
+      </section>
       <section className="display-coach-cues">
         <header><div><span className="eyebrow">主播提词 · 下一句</span><h2>三段备选话术</h2></div><div className="display-meta"><span className="display-source">{session.state.coachPending ? '豆包生成中' : suggestions[0]?.source === 'doubao' ? '豆包直播教练' : '主播专属参考'}</span><span className="display-latency">{session.state.coachPending ? '实时更新' : coachLatency === undefined ? '随时参考' : `教练 ${formatAnalysisLatency(coachLatency)}`}</span></div></header>
         <div className="display-coach-list">{suggestions.map((suggestion, index) => <article className="display-coach-item" key={suggestion.id}><div><span>{index + 1}</span><strong>{suggestion.purpose}</strong></div><p>{suggestion.text}</p><small>{suggestion.reason}</small></article>)}</div>

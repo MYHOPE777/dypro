@@ -61,6 +61,7 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 | `RULE_REVIEWER_ACTOR_ID` | 账号 ID，默认 `owner` | 否 | 共享规则的审核人。多人模式下必须对应 `role` 为 `reviewer` 的账号。 |
 | `RULE_LEARNING_MIN_CONFIDENCE` | 0.8-1，默认 `0.93` | 否 | 仅豆包明确标记为词级规则且达到此置信度时，自动生成待审核候选；句级和上下文语义永不自动发布为硬规则。 |
 | `SESSION_IDLE_TTL_MS` | 毫秒，默认 `1800000` | 否 | 最后一个页面断开后保留会话的时间，最小按 60 秒处理。超时后只清理内存会话，已写入的本地时间线不删除。 |
+| `DISPLAY_LINK_REGISTRY_PATH` | 路径，默认 `.data/display-links/registry.json` | 否 | 保存临时主播屏短地址及过期时间，使服务重启后未过期的主播屏继续连接原会话。 |
 | `ARCHIVE_QUEUE_PATH` | 路径，默认 `.data/archive/queue.json` | 否 | 停播后 TOS 归档队列。失败任务带指数退避，服务重启后可继续。 |
 
 相对路径按启动服务时的项目根目录解析。生产环境建议改为绝对路径，并确保运行账号有读写权限。音频与规则数据属于直播业务数据，建议放在受限磁盘并纳入备份。
