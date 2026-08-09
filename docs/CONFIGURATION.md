@@ -4,6 +4,24 @@
 
 如果现在只准备接入火山引擎，可以直接参考并复制 [`config/volcengine.env.example`](../config/volcengine.env.example)。该文件按“豆包大模型流式语音识别（ASR）→ 豆包大模型 → 方舟知识库搜索 → TOS 归档 → 数据库预留”的顺序排列，并在每个参数旁标注获取位置、发送位置和是否必填；它是模板，不包含真实密钥。
 
+## 官方术语与参数映射
+
+语音链路的正式产品名称是**豆包大模型流式语音识别（ASR）**，本项目接入其官方“双向流式模式（优化版本）” WebSocket（SAUC）。项目环境变量只是服务端配置入口，实际发送到火山引擎的名称保持官方定义：
+
+| 配置用途 | 官方名称或字段 | 在本项目中的配置入口 |
+| --- | --- | --- |
+| 新版鉴权 | 请求头 `X-Api-Key`（App Key） | `X_API_KEY` |
+| 兼容旧版鉴权 | 请求头 `X-Api-App-Key`、`X-Api-Access-Key` | `X_API_APP_KEY`、`X_API_ACCESS_KEY` |
+| 流式识别资源 | 请求头 `X-Api-Resource-Id` | `X_API_RESOURCE_ID` |
+| WebSocket 接入地址 | 豆包大模型流式语音识别官方 SAUC 地址 | `SPEECH_ENDPOINT` |
+| 热词词表 | `request.corpus.boosting_table_id` / `boosting_table_name` | `BOOSTING_TABLE_ID` / `BOOSTING_TABLE_NAME` |
+| 替换词词表 | `request.corpus.correct_table_id` / `correct_table_name` | `CORRECT_TABLE_ID` / `CORRECT_TABLE_NAME` |
+| 识别上下文 | `request.corpus.context`，含 `context_type`、`context_data` | 由商品、纠错词和话术上下文生成 |
+| VAD 判停 | `request.end_window_size` | `END_WINDOW_SIZE` |
+| 语义合规推理 | 火山方舟 **Responses API** 请求体 `model`、`input`、`text.format` 等 | `ARK_MODEL` 等 `ARK_*` 配置 |
+
+“实时”仅用于描述预警或界面更新速度，不作为语音产品名称；界面和日志统一使用“流式语音识别”。
+
 ## 1. 运行模式
 
 | 模式 | 必填配置 | 行为 |
@@ -90,10 +108,10 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 
 | 参数 | 类型/默认值 | 是否必填 | 说明 |
 | --- | --- | --- | --- |
-| `X_API_KEY` | 字符串 | 新版控制台流式识别必填 | 豆包语音新版控制台的 App Key，对应 WebSocket 请求头 `X-Api-Key`。不要放入前端。 |
+| `X_API_KEY` | 字符串 | 新版控制台豆包大模型流式语音识别必填 | 豆包语音新版控制台的 App Key，对应 WebSocket 请求头 `X-Api-Key`。不要放入前端。 |
 | `X_API_APP_KEY` | 字符串 | 旧版控制台可选 | 旧版控制台的 APP ID，对应官方请求头 `X-Api-App-Key`。仅当 `X_API_KEY` 留空时使用。 |
 | `X_API_ACCESS_KEY` | 字符串 | 旧版控制台可选 | 旧版控制台的 Access Token，对应官方请求头 `X-Api-Access-Key`。仅当 `X_API_KEY` 留空时使用；旧版页面里的 Secret Key 不直接发送到 SAUC WebSocket。 |
-| `X_API_RESOURCE_ID` | 字符串，默认 `volc.bigasr.sauc.duration` | 否/按账号 | 已开通的流式语音识别资源 ID，对应 `X-Api-Resource-Id`。并发版使用 `volc.bigasr.sauc.concurrent`，小时版使用 `volc.bigasr.sauc.duration`，实际以控制台为准。 |
+| `X_API_RESOURCE_ID` | 字符串，默认 `volc.bigasr.sauc.duration` | 否/按账号 | 已开通的豆包大模型流式语音识别资源 ID，对应 `X-Api-Resource-Id`。并发版使用 `volc.bigasr.sauc.concurrent`，小时版使用 `volc.bigasr.sauc.duration`，实际以控制台为准。 |
 | `SPEECH_ENDPOINT` | URL，默认 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async` | 否 | 豆包大模型流式语音识别（ASR）的“双向流式模式（优化版本）”WebSocket 地址。除非账号文档要求，否则不要改成 HTTP 地址。 |
 | `BOOSTING_TABLE_ID` / `BOOSTING_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `corpus.boosting_table_id` / `boosting_table_name`。每个流式语音识别请求只使用一张热词表，ID 优先。 |
 | `CORRECT_TABLE_ID` / `CORRECT_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `corpus.correct_table_id` / `correct_table_name`。每个流式语音识别请求只使用一张替换词表，ID 优先。 |

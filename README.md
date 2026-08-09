@@ -1,6 +1,21 @@
-# dypro · 抖音直播实时合规预警
+# dypro · 抖音直播合规预警
 
 一个面向直播间的本地局域网工具：MacBook 采集蓝牙麦克风，豆包大模型流式语音识别（ASR）转录，豆包大模型判断抖音直播话术风险，主播在 MacBook 或 iPad/外接显示器上即时看到合规替代表达。
+
+本项目使用的火山引擎官方名称与协议字段如下：
+
+| 本项目中的能力 | 火山引擎官方名称/字段 |
+| --- | --- |
+| 流式收音与转录 | **豆包大模型流式语音识别（ASR）**，官方“双向流式模式（优化版本）” WebSocket（SAUC） |
+| 流式识别鉴权 | `X-Api-Key`（新版 App Key）；旧版为 `X-Api-App-Key` + `X-Api-Access-Key` |
+| 识别资源 | `X-Api-Resource-Id`，值以豆包语音控制台已开通资源为准 |
+| 热词 | `request.corpus.boosting_table_id` 或 `request.corpus.boosting_table_name` |
+| 替换词 | `request.corpus.correct_table_id` 或 `request.corpus.correct_table_name` |
+| 上下文 | `request.corpus.context`，其中使用官方 `context_type` / `context_data` |
+| 语义合规判断 | **火山方舟 Responses API**，请求体使用官方 `model`、`input`、`text.format`、`max_output_tokens` 等字段 |
+| 知识库检索 | 方舟 Responses API 官方 `knowledge_search` 工具及 `knowledge_resource_id` |
+
+“实时”在本文仅描述预警和界面更新速度；语音能力统一称为“豆包大模型流式语音识别（ASR）”或简写“流式语音识别”。
 
 ## 快速启动
 

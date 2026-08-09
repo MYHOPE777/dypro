@@ -428,7 +428,7 @@ function AppHeader({ state, connected, status, mode, access }: { state: SessionS
     <header className="topbar">
       <div className="brand-lockup">
         <div className="brand-mark"><ShieldCheck size={19} /></div>
-        <div><div className="brand-name">dypro</div><div className="brand-sub">抖音直播实时合规预警</div></div>
+        <div><div className="brand-name">dypro</div><div className="brand-sub">抖音直播合规预警</div></div>
       </div>
       <div className="live-chip"><span className={`signal-dot ${connected ? 'on' : ''}`} />{connected ? 'LIVE SESSION' : 'CONNECTING'}<span className="chip-divider" />{state.sessionId || '等待会话'}</div>
       <div className="top-actions">
@@ -670,7 +670,7 @@ function MicPanel({ state, connected, captureDeniedVersion, send, onOpenReview }
     {state.captureState === 'live' && <div className="mic-control-stack horizontal"><button type="button" className="test-control" onClick={pauseLive} disabled={!connected}><Pause size={15} fill="currentColor" />暂停</button><button type="button" className="main-control stop" onClick={endLive} disabled={!connected}><CircleStop size={16} />结束直播</button></div>}
     {state.captureState === 'paused' && <div className="mic-control-stack horizontal"><button type="button" className="main-control start" onClick={() => void startLive(true)} disabled={!connected}><Play size={16} fill="currentColor" />继续收音</button><button type="button" className="main-control stop" onClick={endLive} disabled={!connected}><CircleStop size={16} />结束直播</button></div>}
     {state.captureState === 'ended' && <button type="button" className="review-control" onClick={onOpenReview}><FileAudio size={16} />复核音频与转录</button>}
-    <span className="capture-note"><span className={`capture-dot ${state.isListening ? 'active' : ''}`} />{state.captureState === 'live' ? '流式识别中' : state.captureState === 'paused' ? '流式识别已暂停' : state.captureState === 'ended' ? '本地已归档' : microphone.capturing ? '本地设备测试' : '流式识别待命'}</span>
+    <span className="capture-note"><span className={`capture-dot ${state.isListening ? 'active' : ''}`} />{state.captureState === 'live' ? '流式语音识别中' : state.captureState === 'paused' ? '流式语音识别已暂停' : state.captureState === 'ended' ? '本地已归档' : microphone.capturing ? '本地设备测试' : '流式语音识别待命'}</span>
   </section>;
 }
 
@@ -897,7 +897,7 @@ function TranscriptStage({ state, send }: { state: SessionState; send: (message:
   const lastFinal = state.transcriptHistory[state.transcriptHistory.length - 1];
   const latestIsCurrent = lastFinal && lastFinal.timestamp >= state.productContextStartedAt;
   return <section className="stage-section transcript-stage">
-    <div className="section-heading"><div><span className="section-kicker">豆包大模型流式语音识别 <span>ASR</span></span><h1>{state.partialTranscript || (latestIsCurrent ? lastFinal?.text : null) || '等待主播开口'}</h1></div><div className="asr-badge"><span className="signal-dot on" />{state.isListening ? '流式识别中' : '待识别'}</div></div>
+    <div className="section-heading"><div><span className="section-kicker">豆包大模型流式语音识别 <span>ASR</span></span><h1>{state.partialTranscript || (latestIsCurrent ? lastFinal?.text : null) || '等待主播开口'}</h1></div><div className="asr-badge"><span className="signal-dot on" />{state.isListening ? '流式语音识别中' : '待识别'}</div></div>
     <Waveform active={state.isListening} />
     <div className="transcript-feed">{state.transcriptHistory.slice(-4).map((segment, index) => { const compliance = state.alerts.find((alert) => alert.segmentId === segment.id); return <div className={`feed-line ${index === state.transcriptHistory.slice(-4).length - 1 ? 'current' : ''} ${compliance?.risk ?? ''}`} key={segment.id}><time><span>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span><em>{formatTranscriptOffset(segment.offsetMs)}</em><SpeakerTag speaker={segment.speaker} onClick={() => send({ type: 'transcript.speaker', segmentId: segment.id, speaker: segment.speaker === 'other' ? 'host' : 'other' })} /></time>{editingId === segment.id ? <form className="transcript-edit" onSubmit={(event) => { event.preventDefault(); if (draft.trim()) { send({ type: 'transcript.correct', segmentId: segment.id, text: draft.trim(), learn: true }); setEditingId(null); } }}><input value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><button type="submit" title="保存并学习纠错"><Save size={13} /></button><button type="button" title="取消纠错" onClick={() => setEditingId(null)}>×</button></form> : <><span>{transcriptMarkup(segment.text, compliance)}</span>{segment.isFinal && <button type="button" className="transcript-edit-button" title="纠正这句转录" onClick={() => { setEditingId(segment.id); setDraft(segment.text); }}><Pencil size={12} /></button>}</>}</div>; })}</div>
   </section>;
@@ -1130,7 +1130,7 @@ function DisplayScreen() {
         {(riskAlternative || result?.reason) && <div className="display-risk-detail">{riskAlternative && <p>{riskAlternative}</p>}{result?.reason && <small><AlertTriangle size={14} />{result.reason}</small>}</div>}
       </section>
     </main>
-    <footer className="display-footer"><div><ShieldCheck size={15} />抖音直播合规实时预警</div><div className="display-footer-stats"><span>监测 {session.state.stats.words} 字</span><span>高风险 {session.state.stats.blockedCount}</span><span>需留意 {session.state.stats.warningCount}</span></div></footer>
+    <footer className="display-footer"><div><ShieldCheck size={15} />抖音直播合规预警</div><div className="display-footer-stats"><span>监测 {session.state.stats.words} 字</span><span>高风险 {session.state.stats.blockedCount}</span><span>需留意 {session.state.stats.warningCount}</span></div></footer>
   </div>;
 }
 

@@ -66,12 +66,12 @@ function speechFailurePayload(error: Error): Record<string, unknown> {
 
 function speechFailureMessage(error: Error): string {
   if (/45000292|quota exceeded for types:\s*concurrency/iu.test(error.message)) {
-    return '语音识别并发额度已满，本场已暂停。请关闭其他正在收音的会话；若控制台并发额度为 0，请开通额度或切换到已开通的小时版资源。';
+    return '豆包大模型流式语音识别并发额度已满，本场已暂停。请关闭其他正在收音的会话；若控制台并发额度为 0，请开通额度或切换到已开通的小时版资源。';
   }
   if (isNextPacketTimeout(error)) {
-    return '语音识别连续恢复失败，本场已暂停。请确认网络和麦克风正常后，再点击“继续收音”。';
+    return '豆包大模型流式语音识别连续恢复失败，本场已暂停。请确认网络和麦克风正常后，再点击“继续收音”。';
   }
-  return '语音识别连接异常，本场已暂停。请确认网络正常后，再点击“继续收音”。';
+  return '豆包大模型流式语音识别连接异常，本场已暂停。请确认网络正常后，再点击“继续收音”。';
 }
 
 function createStats(): SessionStats {
@@ -299,7 +299,7 @@ export class LiveSession {
     });
     this.connectSpeechStream(asrContext);
     this.broadcast({ type: 'state.snapshot', state: this.state });
-    this.status(this.speechStream ? '正在连接语音识别' : '演示模式已启动，可用快捷语句模拟收音', this.speechStream ? 'neutral' : 'success');
+    this.status(this.speechStream ? '正在连接豆包大模型流式语音识别' : '演示模式已启动，可用快捷语句模拟收音', this.speechStream ? 'neutral' : 'success');
   }
 
   private connectSpeechStream(context: string | undefined): void {
@@ -327,9 +327,9 @@ export class LiveSession {
             attempt: recoveryAttempt,
             recoveryMs: this.speechRecoveryStartedAt === null ? null : Math.max(0, occurredAt - this.speechRecoveryStartedAt),
           });
-          this.status('语音识别已自动恢复，收音继续', 'success');
+          this.status('豆包大模型流式语音识别已自动恢复，收音继续', 'success');
         } else {
-          this.status('语音识别已连接', 'success');
+          this.status('豆包大模型流式语音识别已连接', 'success');
         }
         this.scheduleSpeechRecoveryReset(stream);
       },
@@ -368,12 +368,11 @@ export class LiveSession {
       this.archiveQueue?.enqueue(this.id);
     });
     void this.audioWriteQueue.catch((error: unknown) => this.status(`音频切片合成失败：${error instanceof Error ? error.message : String(error)}`, 'error'));
-    try {
-      const timeline = this.timelineStore?.exportSession(this.id);
-      if (timeline && this.presenter) this.phraseLibrary?.archiveSession(this.presenter.id, timeline);
-    } catch {
-      this.status('本场话术归档稍后重试', 'warning');
-    }
+    this.archivePresenterPhrases();
+    // The ASR drain can deliver one final segment after endLive returns.
+    queueMicrotask(() => {
+      if (this.stateValue.captureState === 'ended') this.archivePresenterPhrases();
+    });
     this.broadcast({ type: 'state.snapshot', state: this.state });
     this.status('本场直播已结束，音频和转录可进行复核', 'success');
   }
@@ -459,7 +458,7 @@ export class LiveSession {
       delayMs,
     });
     this.broadcast({ type: 'state.snapshot', state: this.state });
-    this.status(`连接短暂中断，正在恢复语音识别（第 ${this.speechRecoveryAttempt} 次）`, 'warning');
+    this.status(`连接短暂中断，正在恢复豆包大模型流式语音识别（第 ${this.speechRecoveryAttempt} 次）`, 'warning');
     this.speechRecoveryTimer = setTimeout(() => {
       this.speechRecoveryTimer = null;
       if (!this.stateValue.isListening || this.stateValue.captureState !== 'live' || this.speechStream) return;
@@ -500,6 +499,16 @@ export class LiveSession {
     this.speechDrainTimer = null;
     this.drainingSpeechStream = null;
     if (close) stream.close();
+    if (this.stateValue.captureState === 'ended') this.archivePresenterPhrases();
+  }
+
+  private archivePresenterPhrases(): void {
+    try {
+      const timeline = this.timelineStore?.exportSession(this.id);
+      if (timeline && this.presenter) this.phraseLibrary?.archiveSession(this.presenter.id, timeline);
+    } catch {
+      this.status('本场话术归档稍后重试', 'warning');
+    }
   }
 
   ingestTranscript(rawText: string, isFinal = true, timing: TranscriptTiming = {}): void {

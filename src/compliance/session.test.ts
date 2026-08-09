@@ -196,6 +196,35 @@ describe('LiveSession', () => {
     }
   });
 
+  it('archives a final ASR segment delivered while the stream is draining', async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'session-presenter-drain-'));
+    try {
+      const timelineStore = new FileTimelineStore(path.join(directory, 'timeline'));
+      const phraseLibrary = new FilePresenterPhraseLibrary(path.join(directory, 'phrases.json'));
+      const presenter = phraseLibrary.createPresenter({ roomId: 'room-default', accountName: '护肤账号', name: '主播小唐' });
+      const streamingAsrFactory = (options: StreamingAsrOptions) => ({
+        connect: () => undefined,
+        finish: () => {
+          options.onResult({ text: '收尾补充话术', isFinal: true });
+          options.onClosed?.();
+        },
+        close: () => undefined,
+        sendAudio: () => undefined,
+      }) as unknown as DoubaoStreamingAsr;
+      const session = new LiveSession('live-presenter-drain', { timelineStore, phraseLibrary, presenter, streamingAsrFactory });
+
+      session.startListening();
+      session.endLive();
+      await Promise.resolve();
+
+      expect(phraseLibrary.listPhrases(presenter.id)).toEqual([
+        expect.objectContaining({ text: '收尾补充话术', sourceSessionId: 'live-presenter-drain' }),
+      ]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('does not let a paused stream error pause the stream created after resume', () => {
     const streamOptions: StreamingAsrOptions[] = [];
     const streamingAsrFactory = (options: StreamingAsrOptions) => {
@@ -259,7 +288,7 @@ describe('LiveSession', () => {
       expect(streams[0]?.close).toHaveBeenCalledOnce();
       expect(streams[1]?.connect).toHaveBeenCalledOnce();
       expect(session.state.transcriptHistory).toHaveLength(0);
-      expect(statuses.some((status) => status.message?.includes('正在恢复语音识别'))).toBe(true);
+      expect(statuses.some((status) => status.message?.includes('正在恢复豆包大模型流式语音识别'))).toBe(true);
       expect(statuses.every((status) => !status.message?.includes('45000081') && !status.message?.includes('Logid'))).toBe(true);
     } finally {
       vi.useRealTimers();
