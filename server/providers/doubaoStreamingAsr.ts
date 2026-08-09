@@ -4,6 +4,22 @@ import WebSocket from 'ws';
 
 export type StreamingAsrResult = { text: string; isFinal: boolean; startTimeMs?: number; endTimeMs?: number };
 
+export type StreamingAsrDiagnostics = {
+  logId?: string;
+  lastAudioPacketAt?: number;
+  lastAudioPacketGapMs?: number;
+  lastAudioPacketKind?: 'microphone' | 'keepalive';
+  pendingAudioBytes: number;
+  socketReadyState: number | null;
+};
+
+export class StreamingAsrProviderError extends Error {
+  constructor(message: string, readonly diagnostics: StreamingAsrDiagnostics) {
+    super(message);
+    this.name = 'StreamingAsrProviderError';
+  }
+}
+
 export type StreamingAsrOptions = {
   onResult: (result: StreamingAsrResult) => void;
   onError: (error: Error) => void;
@@ -54,8 +70,8 @@ type SpeechSocketFactory = (endpoint: string, headers: Record<string, string>) =
 
 const DEFAULT_ENDPOINT = 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async';
 const MAX_PENDING_AUDIO_BYTES = 160_000;
-const KEEP_ALIVE_CHECK_INTERVAL_MS = 1_000;
-const KEEP_ALIVE_IDLE_MS = 2_000;
+const KEEP_ALIVE_CHECK_INTERVAL_MS = 200;
+const KEEP_ALIVE_IDLE_MS = 400;
 const KEEP_ALIVE_AUDIO = Buffer.alloc(3_200);
 
 function optional(value: string | undefined): string | undefined {
@@ -192,6 +208,7 @@ export class DoubaoStreamingAsr {
   private finishRequested = false;
   private keepAliveTimer: NodeJS.Timeout | null = null;
   private lastAudioPacketAt = 0;
+  private lastAudioPacketKind: StreamingAsrDiagnostics['lastAudioPacketKind'];
   private pendingAudio: Buffer[] = [];
   private pendingAudioBytes = 0;
   private logId: string | undefined;
@@ -223,6 +240,7 @@ export class DoubaoStreamingAsr {
       for (const audio of this.pendingAudio) {
         this.socket?.send(buildAudioFrame(audio));
         this.lastAudioPacketAt = Date.now();
+        this.lastAudioPacketKind = 'microphone';
       }
       this.pendingAudio = [];
       this.pendingAudioBytes = 0;
@@ -263,7 +281,17 @@ export class DoubaoStreamingAsr {
     if (this.failureReported) return;
     this.failureReported = true;
     const suffix = this.logId && !error.message.includes(this.logId) ? `（Logid ${this.logId}）` : '';
-    this.options.onError(new Error(`${error.message}${suffix}`));
+    const now = Date.now();
+    this.options.onError(new StreamingAsrProviderError(`${error.message}${suffix}`, {
+      ...(this.logId ? { logId: this.logId } : {}),
+      ...(this.lastAudioPacketAt > 0 ? {
+        lastAudioPacketAt: this.lastAudioPacketAt,
+        lastAudioPacketGapMs: Math.max(0, now - this.lastAudioPacketAt),
+      } : {}),
+      ...(this.lastAudioPacketKind ? { lastAudioPacketKind: this.lastAudioPacketKind } : {}),
+      pendingAudioBytes: this.pendingAudioBytes,
+      socketReadyState: this.socket?.readyState ?? null,
+    }));
   }
 
   private startKeepAlive(): void {
@@ -277,6 +305,7 @@ export class DoubaoStreamingAsr {
       // Keepalive audio is sent only to ASR and is never persisted as source audio.
       this.socket.send(buildAudioFrame(KEEP_ALIVE_AUDIO));
       this.lastAudioPacketAt = now;
+      this.lastAudioPacketKind = 'keepalive';
     }, KEEP_ALIVE_CHECK_INTERVAL_MS);
     this.keepAliveTimer.unref?.();
   }
@@ -291,6 +320,7 @@ export class DoubaoStreamingAsr {
     if (this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(buildAudioFrame(audio));
       this.lastAudioPacketAt = Date.now();
+      this.lastAudioPacketKind = 'microphone';
       return;
     }
     if (this.socket?.readyState !== WebSocket.CONNECTING) return;

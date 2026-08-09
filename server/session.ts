@@ -1,22 +1,27 @@
 import { randomUUID } from 'node:crypto';
 import type WebSocket from 'ws';
 import { createDoubaoAnalyzer } from './services';
-import { buildStreamingAsrContext, createDoubaoStreamingAsr, type DoubaoStreamingAsr, type StreamingAsrOptions } from './providers/doubaoStreamingAsr';
+import { buildStreamingAsrContext, createDoubaoStreamingAsr, StreamingAsrProviderError, type DoubaoStreamingAsr, type StreamingAsrOptions } from './providers/doubaoStreamingAsr';
 import type { TimelineWriter } from './timelineStore';
 import type { RecordingArchiveQueue } from './recordingArchive';
-import type { ComplianceAnalyzer } from '../src/compliance/engine';
+import type { AnalysisInput, ComplianceAnalyzer } from '../src/compliance/engine';
 import type { ProductCatalog } from './productCatalog';
+import { findMentionedProduct } from './productMentionMatcher';
+import { createDoubaoCoach, localSuggestions, type CoachInput, type CoachProvider } from './providers/doubaoCoach';
 import type { RuleCatalog } from './ruleCatalog';
+import type { PresenterPhraseLibrary } from './presenterPhraseLibrary';
 import { deriveSpeechCorrection, type SpeechCorrectionCatalog } from './speechCorrectionCatalog';
 import { DEFAULT_PRODUCT, PRODUCTS } from '../src/shared/products';
 import type {
   CaptureState,
   ComplianceResult,
   Product,
+  RiskProfile,
   ServerMessage,
   SessionState,
   SessionStats,
   TranscriptSegment,
+  PresenterProfile,
 } from '../src/shared/types';
 
 type Client = { socket: WebSocket; role: 'operator' | 'display' };
@@ -28,19 +33,45 @@ type LiveSessionOptions = {
   speechCorrectionCatalog?: SpeechCorrectionCatalog;
   archiveQueue?: RecordingArchiveQueue;
   analyzer?: ComplianceAnalyzer;
+  coach?: CoachProvider;
   streamingAsrFactory?: (options: StreamingAsrOptions) => DoubaoStreamingAsr | null;
   roomId?: string;
   actorId?: string;
   now?: () => number;
+  riskProfile?: RiskProfile;
+  phraseLibrary?: PresenterPhraseLibrary;
+  presenter?: PresenterProfile;
 };
 
 const AUDIO_CHUNK_BYTES = 256 * 1024;
+const SPEECH_RECOVERY_DELAYS_MS = [250, 500, 1_000] as const;
+const SPEECH_RECOVERY_STABLE_MS = 30_000;
+
+function isNextPacketTimeout(error: Error): boolean {
+  return /45000081|Timeout waiting next packet|waiting next packet timeout/iu.test(error.message);
+}
+
+function speechFailurePayload(error: Error): Record<string, unknown> {
+  const code = /(?:错误|error)\s*(\d{8})/iu.exec(error.message)?.[1];
+  const logId = error instanceof StreamingAsrProviderError
+    ? error.diagnostics.logId
+    : /Logid\s+([^）)]+)/iu.exec(error.message)?.[1];
+  return {
+    message: error.message,
+    ...(code ? { providerCode: code } : {}),
+    ...(logId ? { logId } : {}),
+    ...(error instanceof StreamingAsrProviderError ? { diagnostics: error.diagnostics } : {}),
+  };
+}
 
 function speechFailureMessage(error: Error): string {
   if (/45000292|quota exceeded for types:\s*concurrency/iu.test(error.message)) {
     return '语音识别并发额度已满，本场已暂停。请关闭其他正在收音的会话；若控制台并发额度为 0，请开通额度或切换到已开通的小时版资源。';
   }
-  return `豆包大模型流式语音识别连接异常，本场已暂停：${error.message}`;
+  if (isNextPacketTimeout(error)) {
+    return '语音识别连续恢复失败，本场已暂停。请确认网络和麦克风正常后，再点击“继续收音”。';
+  }
+  return '语音识别连接异常，本场已暂停。请确认网络正常后，再点击“继续收音”。';
 }
 
 function createStats(): SessionStats {
@@ -53,19 +84,27 @@ export class LiveSession {
   readonly createdAt: number;
   private readonly clients = new Set<Client>();
   private readonly analyzer: ComplianceAnalyzer;
+  private readonly coach: CoachProvider;
   private readonly streamingAsrFactory: NonNullable<LiveSessionOptions['streamingAsrFactory']>;
   private speechStream: DoubaoStreamingAsr | null = null;
   private drainingSpeechStream: DoubaoStreamingAsr | null = null;
   private speechDrainTimer: NodeJS.Timeout | null = null;
+  private speechRecoveryTimer: NodeJS.Timeout | null = null;
+  private speechRecoveryResetTimer: NodeJS.Timeout | null = null;
+  private speechRecoveryAttempt = 0;
+  private speechRecoveryStartedAt: number | null = null;
   private segmentNumber = 0;
   private productGeneration = 0;
   private analysisRequestNumber = 0;
   private latestAnalysisRequest = 0;
+  private coachRequestNumber = 0;
   private readonly complianceBySegment = new Map<string, ComplianceResult>();
   private readonly segmentRevisions = new Map<string, number>();
   private readonly timelineStore?: TimelineWriter;
   private readonly productCatalog?: ProductCatalog;
   private readonly ruleCatalog?: RuleCatalog;
+  private readonly phraseLibrary?: PresenterPhraseLibrary;
+  private presenter?: PresenterProfile;
   private readonly speechCorrectionCatalog?: SpeechCorrectionCatalog;
   private readonly archiveQueue?: RecordingArchiveQueue;
   private readonly actorId: string;
@@ -85,9 +124,12 @@ export class LiveSession {
     this.timelineStore = options.timelineStore;
     this.productCatalog = options.productCatalog;
     this.ruleCatalog = options.ruleCatalog;
+    this.phraseLibrary = options.phraseLibrary;
+    this.presenter = options.presenter;
     this.speechCorrectionCatalog = options.speechCorrectionCatalog;
     this.archiveQueue = options.archiveQueue;
     this.analyzer = options.analyzer ?? createDoubaoAnalyzer();
+    this.coach = options.coach ?? createDoubaoCoach();
     this.streamingAsrFactory = options.streamingAsrFactory ?? createDoubaoStreamingAsr;
     this.roomId = options.roomId ?? 'room-default';
     this.actorId = options.actorId ?? 'owner';
@@ -100,6 +142,8 @@ export class LiveSession {
     this.stateValue = {
       sessionId: id,
       roomId: this.roomId,
+      presenterId: this.presenter?.id ?? 'presenter-default',
+      presenterName: this.presenter?.name ?? '默认主播',
       product: initialProduct,
       lineup,
       isListening: false,
@@ -107,13 +151,17 @@ export class LiveSession {
       partialTranscript: '',
       transcriptHistory: [],
       latestCompliance: null,
+      coachSuggestion: null,
+      coachSuggestions: [],
+      coachPending: false,
+      riskProfile: options.riskProfile ?? 'balanced',
       productContextStartedAt: this.createdAt,
       alerts: [],
       stats: createStats(),
       lastEventAt: this.createdAt,
     };
     if (persistedTiming.createdAt === null) {
-      this.recordTimeline('session.created', this.createdAt, null, initialProduct.id, { roomId: this.roomId, actorId: this.actorId, product: initialProduct, lineupProductIds: lineup.map((product) => product.id) });
+      this.recordTimeline('session.created', this.createdAt, null, initialProduct.id, { roomId: this.roomId, actorId: this.actorId, presenterId: this.presenter?.id ?? 'presenter-default', presenterName: this.presenter?.name ?? '默认主播', product: initialProduct, lineupProductIds: lineup.map((product) => product.id) });
     } else {
       this.restorePersistedState();
     }
@@ -137,6 +185,10 @@ export class LiveSession {
     return this.clients.size;
   }
 
+  async waitForPersistence(): Promise<void> {
+    await this.audioWriteQueue;
+  }
+
   products(): Product[] {
     return structuredClone(this.stateValue.lineup);
   }
@@ -144,16 +196,48 @@ export class LiveSession {
   selectProduct(productId: string): void {
     const product = this.stateValue.lineup.find((item) => item.id === productId);
     if (!product) return;
-    this.productGeneration += 1;
+    this.applyProductSelection(product, this.now(), { selectionSource: 'manual' });
+  }
+
+  setRiskProfile(profile: RiskProfile, actorId = this.actorId): void {
+    if (this.stateValue.riskProfile === profile) return;
     const occurredAt = this.now();
+    this.stateValue.riskProfile = profile;
+    this.stateValue.lastEventAt = occurredAt;
+    this.recordTimeline('risk.profile.changed', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, { profile, actorId });
+    this.broadcast({ type: 'state.snapshot', state: this.state });
+    const label = profile === 'strict' ? '严审' : profile === 'optimized' ? '优化' : '均衡';
+    this.status(`本场风险档位已切换为${label}`, 'success');
+  }
+
+  setPresenter(presenter: PresenterProfile, actorId = this.actorId): void {
+    if (presenter.roomId !== this.roomId) throw new Error('主播不属于当前直播间');
+    if (this.stateValue.presenterId === presenter.id) return;
+    const occurredAt = this.now();
+    this.presenter = presenter;
+    this.stateValue.presenterId = presenter.id;
+    this.stateValue.presenterName = presenter.name;
+    this.stateValue.lastEventAt = occurredAt;
+    this.recordTimeline('presenter.selected', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, { presenterId: presenter.id, presenterName: presenter.name, actorId });
+    this.broadcast({ type: 'state.snapshot', state: this.state });
+    this.status(`当前主播已切换为${presenter.name}`, 'success');
+  }
+
+  private applyProductSelection(
+    product: Product,
+    occurredAt: number,
+    payload: Record<string, unknown>,
+  ): void {
+    if (product.id === this.stateValue.product.id) return;
+    this.productGeneration += 1;
     this.stateValue.product = product;
     this.stateValue.productContextStartedAt = occurredAt;
     this.stateValue.latestCompliance = null;
     this.stateValue.partialTranscript = '';
     this.stateValue.lastEventAt = occurredAt;
-    this.recordTimeline('product.selected', occurredAt, this.offsetAt(occurredAt), product.id, { product });
+    this.recordTimeline('product.selected', occurredAt, this.offsetAt(occurredAt), product.id, { product, ...payload });
     this.broadcast({ type: 'state.snapshot', state: this.state });
-    this.status(`已切换商品：${product.name}`, 'success');
+    this.status(`${payload.selectionSource === 'speech' ? '已自动切换' : '已切换'}商品：${product.name}`, 'success');
   }
 
   setLineup(productIds: string[], actorId = this.actorId): void {
@@ -184,6 +268,7 @@ export class LiveSession {
   startListening(): void {
     if (this.stateValue.isListening || this.stateValue.captureState === 'ended') return;
     this.flushAudioBuffers();
+    this.cancelSpeechRecovery(true);
     const captureEvent = this.stateValue.captureState === 'paused' ? 'capture.resumed' : 'capture.started';
     this.releaseDrainingSpeechStream(this.drainingSpeechStream, true);
     this.archiveQueue?.pause?.(this.id);
@@ -212,28 +297,47 @@ export class LiveSession {
       channels: 1,
       bitsPerSample: 16,
     });
+    this.connectSpeechStream(asrContext);
+    this.broadcast({ type: 'state.snapshot', state: this.state });
+    this.status(this.speechStream ? '正在连接语音识别' : '演示模式已启动，可用快捷语句模拟收音', this.speechStream ? 'neutral' : 'success');
+  }
+
+  private connectSpeechStream(context: string | undefined): void {
     let stream: DoubaoStreamingAsr | null = null;
+    const recoveryAttempt = this.speechRecoveryAttempt;
     stream = this.streamingAsrFactory({
       onResult: ({ text, isFinal, startTimeMs, endTimeMs }) => {
-        if (this.stateValue.isListening || (isFinal && this.drainingSpeechStream === stream)) this.ingestTranscript(text, isFinal, { startTimeMs, endTimeMs });
+        const isActiveStream = this.stateValue.isListening && this.speechStream === stream;
+        if (isActiveStream || (isFinal && this.drainingSpeechStream === stream)) this.ingestTranscript(text, isFinal, { startTimeMs, endTimeMs });
       },
       onError: (error) => {
-        if (this.stateValue.isListening && this.speechStream === stream) this.handleSpeechFailure(error);
+        if (this.stateValue.isListening && this.speechStream === stream) this.handleSpeechFailure(error, stream, context);
         else if (!this.stateValue.isListening && this.drainingSpeechStream === stream) {
-          this.status(`流式语音识别收尾失败，最后一句可能不完整：${error.message}`, 'error');
+          const occurredAt = this.now();
+          this.recordTimeline('asr.error', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, { phase: 'draining', ...speechFailurePayload(error) });
+          this.status('最后一句可能不完整，请在停播复核中检查', 'warning');
           this.releaseDrainingSpeechStream(stream, true);
         }
       },
       onReady: () => {
-        if (this.stateValue.isListening) this.status('豆包大模型流式语音识别已连接', 'success');
+        if (!this.stateValue.isListening || this.speechStream !== stream) return;
+        if (recoveryAttempt > 0) {
+          const occurredAt = this.now();
+          this.recordTimeline('asr.recovery.succeeded', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, {
+            attempt: recoveryAttempt,
+            recoveryMs: this.speechRecoveryStartedAt === null ? null : Math.max(0, occurredAt - this.speechRecoveryStartedAt),
+          });
+          this.status('语音识别已自动恢复，收音继续', 'success');
+        } else {
+          this.status('语音识别已连接', 'success');
+        }
+        this.scheduleSpeechRecoveryReset(stream);
       },
       onClosed: () => this.releaseDrainingSpeechStream(stream, false),
-      context: asrContext,
+      context,
     });
     this.speechStream = stream;
     this.speechStream?.connect();
-    this.broadcast({ type: 'state.snapshot', state: this.state });
-    this.status(this.speechStream ? '正在连接豆包大模型流式语音识别' : '演示模式已启动，可用快捷语句模拟收音', this.speechStream ? 'neutral' : 'success');
   }
 
   pauseListening(): void {
@@ -259,10 +363,17 @@ export class LiveSession {
     if (this.stateValue.isListening) this.finishActiveSpeechStream();
     this.stateValue.captureState = 'ended';
     this.recordCaptureBoundary('capture.ended', occurredAt);
-    void this.audioWriteQueue.then(() => {
+    this.audioWriteQueue = this.audioWriteQueue.then(() => {
       this.timelineStore?.finalizeAudio(this.id);
       this.archiveQueue?.enqueue(this.id);
-    }).catch((error: unknown) => this.status(`音频切片合成失败：${error instanceof Error ? error.message : String(error)}`, 'error'));
+    });
+    void this.audioWriteQueue.catch((error: unknown) => this.status(`音频切片合成失败：${error instanceof Error ? error.message : String(error)}`, 'error'));
+    try {
+      const timeline = this.timelineStore?.exportSession(this.id);
+      if (timeline && this.presenter) this.phraseLibrary?.archiveSession(this.presenter.id, timeline);
+    } catch {
+      this.status('本场话术归档稍后重试', 'warning');
+    }
     this.broadcast({ type: 'state.snapshot', state: this.state });
     this.status('本场直播已结束，音频和转录可进行复核', 'success');
   }
@@ -272,6 +383,7 @@ export class LiveSession {
   }
 
   private finishActiveSpeechStream(): void {
+    this.cancelSpeechRecovery(true);
     const stream = this.speechStream;
     this.speechStream = null;
     if (stream) {
@@ -311,18 +423,75 @@ export class LiveSession {
     if (pending.byteLength >= AUDIO_CHUNK_BYTES) this.flushSourceChunk(sampleRate);
   }
 
-  private handleSpeechFailure(error: Error): void {
+  private handleSpeechFailure(error: Error, failedStream: DoubaoStreamingAsr | null, context: string | undefined): void {
     if (!this.stateValue.isListening) return;
+    if (isNextPacketTimeout(error) && this.speechRecoveryAttempt < SPEECH_RECOVERY_DELAYS_MS.length) {
+      this.beginSpeechRecovery(error, failedStream, context);
+      return;
+    }
     const occurredAt = this.now();
-    this.speechStream?.close();
+    this.cancelSpeechRecovery(true);
+    if (this.speechStream === failedStream) this.speechStream = null;
+    failedStream?.close();
     this.speechStream = null;
     this.stateValue.isListening = false;
     this.stateValue.captureState = 'paused';
     this.stateValue.partialTranscript = '';
     this.stateValue.lastEventAt = occurredAt;
-    this.recordTimeline('capture.failed', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, { message: error.message });
+    this.recordTimeline('capture.failed', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, speechFailurePayload(error));
     this.broadcast({ type: 'state.snapshot', state: this.state });
     this.status(speechFailureMessage(error), 'error');
+  }
+
+  private beginSpeechRecovery(error: Error, failedStream: DoubaoStreamingAsr | null, context: string | undefined): void {
+    const occurredAt = this.now();
+    this.clearSpeechRecoveryTimers();
+    if (this.speechStream === failedStream) this.speechStream = null;
+    failedStream?.close();
+    this.speechRecoveryAttempt += 1;
+    this.speechRecoveryStartedAt = occurredAt;
+    const delayMs = SPEECH_RECOVERY_DELAYS_MS[this.speechRecoveryAttempt - 1];
+    this.stateValue.partialTranscript = '';
+    this.stateValue.lastEventAt = occurredAt;
+    this.recordTimeline('asr.recovery.started', occurredAt, this.offsetAt(occurredAt), this.stateValue.product.id, {
+      ...speechFailurePayload(error),
+      attempt: this.speechRecoveryAttempt,
+      delayMs,
+    });
+    this.broadcast({ type: 'state.snapshot', state: this.state });
+    this.status(`连接短暂中断，正在恢复语音识别（第 ${this.speechRecoveryAttempt} 次）`, 'warning');
+    this.speechRecoveryTimer = setTimeout(() => {
+      this.speechRecoveryTimer = null;
+      if (!this.stateValue.isListening || this.stateValue.captureState !== 'live' || this.speechStream) return;
+      this.connectSpeechStream(context);
+    }, delayMs);
+    this.speechRecoveryTimer.unref();
+  }
+
+  private scheduleSpeechRecoveryReset(stream: DoubaoStreamingAsr | null): void {
+    if (this.speechRecoveryResetTimer) clearTimeout(this.speechRecoveryResetTimer);
+    this.speechRecoveryResetTimer = setTimeout(() => {
+      this.speechRecoveryResetTimer = null;
+      if (this.stateValue.isListening && this.speechStream === stream) {
+        this.speechRecoveryAttempt = 0;
+        this.speechRecoveryStartedAt = null;
+      }
+    }, SPEECH_RECOVERY_STABLE_MS);
+    this.speechRecoveryResetTimer.unref();
+  }
+
+  private clearSpeechRecoveryTimers(): void {
+    if (this.speechRecoveryTimer) clearTimeout(this.speechRecoveryTimer);
+    if (this.speechRecoveryResetTimer) clearTimeout(this.speechRecoveryResetTimer);
+    this.speechRecoveryTimer = null;
+    this.speechRecoveryResetTimer = null;
+  }
+
+  private cancelSpeechRecovery(resetAttempt: boolean): void {
+    this.clearSpeechRecoveryTimers();
+    if (!resetAttempt) return;
+    this.speechRecoveryAttempt = 0;
+    this.speechRecoveryStartedAt = null;
   }
 
   private releaseDrainingSpeechStream(stream: DoubaoStreamingAsr | null, close: boolean): void {
@@ -350,12 +519,22 @@ export class LiveSession {
       offsetMs: endOffsetMs,
       startOffsetMs,
       endOffsetMs,
+      speaker: 'host',
     };
     this.stateValue.lastEventAt = occurredAt;
     if (!isFinal) {
       this.stateValue.partialTranscript = text;
       this.broadcast({ type: 'transcript.partial', segment });
       return;
+    }
+    const mentionedProduct = findMentionedProduct(text, this.stateValue.lineup);
+    if (mentionedProduct && mentionedProduct.product.id !== this.stateValue.product.id) {
+      this.applyProductSelection(mentionedProduct.product, occurredAt, {
+        selectionSource: 'speech',
+        matchedTerm: mentionedProduct.matchedTerm,
+        matchType: mentionedProduct.matchType,
+        transcriptSegmentId: segment.id,
+      });
     }
     this.stateValue.partialTranscript = '';
     this.stateValue.transcriptHistory = [...this.stateValue.transcriptHistory, segment].slice(-20);
@@ -367,6 +546,7 @@ export class LiveSession {
       ...(normalized.applied.length > 0 ? { rawText: raw, appliedSpeechCorrectionIds: normalized.applied.map((entry) => entry.id) } : {}),
       startOffsetMs,
       endOffsetMs,
+      speaker: segment.speaker,
       audioStartSample: timing.startTimeMs === undefined ? null : this.currentCaptureSampleOffset + Math.round((timing.startTimeMs / 1000) * 16000),
       audioEndSample: timing.endTimeMs === undefined ? null : this.currentCaptureSampleOffset + Math.round((timing.endTimeMs / 1000) * 16000),
     });
@@ -427,6 +607,29 @@ export class LiveSession {
     return corrected;
   }
 
+  annotateSpeaker(segmentId: string, speaker: 'host' | 'other', actorId = this.actorId): TranscriptSegment | null {
+    const index = this.stateValue.transcriptHistory.findIndex((segment) => segment.id === segmentId && segment.isFinal);
+    const original = index >= 0 ? this.stateValue.transcriptHistory[index] : this.findPersistedTranscript(segmentId);
+    if (!original) return null;
+    if (original.speaker === speaker) return original;
+    const annotatedAt = this.now();
+    const annotated = { ...original, speaker };
+    if (index >= 0) {
+      const history = [...this.stateValue.transcriptHistory];
+      history[index] = annotated;
+      this.stateValue.transcriptHistory = history;
+    }
+    this.stateValue.lastEventAt = annotatedAt;
+    this.recordTimeline('transcript.annotated', annotatedAt, annotated.endOffsetMs, this.stateValue.product.id, {
+      segmentId,
+      speaker,
+      actorId,
+    });
+    if (index >= 0) this.broadcast({ type: 'transcript.final', segment: annotated });
+    this.broadcast({ type: 'state.snapshot', state: this.state });
+    return annotated;
+  }
+
   private findPersistedTranscript(segmentId: string): TranscriptSegment | null {
     const events = this.timelineStore?.exportSession(this.id)?.events ?? [];
     let segment: TranscriptSegment | null = null;
@@ -440,10 +643,14 @@ export class LiveSession {
           offsetMs: event.offsetMs,
           startOffsetMs: typeof event.payload.startOffsetMs === 'number' ? event.payload.startOffsetMs : null,
           endOffsetMs: typeof event.payload.endOffsetMs === 'number' ? event.payload.endOffsetMs : event.offsetMs,
+          speaker: event.payload.speaker === 'other' ? 'other' : 'host',
         };
       }
       if (segment && event.type === 'transcript.corrected' && event.payload.segmentId === segmentId && typeof event.payload.correctedText === 'string') {
         segment = { ...segment, text: event.payload.correctedText };
+      }
+      if (segment && event.type === 'transcript.annotated' && event.payload.segmentId === segmentId) {
+        segment = { ...segment, speaker: event.payload.speaker === 'other' ? 'other' : 'host' };
       }
     }
     return segment;
@@ -456,14 +663,76 @@ export class LiveSession {
     const requestNumber = ++this.analysisRequestNumber;
     this.latestAnalysisRequest = requestNumber;
     const queuedAt = performance.now();
-    void this.checkCompliance(segment.text, generation, product.id, product, segment, revision, requestNumber, queuedAt)
-      .catch((error: unknown) => this.status(`合规分析暂时不可用：${error instanceof Error ? error.message : String(error)}`, 'error'));
+    const riskProfile = this.stateValue.riskProfile;
+    const context = this.buildAnalysisContext(segment, riskProfile);
+    void this.checkCompliance(segment.text, generation, product.id, product, segment, revision, requestNumber, queuedAt, riskProfile, context)
+      .catch((error: unknown) => {
+        this.status(`合规分析暂时不可用：${error instanceof Error ? error.message : String(error)}`, 'error');
+        if (requestNumber === this.latestAnalysisRequest) this.enqueueCoach(segment, null);
+      });
   }
 
-  private async checkCompliance(transcript: string, generation: number, productId: string, product: Product, segment: TranscriptSegment, revision: number, requestNumber: number, queuedAt: number): Promise<void> {
+  private buildAnalysisContext(segment: TranscriptSegment, profile: RiskProfile): NonNullable<AnalysisInput['context']> {
+    const windowMs = profile === 'strict' ? 90_000 : profile === 'optimized' ? 45_000 : 60_000;
+    const maxSegments = profile === 'strict' ? 20 : profile === 'optimized' ? 8 : 12;
+    const windowStartMs = Math.max(this.stateValue.productContextStartedAt, segment.timestamp - windowMs);
+    const segments = this.stateValue.transcriptHistory
+      .filter((candidate) => candidate.isFinal && candidate.speaker !== 'other' && candidate.timestamp >= windowStartMs && candidate.timestamp <= segment.timestamp)
+      .slice(-maxSegments);
+    return {
+      text: segments.map((candidate) => candidate.text).join('\n').slice(-4_000),
+      segmentCount: segments.length,
+      windowStartMs,
+      windowEndMs: segment.timestamp,
+    };
+  }
+
+  private enqueueCoach(segment: TranscriptSegment, compliance: ComplianceResult | null): void {
+    const requestNumber = ++this.coachRequestNumber;
+    const input: CoachInput = {
+      product: this.stateValue.product,
+      transcript: segment.text,
+      compliance,
+      stats: this.stateValue.stats,
+      referencePhrases: this.phraseLibrary?.references(this.presenter?.id ?? this.stateValue.presenterId, this.stateValue.product.id).slice(0, 10).map((phrase) => ({ text: phrase.text, purpose: phrase.purpose })) ?? [],
+    };
+    const fallback = localSuggestions(input, this.now());
+    this.stateValue.coachSuggestion = fallback[0];
+    this.stateValue.coachSuggestions = fallback;
+    this.stateValue.coachPending = true;
+    this.broadcast({ type: 'state.snapshot', state: this.state });
+    const request = this.coach.suggestMany ? this.coach.suggestMany(input) : this.coach.suggest(input).then((suggestion) => [suggestion]);
+    void request.then((suggestions) => {
+      if (requestNumber !== this.coachRequestNumber) return;
+      const resolved = [...suggestions, ...fallback]
+        .filter((suggestion, index, all) => all.findIndex((item) => item.text === suggestion.text) === index)
+        .slice(0, 3);
+      this.stateValue.coachSuggestion = resolved[0] ?? fallback[0];
+      this.stateValue.coachSuggestions = resolved.length === 3 ? resolved : fallback;
+      this.stateValue.coachPending = false;
+      this.stateValue.coachSuggestions.forEach((suggestion, suggestionIndex) => {
+        this.recordTimeline('coach.suggestion', suggestion.createdAt, segment.endOffsetMs, input.product.id, {
+          transcriptSegmentId: segment.id,
+          suggestionIndex,
+          purpose: suggestion.purpose,
+          text: suggestion.text,
+          reason: suggestion.reason,
+          source: suggestion.source,
+          ...(suggestion.latencyMs === undefined ? {} : { latencyMs: suggestion.latencyMs }),
+        });
+      });
+      this.broadcast({ type: 'state.snapshot', state: this.state });
+    }).catch(() => {
+      if (requestNumber !== this.coachRequestNumber) return;
+      this.stateValue.coachPending = false;
+      this.broadcast({ type: 'state.snapshot', state: this.state });
+    });
+  }
+
+  private async checkCompliance(transcript: string, generation: number, productId: string, product: Product, segment: TranscriptSegment, revision: number, requestNumber: number, queuedAt: number, riskProfile: RiskProfile, context: NonNullable<AnalysisInput['context']>): Promise<void> {
     const analysisStartedAt = performance.now();
     const analysisStartedAtWallClock = this.now();
-    const analyzed = await this.analyzer.analyze({ roomId: this.roomId, productId, transcript, product, customRules: this.ruleCatalog?.listActive(this.roomId) });
+    const analyzed = await this.analyzer.analyze({ roomId: this.roomId, productId, transcript, product, customRules: this.ruleCatalog?.listActive(this.roomId), riskProfile, context });
     if (generation !== this.productGeneration || productId !== this.stateValue.product.id || revision !== this.segmentRevisions.get(segment.id)) return;
     const complianceAnalysisMs = Math.max(0, Math.round(performance.now() - analysisStartedAt));
     const completedAt = this.now();
@@ -497,10 +766,21 @@ export class LiveSession {
       confidence: result.confidence,
       source: result.source,
       analysisMs: result.analysisMs,
+      matchedTerms: result.matchedTerms ?? [],
+      ruleKind: result.ruleKind ?? 'sentence',
+      riskProfile,
+      contextSegmentCount: context.segmentCount,
+      contextWindowMs: Math.max(0, context.windowEndMs - context.windowStartMs),
       stageTimings,
     });
     this.broadcast({ type: 'compliance.result', result });
     this.broadcast({ type: 'state.snapshot', state: this.state });
+    if (requestNumber === this.latestAnalysisRequest) this.enqueueCoach(segment, result);
+    try {
+      this.ruleCatalog?.learnFromResult(this.roomId, this.id, result);
+    } catch {
+      // Rule learning is best-effort and must never interrupt the live session.
+    }
   }
 
   private currentAsrAudioByteLength(): number {
@@ -550,8 +830,11 @@ export class LiveSession {
     if (!timeline) return;
     const transcripts = new Map<string, TranscriptSegment>();
     const results = new Map<string, ComplianceResult>();
+    let latestCoach: SessionState['coachSuggestion'] = null;
+    let latestCoachSuggestions: NonNullable<SessionState['coachSuggestions']> = [];
     let selectedProductId = this.stateValue.product.id;
     let productContextStartedAt = this.stateValue.productContextStartedAt;
+    let riskProfile = this.stateValue.riskProfile;
     let maximumOffsetMs = 0;
     let captureState: CaptureState = 'idle';
 
@@ -565,6 +848,13 @@ export class LiveSession {
         selectedProductId = event.productId;
         productContextStartedAt = event.occurredAt;
       }
+      if (event.type === 'risk.profile.changed' && (event.payload.profile === 'strict' || event.payload.profile === 'balanced' || event.payload.profile === 'optimized')) {
+        riskProfile = event.payload.profile;
+      }
+      if ((event.type === 'session.created' || event.type === 'presenter.selected') && typeof event.payload.presenterId === 'string') {
+        this.stateValue.presenterId = event.payload.presenterId;
+        this.stateValue.presenterName = typeof event.payload.presenterName === 'string' ? event.payload.presenterName : this.stateValue.presenterName;
+      }
       if (event.type === 'transcript.final') {
         const segmentId = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
         const text = typeof event.payload.text === 'string' ? event.payload.text : '';
@@ -577,6 +867,7 @@ export class LiveSession {
           offsetMs: event.offsetMs,
           startOffsetMs: typeof event.payload.startOffsetMs === 'number' ? event.payload.startOffsetMs : null,
           endOffsetMs: typeof event.payload.endOffsetMs === 'number' ? event.payload.endOffsetMs : event.offsetMs,
+          speaker: event.payload.speaker === 'other' ? 'other' : 'host',
         });
         const match = /^segment-(\d+)$/u.exec(segmentId);
         if (match) this.segmentNumber = Math.max(this.segmentNumber, Number(match[1]) + 1);
@@ -610,7 +901,28 @@ export class LiveSession {
           transcript: segment.text,
           createdAt: event.occurredAt,
           ...(typeof event.payload.analysisMs === 'number' ? { analysisMs: Math.max(0, event.payload.analysisMs) } : {}),
+          ...(Array.isArray(event.payload.matchedTerms) ? { matchedTerms: event.payload.matchedTerms.filter((term): term is string => typeof term === 'string') } : {}),
+          ...(event.payload.ruleKind === 'term' || event.payload.ruleKind === 'context' || event.payload.ruleKind === 'sentence' ? { ruleKind: event.payload.ruleKind } : {}),
         });
+      }
+      if (event.type === 'coach.suggestion') {
+        const purpose = typeof event.payload.purpose === 'string' ? event.payload.purpose : '塑品';
+        const text = typeof event.payload.text === 'string' ? event.payload.text : '';
+        if (text) {
+          const suggestion: NonNullable<SessionState['coachSuggestion']> = {
+            id: `restored-${event.id}`,
+            purpose: purpose as NonNullable<SessionState['coachSuggestion']>['purpose'],
+            text,
+            reason: typeof event.payload.reason === 'string' ? event.payload.reason : '',
+            source: event.payload.source === 'doubao' ? 'doubao' : 'local-fallback',
+            createdAt: event.occurredAt,
+            ...(typeof event.payload.latencyMs === 'number' ? { latencyMs: event.payload.latencyMs } : {}),
+          };
+          const suggestionIndex = typeof event.payload.suggestionIndex === 'number' ? event.payload.suggestionIndex : 0;
+          if (suggestionIndex === 0) latestCoachSuggestions = [];
+          latestCoachSuggestions[suggestionIndex] = suggestion;
+          latestCoach = latestCoachSuggestions[0] ?? suggestion;
+        }
       }
     }
 
@@ -619,8 +931,13 @@ export class LiveSession {
     this.stateValue.product = this.stateValue.lineup.find((product) => product.id === selectedProductId) ?? this.stateValue.product;
     this.stateValue.captureState = captureState;
     this.stateValue.productContextStartedAt = productContextStartedAt;
+    this.stateValue.riskProfile = riskProfile;
+    this.presenter = this.phraseLibrary?.getPresenter(this.stateValue.presenterId) ?? this.presenter;
     this.stateValue.transcriptHistory = allTranscripts.slice(-20);
     this.stateValue.latestCompliance = allResults.at(-1) ?? null;
+    this.stateValue.coachSuggestion = latestCoach;
+    this.stateValue.coachSuggestions = latestCoachSuggestions.filter(Boolean).slice(0, 3);
+    this.stateValue.coachPending = false;
     this.stateValue.alerts = allResults.filter((result) => result.risk !== 'safe').reverse().slice(0, 12);
     this.stateValue.stats = {
       speakingSeconds: Math.round(maximumOffsetMs / 1_000),

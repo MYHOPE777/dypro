@@ -1,5 +1,8 @@
 export type RiskLevel = 'safe' | 'warning' | 'blocked';
+export type RiskProfile = 'strict' | 'balanced' | 'optimized';
 export type CaptureState = 'idle' | 'live' | 'paused' | 'ended';
+export type SpeakerLabel = 'host' | 'other';
+export type CoachPurpose = '塑品' | '憋单' | '逼单' | '转化' | '互动' | '留人' | '答疑';
 
 export type LiveRoom = {
   id: string;
@@ -38,6 +41,7 @@ export type TranscriptSegment = {
   offsetMs: number | null;
   startOffsetMs: number | null;
   endOffsetMs: number | null;
+  speaker?: SpeakerLabel;
 };
 
 export type TimelineEventType =
@@ -48,10 +52,17 @@ export type TimelineEventType =
   | 'capture.ended'
   | 'capture.stopped'
   | 'capture.failed'
+  | 'asr.error'
+  | 'asr.recovery.started'
+  | 'asr.recovery.succeeded'
   | 'lineup.updated'
   | 'product.selected'
   | 'transcript.final'
   | 'transcript.corrected'
+  | 'transcript.annotated'
+  | 'risk.profile.changed'
+  | 'presenter.selected'
+  | 'coach.suggestion'
   | 'compliance.result';
 
 export type TimelineEvent = {
@@ -108,6 +119,20 @@ export type ComplianceResult = {
   analysisMs?: number;
   /** Detailed server-side stages retained for timeline diagnostics. */
   analysisTiming?: ComplianceAnalysisTiming;
+  /** Terms or phrases identified as the reason for a non-safe result. */
+  matchedTerms?: string[];
+  /** Only stable term findings are eligible for automatic rule learning. */
+  ruleKind?: 'term' | 'sentence' | 'context';
+};
+
+export type CoachSuggestion = {
+  id: string;
+  purpose: CoachPurpose;
+  text: string;
+  reason: string;
+  source: 'doubao' | 'local-fallback';
+  createdAt: number;
+  latencyMs?: number;
 };
 
 export type ComplianceAnalysisTiming = {
@@ -130,6 +155,8 @@ export type SessionStats = {
 export type SessionState = {
   sessionId: string;
   roomId: string;
+  presenterId: string;
+  presenterName: string;
   product: Product;
   lineup: Product[];
   isListening: boolean;
@@ -137,6 +164,10 @@ export type SessionState = {
   partialTranscript: string;
   transcriptHistory: TranscriptSegment[];
   latestCompliance: ComplianceResult | null;
+  coachSuggestion?: CoachSuggestion | null;
+  coachSuggestions?: CoachSuggestion[];
+  coachPending?: boolean;
+  riskProfile: RiskProfile;
   /** Timestamp from which transcript belongs to the currently selected product. */
   productContextStartedAt: number;
   alerts: ComplianceResult[];
@@ -145,7 +176,7 @@ export type SessionState = {
 };
 
 export type ClientMessage =
-  | { type: 'session.join'; sessionId?: string; roomId?: string; actorId?: string; token?: string; role: 'operator' | 'display' }
+  | { type: 'session.join'; sessionId?: string; roomId?: string; displayAlias?: string; presenterId?: string; actorId?: string; token?: string; role: 'operator' | 'display' }
   | { type: 'control.start' }
   | { type: 'control.pause' }
   | { type: 'control.resume' }
@@ -153,7 +184,10 @@ export type ClientMessage =
   | { type: 'control.stop' }
   | { type: 'product.select'; productId: string }
   | { type: 'lineup.set'; productIds: string[] }
+  | { type: 'risk.profile'; profile: RiskProfile }
+  | { type: 'presenter.select'; presenterId: string }
   | { type: 'transcript.correct'; segmentId: string; text: string; learn?: boolean; wrongText?: string; correctText?: string }
+  | { type: 'transcript.speaker'; segmentId: string; speaker: SpeakerLabel }
   | { type: 'audio'; data: string }
   | { type: 'audio.raw'; data: string; sampleRate: number }
   | { type: 'demo.transcript'; text: string };
@@ -193,6 +227,12 @@ export type ComplianceRule = {
   enabled: boolean;
   status: ComplianceRuleStatus;
   version: number;
+  origin?: 'manual' | 'learned' | 'synced';
+  confidence?: number;
+  evidenceCount?: number;
+  evidenceRoomIds?: string[];
+  lastSeenAt?: number;
+  lastSessionId?: string;
   createdBy: string;
   approvedBy?: string;
   createdAt: number;
@@ -203,7 +243,7 @@ export type RuleAuditEntry = {
   id: string;
   ruleId: string;
   roomId: string;
-  action: 'created' | 'submitted' | 'approved' | 'rejected' | 'edited' | 'rolled_back' | 'disabled' | 'enabled';
+  action: 'created' | 'learned' | 'observed' | 'submitted' | 'approved' | 'rejected' | 'edited' | 'rolled_back' | 'disabled' | 'enabled';
   actorId: string;
   occurredAt: number;
   details: Record<string, unknown>;
@@ -231,4 +271,33 @@ export type SpeechCorrectionEntry = {
   updatedAt: number;
   lastSessionId: string;
   lastSegmentId: string;
+};
+
+export type PresenterProfile = {
+  id: string;
+  roomId: string;
+  accountName: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type PresenterPhraseStatus = 'draft' | 'reference' | 'retired';
+
+export type PresenterPhrase = {
+  id: string;
+  roomId: string;
+  presenterId: string;
+  productId: string | null;
+  purpose?: CoachPurpose;
+  text: string;
+  source: 'session' | 'manual' | 'doubao' | 'imported';
+  status: PresenterPhraseStatus;
+  version: number;
+  sourceSessionId?: string;
+  sourceSegmentId?: string;
+  parentPhraseId?: string;
+  usageCount: number;
+  createdAt: number;
+  updatedAt: number;
 };

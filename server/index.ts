@@ -16,10 +16,16 @@ import { parseProductText } from './productParser';
 import { AuthService, allowsControlTransport, canAccessRoom, type AuthIdentity } from './auth';
 import { readSessionIdleTtlMs } from './config';
 import { canDisplayJoin, CaptureLease } from './sessionAccess';
+import { DisplayLinkRegistry } from './displayLink';
 import { createRecordingArchiveQueue } from './recordingArchive';
+import { createRuleSyncQueue } from './ruleSync';
+import { FilePresenterPhraseLibrary } from './presenterPhraseLibrary';
+import { createPhraseSyncQueue } from './phraseSync';
 import { createDoubaoAnalyzer } from './services';
 import { getArkKnowledgeSearchStatus } from './providers/ark';
-import type { ClientMessage, ComplianceRuleScope, RiskLevel, Product } from '../src/shared/types';
+import { getArkConfig, requestArk } from './providers/ark';
+import { parseArkJson } from './providers/doubao';
+import type { ClientMessage, ComplianceRuleScope, CoachPurpose, RiskLevel, Product } from '../src/shared/types';
 
 const app = express();
 const server = http.createServer(app);
@@ -30,19 +36,27 @@ const projectRoot = path.dirname(fileURLToPath(import.meta.url));
 const clientDir = path.resolve(projectRoot, '../dist/client');
 const timelineStore = new FileTimelineStore(process.env.TIMELINE_DATA_DIR ?? path.resolve(projectRoot, '../.data/timeline'));
 const productCatalog = new FileProductCatalog(process.env.PRODUCT_CATALOG_PATH ?? path.resolve(projectRoot, '../.data/products/catalog.json'));
-const ruleCatalog = new FileRuleCatalog(productCatalog, process.env.RULE_CATALOG_PATH ?? path.resolve(projectRoot, '../.data/rules/catalog.json'));
+const ruleSyncQueue = createRuleSyncQueue(process.env);
+const ruleCatalog = new FileRuleCatalog(productCatalog, process.env.RULE_CATALOG_PATH ?? path.resolve(projectRoot, '../.data/rules/catalog.json'), process.env.RULE_REVIEWER_ACTOR_ID ?? 'owner', (event) => { ruleSyncQueue.enqueue(event); });
+const phraseSyncQueue = createPhraseSyncQueue(process.env);
+const phraseLibrary = new FilePresenterPhraseLibrary(process.env.PHRASE_LIBRARY_PATH ?? path.resolve(projectRoot, '../.data/phrases/catalog.json'), (event) => { phraseSyncQueue.enqueue(event); });
 const speechCorrectionCatalog = new FileSpeechCorrectionCatalog(process.env.SPEECH_CORRECTION_CATALOG_PATH ?? path.resolve(projectRoot, '../.data/speech-corrections/catalog.json'));
 const authService = new AuthService(process.env);
 const requestIdentities = new WeakMap<express.Request, AuthIdentity>();
 const loginAttempts = new Map<string, { failures: number; blockedUntil: number }>();
 const sessionExpiryTimers = new Map<string, NodeJS.Timeout>();
 const captureLeases = new CaptureLease<WebSocket>();
+const displayLinks = new DisplayLinkRegistry();
 const sessionIdleTtlMs = readSessionIdleTtlMs(process.env);
 const allowInsecureAuth = process.env.ALLOW_INSECURE_AUTH === 'true';
 const complianceAnalyzer = createDoubaoAnalyzer(process.env);
 const recordingArchiveQueue = createRecordingArchiveQueue(timelineStore, process.env, (sessionId) => !sessions.get(sessionId)?.state.isListening);
 const recordingArchiveTimer = setInterval(() => { void recordingArchiveQueue.flush(); }, 10_000);
 recordingArchiveTimer.unref();
+const ruleSyncTimer = setInterval(() => { void ruleSyncQueue.flush(); }, 10_000);
+ruleSyncTimer.unref();
+const phraseSyncTimer = setInterval(() => { void phraseSyncQueue.flush(); }, 10_000);
+phraseSyncTimer.unref();
 let websocketConnectionsAccepted = 0;
 
 app.use(cors());
@@ -52,13 +66,17 @@ function safeRoomId(value: unknown): string {
   return typeof value === 'string' && /^room-[a-z0-9-]{4,64}$/u.test(value) ? value : 'room-default';
 }
 
-function getOrCreateSession(id?: string, roomId = 'room-default', actorId = 'owner'): LiveSession {
+function getOrCreateSession(id?: string, roomId = 'room-default', actorId = 'owner', presenterId?: string): LiveSession {
   const safeId = id && /^live-[a-z0-9-]{4,32}$/u.test(id) ? id : undefined;
   if (safeId && sessions.has(safeId)) {
     const existing = sessions.get(safeId)!;
     if (existing.roomId === roomId) return existing;
   }
-  const session = new LiveSession(safeId && !sessions.has(safeId) ? safeId : undefined, { timelineStore, productCatalog, ruleCatalog, speechCorrectionCatalog, archiveQueue: recordingArchiveQueue, analyzer: complianceAnalyzer, roomId, actorId });
+  const room = productCatalog.getRoom(roomId);
+  const defaultPresenter = phraseLibrary.createPresenter({ roomId, accountName: room?.accountName ?? roomId, name: process.env.DEFAULT_PRESENTER_NAME?.trim() || '默认主播' });
+  const requestedPresenter = presenterId ? phraseLibrary.getPresenter(presenterId) : null;
+  const presenter = requestedPresenter?.roomId === roomId ? requestedPresenter : defaultPresenter;
+  const session = new LiveSession(safeId && !sessions.has(safeId) ? safeId : undefined, { timelineStore, productCatalog, ruleCatalog, speechCorrectionCatalog, phraseLibrary, presenter, archiveQueue: recordingArchiveQueue, analyzer: complianceAnalyzer, roomId, actorId });
   sessions.set(session.id, session);
   return session;
 }
@@ -90,6 +108,8 @@ function isClientMessage(value: unknown): value is ClientMessage {
     case 'session.join':
       return (message.sessionId === undefined || (typeof message.sessionId === 'string' && message.sessionId.length <= 64))
         && (message.roomId === undefined || typeof message.roomId === 'string')
+        && (message.displayAlias === undefined || (typeof message.displayAlias === 'string' && /^[A-Z0-9]{8}$/u.test(message.displayAlias)))
+        && (message.presenterId === undefined || (typeof message.presenterId === 'string' && /^presenter-[a-f0-9]{14}$/u.test(message.presenterId)))
         && (message.actorId === undefined || typeof message.actorId === 'string')
         && (message.token === undefined || typeof message.token === 'string')
         && (message.role === 'operator' || message.role === 'display');
@@ -103,6 +123,10 @@ function isClientMessage(value: unknown): value is ClientMessage {
       return typeof message.productId === 'string' && message.productId.length <= 64;
     case 'lineup.set':
       return Array.isArray(message.productIds) && message.productIds.length <= 100 && message.productIds.every((productId) => typeof productId === 'string' && productId.length <= 64);
+    case 'risk.profile':
+      return message.profile === 'strict' || message.profile === 'balanced' || message.profile === 'optimized';
+    case 'presenter.select':
+      return typeof message.presenterId === 'string' && /^presenter-[a-f0-9]{14}$/u.test(message.presenterId);
     case 'audio':
       return typeof message.data === 'string' && message.data.length <= 2_000_000;
     case 'audio.raw':
@@ -115,6 +139,9 @@ function isClientMessage(value: unknown): value is ClientMessage {
         && (message.learn === undefined || typeof message.learn === 'boolean')
         && (message.wrongText === undefined || (typeof message.wrongText === 'string' && message.wrongText.length <= 80))
         && (message.correctText === undefined || (typeof message.correctText === 'string' && message.correctText.length <= 80));
+    case 'transcript.speaker':
+      return typeof message.segmentId === 'string' && message.segmentId.length <= 128
+        && (message.speaker === 'host' || message.speaker === 'other');
     default:
       return false;
   }
@@ -131,7 +158,7 @@ function getLanAddress(): string {
 }
 
 app.get('/api/health', (_request, response) => {
-  response.json({ ok: true, sessions: sessions.size, clients: [...sessions.values()].reduce((total, session) => total + session.clientCount, 0), websocketConnectionsAccepted, rooms: productCatalog.listRooms().length, streamingAsrConfigured: Boolean(process.env.X_API_KEY), arkResponsesConfigured: Boolean(process.env.ARK_API_KEY && process.env.ARK_MODEL), authMode: authService.configured ? 'multi-user' : 'local-only' });
+  response.json({ ok: true, sessions: sessions.size, clients: [...sessions.values()].reduce((total, session) => total + session.clientCount, 0), websocketConnectionsAccepted, rooms: productCatalog.listRooms().length, streamingAsrConfigured: Boolean(process.env.X_API_KEY), arkResponsesConfigured: Boolean(process.env.ARK_API_KEY && process.env.ARK_MODEL), authMode: authService.configured ? 'multi-user' : 'local-only', ruleSync: ruleSyncQueue.status(), phraseSync: phraseSyncQueue.status() });
 });
 
 function actorFromRequest(request: express.Request): string {
@@ -204,6 +231,15 @@ function ruleRoomId(ruleId: string): string | null {
   return ruleCatalog.versions(ruleId).at(-1)?.roomId ?? null;
 }
 
+function presenterRoomId(presenterId: string): string | null {
+  return phraseLibrary.getPresenter(presenterId)?.roomId ?? null;
+}
+
+function phraseRoomId(phraseId: string): string | null {
+  const phrase = phraseLibrary.getPhrase(phraseId);
+  return phrase?.roomId ?? null;
+}
+
 const requireRuleAccess: express.RequestHandler = (request, response, next) => {
   try {
     const roomId = ruleRoomId(routeParam(request, 'ruleId'));
@@ -213,6 +249,24 @@ const requireRuleAccess: express.RequestHandler = (request, response, next) => {
   } catch (error) {
     response.status(403).json({ message: error instanceof Error ? error.message : '规则权限校验失败' });
   }
+};
+
+const requirePresenterAccess: express.RequestHandler = (request, response, next) => {
+  try {
+    const roomId = presenterRoomId(routeParam(request, 'presenterId'));
+    if (!roomId) return response.status(404).json({ message: '主播档案不存在' });
+    assertRoomAccess(identityFromRequest(request), roomId);
+    next();
+  } catch (error) { response.status(403).json({ message: error instanceof Error ? error.message : '主播档案权限校验失败' }); }
+};
+
+const requirePhraseAccess: express.RequestHandler = (request, response, next) => {
+  try {
+    const roomId = phraseRoomId(routeParam(request, 'phraseId'));
+    if (!roomId) return response.status(404).json({ message: '话术不存在' });
+    assertRoomAccess(identityFromRequest(request), roomId);
+    next();
+  } catch (error) { response.status(403).json({ message: error instanceof Error ? error.message : '话术权限校验失败' }); }
 };
 
 function persistedSessionRoomId(sessionId: string): string | null {
@@ -270,6 +324,8 @@ app.get('/api/readiness', (_request, response) => {
   const objectStorageConfigured = archiveStatus.configured;
   const redisConfigured = Boolean(process.env.REDIS_URL);
   const knowledge = getArkKnowledgeSearchStatus(process.env);
+  const ruleSync = ruleSyncQueue.status();
+  const phraseSync = phraseSyncQueue.status();
   const liveConfigured = streamingAsrConfigured && arkResponsesConfigured;
   const productionConfigured = liveConfigured && authService.configured && databaseConfigured && objectStorageConfigured && redisConfigured;
   response.json({
@@ -284,8 +340,13 @@ app.get('/api/readiness', (_request, response) => {
     objectStorage: { configured: objectStorageConfigured, label: objectStorageConfigured ? 'TOS 原始音频归档已配置' : 'TOS 原始音频归档待配置', status: archiveStatus },
     redis: { configured: redisConfigured, label: redisConfigured ? 'Redis 会话协调已配置' : 'Redis 会话协调待配置' },
     knowledge,
+    ruleSync: { ...ruleSync, label: ruleSync.configured ? '规则库后台同步已配置' : '规则库本地优先，云端同步待配置' },
+    phraseSync: { ...phraseSync, label: phraseSync.configured ? '主播话术后台同步已配置' : '主播话术本地优先，云端同步待配置' },
   });
 });
+
+app.get('/api/rules/sync/status', requireOperator, (_request, response) => response.json(ruleSyncQueue.status()));
+app.get('/api/phrases/sync/status', requireOperator, (_request, response) => response.json(phraseSyncQueue.status()));
 
 app.get('/api/knowledge/status', requireOperator, (_request, response) => response.json({ knowledge: getArkKnowledgeSearchStatus(process.env) }));
 
@@ -313,6 +374,25 @@ function readRuleInput(value: unknown): { name: string; scope: ComplianceRuleSco
   return { scope, matchType, risk, name: rule.name as string, pattern: rule.pattern as string, title: rule.title as string, reason: rule.reason as string, alternative: rule.alternative as string, policyRef: rule.policyRef as string };
 }
 
+function readPresenterInput(value: unknown): { name: string; accountName: string } | null {
+  if (!value || typeof value !== 'object') return null;
+  const input = value as Record<string, unknown>;
+  if (typeof input.name !== 'string' || typeof input.accountName !== 'string' || !input.name.trim() || !input.accountName.trim()) return null;
+  return { name: input.name.trim().slice(0, 80), accountName: input.accountName.trim().slice(0, 120) };
+}
+
+function validPurpose(value: unknown): value is CoachPurpose {
+  return value === '塑品' || value === '憋单' || value === '逼单' || value === '转化' || value === '互动' || value === '留人' || value === '答疑';
+}
+
+function readPhraseInput(value: unknown): { text: string; productId: string | null; purpose?: CoachPurpose; source: 'manual' | 'imported' } | null {
+  if (!value || typeof value !== 'object' || typeof (value as Record<string, unknown>).text !== 'string') return null;
+  const phrase = value as Record<string, unknown>;
+  const text = String(phrase.text).trim();
+  if (!text || text.length > 2_000) return null;
+  return { text, productId: typeof phrase.productId === 'string' ? phrase.productId : null, ...(validPurpose(phrase.purpose) ? { purpose: phrase.purpose } : {}), source: phrase.source === 'imported' ? 'imported' : 'manual' };
+}
+
 app.get('/api/rooms', requireOperator, (request, response) => {
   const identity = identityFromRequest(request);
   response.json(productCatalog.listRooms().filter((room) => canAccessRoom(identity, room)));
@@ -330,6 +410,55 @@ app.post('/api/rooms', requireOperator, (request, response) => {
 app.get('/api/rooms/:roomId', requireOperator, requireRoomAccess, (request, response) => {
   const room = productCatalog.getRoom(routeParam(request, 'roomId'));
   return room ? response.json(room) : response.status(404).json({ message: '直播间不存在' });
+});
+
+app.get('/api/rooms/:roomId/presenters', requireOperator, requireRoomAccess, (request, response) => response.json(phraseLibrary.listPresenters(routeParam(request, 'roomId'))));
+app.post('/api/rooms/:roomId/presenters', requireOperator, requireRoomAccess, (request, response) => {
+  const input = readPresenterInput(request.body);
+  if (!input) return response.status(400).json({ message: '主播名称和账号不能为空' });
+  try { return response.status(201).json(phraseLibrary.createPresenter({ roomId: routeParam(request, 'roomId'), ...input })); }
+  catch (error) { return response.status(400).json({ message: error instanceof Error ? error.message : '主播档案创建失败' }); }
+});
+
+app.get('/api/presenters/:presenterId/phrases', requireOperator, requirePresenterAccess, (request, response) => {
+  const productId = typeof request.query.productId === 'string' ? request.query.productId : undefined;
+  const phrases = phraseLibrary.listPhrases(routeParam(request, 'presenterId'));
+  return response.json(productId ? phrases.filter((phrase) => phrase.productId === null || phrase.productId === productId) : phrases);
+});
+app.post('/api/presenters/:presenterId/phrases', requireOperator, requirePresenterAccess, (request, response) => {
+  const input = readPhraseInput(request.body);
+  if (!input) return response.status(400).json({ message: '话术内容格式不完整' });
+  try { return response.status(201).json(phraseLibrary.createPhrase(routeParam(request, 'presenterId'), input)); }
+  catch (error) { return response.status(400).json({ message: error instanceof Error ? error.message : '话术保存失败' }); }
+});
+app.get('/api/phrases/:phraseId/versions', requireOperator, requirePhraseAccess, (request, response) => response.json(phraseLibrary.versions(routeParam(request, 'phraseId'))));
+app.patch('/api/phrases/:phraseId', requireOperator, requirePhraseAccess, (request, response) => {
+  if (typeof request.body?.text !== 'string' || !request.body.text.trim()) return response.status(400).json({ message: '话术内容不能为空' });
+  try { return response.json(phraseLibrary.revise(routeParam(request, 'phraseId'), { text: request.body.text, ...(validPurpose(request.body.purpose) ? { purpose: request.body.purpose } : {}), source: request.body.source === 'doubao' ? 'doubao' : 'manual' })); }
+  catch (error) { return response.status(400).json({ message: error instanceof Error ? error.message : '话术修改失败' }); }
+});
+app.post('/api/phrases/:phraseId/reference', requireOperator, requirePhraseAccess, (request, response) => {
+  if (typeof request.body?.selected !== 'boolean') return response.status(400).json({ message: 'selected 必须是布尔值' });
+  try { return response.json(phraseLibrary.setReference(routeParam(request, 'phraseId'), request.body.selected)); }
+  catch (error) { return response.status(400).json({ message: error instanceof Error ? error.message : '话术参考状态更新失败' }); }
+});
+app.post('/api/phrases/:phraseId/rollback', requireOperator, requirePhraseAccess, (request, response) => {
+  const targetVersion = Number(request.body?.targetVersion);
+  if (!Number.isInteger(targetVersion) || targetVersion < 1) return response.status(400).json({ message: '目标版本无效' });
+  try { return response.json(phraseLibrary.rollback(routeParam(request, 'phraseId'), targetVersion)); }
+  catch (error) { return response.status(400).json({ message: error instanceof Error ? error.message : '话术回滚失败' }); }
+});
+app.post('/api/phrases/:phraseId/rewrite', requireOperator, requirePhraseAccess, async (request, response) => {
+  const phrase = phraseLibrary.getPhrase(routeParam(request, 'phraseId'));
+  if (!phrase) return response.status(404).json({ message: '话术不存在' });
+  const config = getArkConfig(process.env, 'ARK_PHRASE_REWRITE_TIMEOUT_MS', 4_000);
+  if (!config) return response.status(503).json({ message: '豆包改写待配置，仍可使用人工编辑' });
+  try {
+    const content = await requestArk(config, '你是直播话术教练。只输出 JSON：{"text":"改写后话术","purpose":"塑品|憋单|逼单|转化|互动|留人|答疑"}。不得添加未提供的价格、库存、功效或赠品承诺，保持真实、自然、可直接朗读。', JSON.stringify({ phrase: phrase.text, productId: phrase.productId, purpose: phrase.purpose ?? '塑品' }), 240, Boolean(config.knowledgeResourceId));
+    const result = parseArkJson(content);
+    if (typeof result.text !== 'string' || !result.text.trim()) throw new Error('豆包未返回有效话术');
+    return response.json(phraseLibrary.revise(phrase.id, { text: result.text, purpose: validPurpose(result.purpose) ? result.purpose : phrase.purpose, source: 'doubao' }));
+  } catch (error) { return response.status(400).json({ message: error instanceof Error ? error.message : '豆包改写失败' }); }
 });
 
 app.get('/api/rooms/:roomId/products', requireOperator, requireRoomAccess, (request, response) => {
@@ -456,9 +585,20 @@ app.put('/api/session/:id/lineup', requireOperator, (request, response) => {
   }
 });
 
-app.get('/api/network', (_request, response) => {
+function networkOrigin(): string {
   const clientPort = existsSync(clientDir) ? port : Number(process.env.CLIENT_PORT ?? 5173);
-  response.json({ origin: `http://${getLanAddress()}:${clientPort}` });
+  return `http://${getLanAddress()}:${clientPort}`;
+}
+
+app.get('/api/network', (_request, response) => {
+  response.json({ origin: networkOrigin() });
+});
+
+app.post('/api/session/:id/display-link', requireOperator, requireSessionAccess, (request, response) => {
+  const session = sessions.get(routeParam(request, 'id'));
+  if (!session) return response.status(404).json({ message: 'session not found' });
+  const link = displayLinks.getOrCreate(session.id, session.roomId);
+  return response.json({ ...link, displayUrl: `${networkOrigin()}/screen/${link.alias}`, expiresInSeconds: Math.max(0, Math.ceil((link.expiresAt - Date.now()) / 1_000)) });
 });
 
 app.get('/api/session/:id', requireOperator, requireSessionAccess, (request, response) => {
@@ -484,18 +624,23 @@ app.get('/api/session/:id/timeline.jsonl', requireOperator, requireSessionAccess
 
 app.patch('/api/session/:id/transcripts/:segmentId', requireOperator, requireSessionAccess, (request, response) => {
   const text = typeof request.body?.text === 'string' ? request.body.text.trim() : '';
-  if (!text || text.length > 2_000) return response.status(400).json({ message: '修正后的转录不能为空且不能超过 2000 个字符' });
+  const speaker = request.body?.speaker === 'host' || request.body?.speaker === 'other' ? request.body.speaker : undefined;
+  if (request.body?.speaker !== undefined && !speaker) return response.status(400).json({ message: '说话人标记只能是主播或其他人' });
+  if (!text && !speaker) return response.status(400).json({ message: '请提供转录修正内容或说话人标记' });
+  if (text.length > 2_000) return response.status(400).json({ message: '修正后的转录不能超过 2000 个字符' });
   const wrongText = typeof request.body?.wrongText === 'string' ? request.body.wrongText.trim() : undefined;
   const correctText = typeof request.body?.correctText === 'string' ? request.body.correctText.trim() : undefined;
   if ((wrongText && wrongText.length > 80) || (correctText && correctText.length > 80)) return response.status(400).json({ message: '单个纠错词不能超过 80 个字符' });
   const session = sessions.get(routeParam(request, 'id'));
   if (!session) return response.status(404).json({ message: '直播会话尚未载入' });
   try {
-    const segment = session.correctTranscript(routeParam(request, 'segmentId'), text, actorFromRequest(request), {
+    const segmentId = routeParam(request, 'segmentId');
+    const corrected = text ? session.correctTranscript(segmentId, text, actorFromRequest(request), {
       learn: request.body?.learn === true,
       wrongText,
       correctText,
-    });
+    }) : null;
+    const segment = speaker ? session.annotateSpeaker(segmentId, speaker, actorFromRequest(request)) : corrected;
     return segment ? response.json({ segment }) : response.status(404).json({ message: '转录片段不存在' });
   } catch (error) {
     return response.status(400).json({ message: error instanceof Error ? error.message : '转录纠错失败' });
@@ -569,7 +714,10 @@ wsServer.on('connection', (socket: WebSocket, request) => {
           session = null;
         }
         role = message.role;
-        const requestedRoomId = safeRoomId(message.roomId);
+        const displayLink = role === 'display' && message.displayAlias ? displayLinks.resolve(message.displayAlias) : null;
+        if (role === 'display' && message.displayAlias && !displayLink) return sendError('主播屏二维码已过期，请从控制台重新打开二维码');
+        const requestedRoomId = displayLink?.roomId ?? safeRoomId(message.roomId);
+        const requestedSessionId = displayLink?.sessionId ?? message.sessionId;
         if (role === 'operator') {
           try {
             assertControlTransport(request);
@@ -581,17 +729,17 @@ wsServer.on('connection', (socket: WebSocket, request) => {
           }
         } else {
           actorId = 'display';
-          const persisted = message.sessionId ? timelineStore.exportSession(message.sessionId) : null;
+          const persisted = requestedSessionId ? timelineStore.exportSession(requestedSessionId) : null;
           const persistedRoomId = persisted?.events.find((event) => event.type === 'session.created')?.payload.roomId;
           const displayCanJoin = canDisplayJoin(
-            message.sessionId,
+            requestedSessionId,
             requestedRoomId,
-            message.sessionId ? sessions.get(message.sessionId)?.roomId ?? null : null,
+            requestedSessionId ? sessions.get(requestedSessionId)?.roomId ?? null : null,
             typeof persistedRoomId === 'string' ? persistedRoomId : null,
           );
           if (!displayCanJoin) return sendError('主播屏链接无效，请从控制台重新打开主播屏');
         }
-        session = getOrCreateSession(message.sessionId, requestedRoomId, actorId);
+        session = getOrCreateSession(requestedSessionId, requestedRoomId, actorId, message.presenterId);
         const expiryTimer = sessionExpiryTimers.get(session.id);
         if (expiryTimer) clearTimeout(expiryTimer);
         sessionExpiryTimers.delete(session.id);
@@ -633,6 +781,15 @@ wsServer.on('connection', (socket: WebSocket, request) => {
         case 'lineup.set':
           session.setLineup(message.productIds, actorId);
           break;
+        case 'risk.profile':
+          session.setRiskProfile(message.profile, actorId);
+          break;
+        case 'presenter.select': {
+          const presenter = phraseLibrary.getPresenter(message.presenterId);
+          if (!presenter || presenter.roomId !== session.roomId) return sendError('主播档案不存在或不属于当前直播间');
+          session.setPresenter(presenter, actorId);
+          break;
+        }
         case 'audio':
           if (!captureLeases.owns(session.id, socket)) break;
           session.ingestAudio(Buffer.from(message.data, 'base64'));
@@ -646,6 +803,9 @@ wsServer.on('connection', (socket: WebSocket, request) => {
           break;
         case 'transcript.correct':
           session.correctTranscript(message.segmentId, message.text, actorId, message);
+          break;
+        case 'transcript.speaker':
+          session.annotateSpeaker(message.segmentId, message.speaker, actorId);
           break;
         default:
           break;

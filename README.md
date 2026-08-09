@@ -42,7 +42,7 @@ npm start
 
 ## 火山引擎参数
 
-流式语音识别连接使用双向流式优化版 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`。并发版资源 ID 使用 `volc.bigasr.sauc.concurrent`，小时版使用 `volc.bigasr.sauc.duration`，以控制台开通的资源为准。服务端优先使用新版 `X-Api-Key` 鉴权，也兼容旧版 `X-Api-App-Key` + `X-Api-Access-Key`；旧版页面的 Secret Key 不直接发送到 SAUC WebSocket。服务端还实现官方协议中的 full client request、无序号 audio-only request、gzip 压缩、`request.corpus` 热词/替换词/上下文和最终帧标记；如果账号开通的是其他资源 ID，只需修改 `X_API_RESOURCE_ID`。火山引擎服务端约 8 秒未收到下一音频包会返回 `45000081`，主播停顿时服务端会在 2 秒空闲后发送 100 ms 静音 audio-only 保活帧；该帧仅发给 ASR，不会保存到任何录音或时间线资产。
+豆包大模型流式语音识别（ASR）连接使用官方“双向流式模式（优化版本）”接口 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`。并发版资源 ID 使用 `volc.bigasr.sauc.concurrent`，小时版使用 `volc.bigasr.sauc.duration`，以控制台开通的资源为准。服务端优先使用新版 `X-Api-Key` 鉴权，也兼容旧版 `X-Api-App-Key` + `X-Api-Access-Key`；旧版页面的 Secret Key 不直接发送到 SAUC WebSocket。服务端还实现官方协议中的 full client request、无序号 audio-only request、gzip 压缩、`request.corpus` 热词/替换词/上下文和最终帧标记；如果账号开通的是其他资源 ID，只需修改 `X_API_RESOURCE_ID`。火山引擎服务端约 8 秒未收到下一音频包会返回 `45000081`，主播停顿时服务端会在约 400 ms 空闲后以约 400 ms 间隔发送 100 ms 静音 audio-only 保活帧；若仍发生等包超时，会自动进行有限次数重连。保活帧仅发给 ASR，不会保存到任何录音或时间线资产。
 
 ## 时间线与原始音频
 
@@ -139,7 +139,7 @@ npm run auth:hash -- '至少8位的强密码'
 对外商用部署时，建议把当前 Node 服务拆成“租户控制面 + 直播边缘采集端”：
 
 - 控制面放在服务区，负责账号、租户、直播间、商品库、规则版本、审核、审计和复盘查询。
-- 每个 MacBook 作为一个直播边缘节点，蓝牙麦克风和实时 ASR 音频留在本地；通过短连接/安全 WebSocket 只上送转录和告警，不把原始音频放进实时链路。
+- 每个 MacBook 作为一个直播边缘节点，蓝牙麦克风和豆包大模型流式语音识别（ASR）音频留在本地；通过短连接/安全 WebSocket 只上送转录和告警，不把原始音频放进实时链路。
 - PostgreSQL/MySQL 保存业务事实，Redis 负责会话状态、采集租约和跨进程协调，TOS 保存下播后的原始音频、录屏和导出文件，方舟知识库保存可检索的规则/案例副本。
 - `tenantId` 已在房间和认证身份上预留；本地旧数据自动归入 `tenant-default`。SaaS 阶段必须在数据库查询、对象存储 key、Redis key 和知识库 metadata 中同时带租户标识。
 

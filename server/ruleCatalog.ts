@@ -2,8 +2,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import safeRegex from 'safe-regex2';
-import type { ComplianceRule, ComplianceRuleScope, ComplianceRuleStatus, LiveRoom, RuleAuditEntry, RiskLevel } from '../src/shared/types';
+import type { ComplianceResult, ComplianceRule, ComplianceRuleScope, ComplianceRuleStatus, LiveRoom, RuleAuditEntry, RiskLevel } from '../src/shared/types';
 import type { ProductCatalog } from './productCatalog';
+
+export type RuleMutationListener = (event: { action: RuleAuditEntry['action']; rule: ComplianceRule; occurredAt: number }) => void;
 
 type RuleInput = {
   name: string;
@@ -35,6 +37,14 @@ export interface RuleCatalog {
   setEnabled(ruleId: string, enabled: boolean, actorId: string): ComplianceRule;
   versions(ruleId: string): ComplianceRule[];
   audits(roomId: string): RuleAuditEntry[];
+  learnFromResult(roomId: string, sessionId: string, result: ComplianceResult): ComplianceRule[];
+}
+
+const DEFAULT_LEARNING_CONFIDENCE = 0.93;
+
+function learningConfidenceFromEnv(env: NodeJS.ProcessEnv): number {
+  const configured = Number(env.RULE_LEARNING_MIN_CONFIDENCE);
+  return Number.isFinite(configured) && configured >= 0.8 && configured <= 1 ? configured : DEFAULT_LEARNING_CONFIDENCE;
 }
 
 function clone<T>(value: T): T {
@@ -53,12 +63,16 @@ export class FileRuleCatalog implements RuleCatalog {
   private readonly filePath: string;
   private readonly productCatalog: Pick<ProductCatalog, 'getRoom' | 'listRooms'>;
   private readonly reviewerActorId: string;
+  private readonly onMutation?: RuleMutationListener;
+  private readonly learningConfidence: number;
   private data: RuleFile;
 
-  constructor(productCatalog: Pick<ProductCatalog, 'getRoom' | 'listRooms'>, filePath = path.resolve(process.cwd(), '.data/rules/catalog.json'), reviewerActorId = process.env.RULE_REVIEWER_ACTOR_ID ?? 'owner') {
+  constructor(productCatalog: Pick<ProductCatalog, 'getRoom' | 'listRooms'>, filePath = path.resolve(process.cwd(), '.data/rules/catalog.json'), reviewerActorId = process.env.RULE_REVIEWER_ACTOR_ID ?? 'owner', onMutation?: RuleMutationListener, learningConfidence = learningConfidenceFromEnv(process.env)) {
     this.productCatalog = productCatalog;
     this.filePath = filePath;
     this.reviewerActorId = reviewerActorId;
+    this.onMutation = onMutation;
+    this.learningConfidence = learningConfidence;
     this.data = this.readFile();
   }
 
@@ -88,6 +102,7 @@ export class FileRuleCatalog implements RuleCatalog {
       enabled: true,
       status: this.nextStatus(input.scope, actorId, room),
       version: 1,
+      origin: 'manual',
       createdBy: actorId,
       createdAt: now,
       updatedAt: now,
@@ -97,6 +112,7 @@ export class FileRuleCatalog implements RuleCatalog {
     this.data.versions[rule.id] = [clone(rule)];
     this.audit(rule, 'created', actorId, { status: rule.status });
     this.writeFile();
+    this.notify('created', rule);
     return clone(rule);
   }
 
@@ -122,6 +138,7 @@ export class FileRuleCatalog implements RuleCatalog {
     this.data.versions[ruleId] = [...(this.data.versions[ruleId] ?? []), clone(next)];
     this.audit(next, 'edited', actorId, { status: next.status, version: next.version });
     this.writeFile();
+    this.notify('edited', next);
     return clone(next);
   }
 
@@ -134,6 +151,7 @@ export class FileRuleCatalog implements RuleCatalog {
     this.data.versions[ruleId] = [...(this.data.versions[ruleId] ?? []), clone(next)];
     this.audit(next, 'approved', actorId, { version: next.version });
     this.writeFile();
+    this.notify('approved', next);
     return clone(next);
   }
 
@@ -146,6 +164,7 @@ export class FileRuleCatalog implements RuleCatalog {
     this.data.versions[ruleId] = [...(this.data.versions[ruleId] ?? []), clone(next)];
     this.audit(next, 'rejected', actorId, { reason, version: next.version });
     this.writeFile();
+    this.notify('rejected', next);
     return clone(next);
   }
 
@@ -160,6 +179,7 @@ export class FileRuleCatalog implements RuleCatalog {
     this.data.versions[ruleId] = [...(this.data.versions[ruleId] ?? []), clone(next)];
     this.audit(next, 'rolled_back', actorId, { targetVersion, version: next.version });
     this.writeFile();
+    this.notify('rolled_back', next);
     return clone(next);
   }
 
@@ -172,6 +192,7 @@ export class FileRuleCatalog implements RuleCatalog {
     this.data.versions[ruleId] = [...(this.data.versions[ruleId] ?? []), clone(next)];
     this.audit(next, enabled ? 'enabled' : 'disabled', actorId, { version: next.version });
     this.writeFile();
+    this.notify(enabled ? 'enabled' : 'disabled', next);
     return clone(next);
   }
 
@@ -181,6 +202,89 @@ export class FileRuleCatalog implements RuleCatalog {
 
   audits(roomId: string): RuleAuditEntry[] {
     return clone(this.data.audits.filter((audit) => audit.roomId === roomId || this.data.rules.find((rule) => rule.id === audit.ruleId)?.scope === 'shared'));
+  }
+
+  learnFromResult(roomId: string, sessionId: string, result: ComplianceResult): ComplianceRule[] {
+    if (result.source !== 'doubao' || result.ruleKind !== 'term' || result.risk === 'safe' || result.confidence < this.learningConfidence) return [];
+    this.requireRoom(roomId);
+    const terms = [...new Set((result.matchedTerms ?? [])
+      .map((term) => term.trim())
+      .filter((term) => term.length >= 2 && term.length <= 80 && result.transcript.includes(term)))]
+      .slice(0, 3);
+    if (terms.length === 0) return [];
+    const learned: ComplianceRule[] = [];
+    const mutations: Array<{ action: RuleAuditEntry['action']; rule: ComplianceRule }> = [];
+    for (const term of terms) {
+      const normalizedTerm = term.normalize('NFKC').toLocaleLowerCase();
+      const existing = this.data.rules.find((rule) => rule.origin === 'learned'
+        && rule.matchType === 'contains'
+        && rule.pattern.normalize('NFKC').toLocaleLowerCase() === normalizedTerm);
+      const now = Date.now();
+      if (existing) {
+        if (existing.status === 'rejected') continue;
+        const evidenceRoomIds = [...new Set([...(existing.evidenceRoomIds ?? [existing.roomId]), roomId])];
+        const promoted = existing.scope === 'room' && existing.status === 'pending_review' && !evidenceRoomIds.every((candidate) => candidate === existing.roomId);
+        const stronger = existing.status === 'pending_review' && result.risk === 'blocked' && existing.risk !== 'blocked';
+        const next: ComplianceRule = {
+          ...existing,
+          ...(promoted ? { scope: 'shared' as const } : {}),
+          ...(stronger ? {
+            risk: result.risk,
+            title: result.title.trim(),
+            reason: result.reason.trim(),
+            alternative: result.alternative.trim(),
+            policyRef: result.policyRef.trim(),
+          } : {}),
+          version: promoted || stronger ? existing.version + 1 : existing.version,
+          confidence: Math.max(existing.confidence ?? 0, result.confidence),
+          evidenceCount: (existing.evidenceCount ?? 1) + 1,
+          evidenceRoomIds,
+          lastSeenAt: now,
+          lastSessionId: sessionId,
+          updatedAt: now,
+        };
+        this.replaceRule(next);
+        if (next.version !== existing.version) this.data.versions[next.id] = [...(this.data.versions[next.id] ?? []), clone(next)];
+        this.audit(next, 'observed', 'doubao-learning', { confidence: result.confidence, sessionId, sourceResultId: result.id, promoted, stronger });
+        mutations.push({ action: 'observed', rule: next });
+        learned.push(next);
+        continue;
+      }
+      const rule: ComplianceRule = {
+        id: makeId(`learned-${term}`),
+        roomId,
+        scope: 'room',
+        name: `智能发现：${result.title}`,
+        matchType: 'contains',
+        pattern: term,
+        risk: result.risk,
+        title: result.title.trim(),
+        reason: result.reason.trim(),
+        alternative: result.alternative.trim(),
+        policyRef: result.policyRef.trim(),
+        enabled: true,
+        status: 'pending_review',
+        version: 1,
+        origin: 'learned',
+        confidence: result.confidence,
+        evidenceCount: 1,
+        evidenceRoomIds: [roomId],
+        lastSeenAt: now,
+        lastSessionId: sessionId,
+        createdBy: 'doubao-learning',
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.validateRule(rule);
+      this.data.rules.push(rule);
+      this.data.versions[rule.id] = [clone(rule)];
+      this.audit(rule, 'learned', 'doubao-learning', { confidence: result.confidence, sessionId, sourceResultId: result.id });
+      mutations.push({ action: 'learned', rule });
+      learned.push(rule);
+    }
+    this.writeFile();
+    for (const mutation of mutations) this.notify(mutation.action, mutation.rule);
+    return clone(learned);
   }
 
   private nextStatus(scope: ComplianceRuleScope, actorId: string, room: LiveRoom): ComplianceRuleStatus {
@@ -240,6 +344,12 @@ export class FileRuleCatalog implements RuleCatalog {
 
   private audit(rule: ComplianceRule, action: RuleAuditEntry['action'], actorId: string, details: Record<string, unknown>): void {
     this.data.audits.push({ id: `audit-${randomUUID()}`, ruleId: rule.id, roomId: rule.roomId, action, actorId, occurredAt: Date.now(), details });
+  }
+
+  private notify(action: RuleAuditEntry['action'], rule: ComplianceRule): void {
+    try { this.onMutation?.({ action, rule: clone(rule), occurredAt: Date.now() }); } catch {
+      // Sync is best effort; local rule writes remain authoritative.
+    }
   }
 
   private readFile(): RuleFile {

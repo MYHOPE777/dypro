@@ -61,6 +61,38 @@ describe('DoubaoComplianceAnalyzer', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('samples ordinary safe speech in optimized mode while keeping local checks on every sentence', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      output_text: JSON.stringify({ risk: 'safe', title: '可继续', reason: '未发现风险', alternative: '继续介绍', policyRef: '平台规则', confidence: 0.9, matchedTerms: [], ruleKind: 'sentence' }),
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model' });
+
+    await analyzer.analyze({ roomId: 'room-default', productId: 'serum', transcript: '这款面料触感柔软', riskProfile: 'optimized' });
+    await analyzer.analyze({ roomId: 'room-default', productId: 'serum', transcript: '日常通勤搭配很方便', riskProfile: 'optimized' });
+    await analyzer.analyze({ roomId: 'room-default', productId: 'serum', transcript: '现在看一下它的细节', riskProfile: 'optimized' });
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('immediately reviews euphemistic product context even in optimized mode', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      output_text: JSON.stringify({ risk: 'blocked', title: '健康功效暗示', reason: '跨句隐喻人体器官', alternative: '只介绍产品用途', policyRef: '健康宣传', confidence: 0.96, matchedTerms: ['发动机', '汽油'], ruleKind: 'context' }),
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model' });
+
+    const result = await analyzer.analyze({
+      roomId: 'room-default', productId: 'supplement', transcript: '所以这个汽油要保持干净', riskProfile: 'optimized',
+      context: { text: '人的发动机每天都在工作。\n所以这个汽油要保持干净。', segmentCount: 2, windowStartMs: 0, windowEndMs: 20_000 },
+    });
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as { input: Array<{ content: Array<{ text: string }> }> };
+    expect(request.input[1]?.content[0]?.text).toContain('人的发动机每天都在工作');
+    expect(result).toMatchObject({ risk: 'blocked', ruleKind: 'context' });
+  });
+
   it('reuses a recent result for the same transcript and product', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       output_text: JSON.stringify({ risk: 'warning', title: '语义提醒', reason: '需要核验', alternative: '替代表达', policyRef: '平台规则', confidence: 0.8 }),

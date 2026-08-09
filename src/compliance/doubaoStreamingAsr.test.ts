@@ -1,7 +1,7 @@
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
-import { buildAudioFrame, buildFullClientRequest, buildStreamingAsrContext, getStreamingAsrConfig, parseResponseFrame, DoubaoStreamingAsr } from '../../server/providers/doubaoStreamingAsr';
+import { buildAudioFrame, buildFullClientRequest, buildStreamingAsrContext, getStreamingAsrConfig, parseResponseFrame, DoubaoStreamingAsr, StreamingAsrProviderError } from '../../server/providers/doubaoStreamingAsr';
 
 describe('Doubao streaming ASR frames', () => {
   it('builds a gzip JSON full-client request with 16k mono PCM settings', () => {
@@ -186,6 +186,48 @@ describe('Doubao streaming ASR frames', () => {
       const sentBeforeCleanup = sent.length;
       vi.advanceTimersByTime(3_000);
       expect(sent).toHaveLength(sentBeforeCleanup);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('attaches local packet timing diagnostics to provider errors', () => {
+    vi.useFakeTimers();
+    try {
+      const listeners = new Map<string, (...args: unknown[]) => void>();
+      const socket = {
+        readyState: WebSocket.CONNECTING as number,
+        on(event: string, listener: (...args: unknown[]) => void) { listeners.set(event, listener); return this; },
+        send() { undefined; },
+        close() { this.readyState = WebSocket.CLOSED; },
+      };
+      const onError = vi.fn();
+      const stream = new DoubaoStreamingAsr(
+        { apiKey: 'api-key', resourceId: 'resource', endpoint: 'wss://speech.example', endWindowMs: 800 },
+        { onResult: vi.fn(), onError },
+        () => socket as never,
+      );
+
+      stream.connect();
+      socket.readyState = WebSocket.OPEN;
+      listeners.get('open')?.();
+      vi.advanceTimersByTime(600);
+      const message = Buffer.from('{"error":"[Timeout waiting next packet]"}');
+      const code = Buffer.alloc(4);
+      code.writeUInt32BE(45000081, 0);
+      const size = Buffer.alloc(4);
+      size.writeUInt32BE(message.length, 0);
+      listeners.get('message')?.(Buffer.concat([Buffer.from([0x11, 0xf0, 0x00, 0x00]), code, size, message]));
+
+      const error = onError.mock.calls[0]?.[0];
+      expect(error).toBeInstanceOf(StreamingAsrProviderError);
+      expect((error as StreamingAsrProviderError).diagnostics).toMatchObject({
+        lastAudioPacketKind: 'keepalive',
+        lastAudioPacketGapMs: 200,
+        pendingAudioBytes: 0,
+        socketReadyState: WebSocket.OPEN,
+      });
+      stream.close();
     } finally {
       vi.useRealTimers();
     }

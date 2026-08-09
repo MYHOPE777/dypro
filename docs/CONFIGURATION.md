@@ -35,9 +35,13 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 | `TIMELINE_DATA_DIR` | 路径，默认 `.data/timeline` | 否 | 保存每场 `timeline.jsonl`、16 kHz ASR PCM、原始采样率 PCM 和音轨元数据。原始音频必须保留时不要放在临时目录。 |
 | `PRODUCT_CATALOG_PATH` | 路径，默认 `.data/products/catalog.json` | 否 | 直播间、长期商品库和本场清单的本地 adapter 文件。 |
 | `RULE_CATALOG_PATH` | 路径，默认 `.data/rules/catalog.json` | 否 | 规则版本、启停状态、审核状态与审计日志的本地 adapter 文件。 |
+| `PHRASE_LIBRARY_PATH` | 路径，默认 `.data/phrases/catalog.json` | 否 | 按直播间账号和主播隔离保存归档话术、参考状态及版本历史。 |
+| `RULE_SYNC_QUEUE_PATH` | 路径，默认 `.data/rules/sync-queue.json` | 否 | 规则变更的本地异步同步队列。 |
+| `PHRASE_LIBRARY_SYNC_QUEUE_PATH` | 路径，默认 `.data/phrases/sync-queue.json` | 否 | 主播话术变更的本地异步同步队列。 |
 | `SPEECH_CORRECTION_CATALOG_PATH` | 路径，默认 `.data/speech-corrections/catalog.json` | 否 | 按直播间保存主播长期语音纠错词库。停播复核产生的错误词、正确词、确认次数、启停状态和最近来源会话都保存在这里。 |
 | `TENANT_ID` | 标识，默认 `tenant-default` | 否 | 多租户预留字段。SaaS 接入数据库、对象存储、Redis 和知识库时必须继续透传。 |
 | `RULE_REVIEWER_ACTOR_ID` | 账号 ID，默认 `owner` | 否 | 共享规则的审核人。多人模式下必须对应 `role` 为 `reviewer` 的账号。 |
+| `RULE_LEARNING_MIN_CONFIDENCE` | 0.8-1，默认 `0.93` | 否 | 仅豆包明确标记为词级规则且达到此置信度时，自动生成待审核候选；句级和上下文语义永不自动发布为硬规则。 |
 | `SESSION_IDLE_TTL_MS` | 毫秒，默认 `1800000` | 否 | 最后一个页面断开后保留会话的时间，最小按 60 秒处理。超时后只清理内存会话，已写入的本地时间线不删除。 |
 | `ARCHIVE_QUEUE_PATH` | 路径，默认 `.data/archive/queue.json` | 否 | 停播后 TOS 归档队列。失败任务带指数退避，服务重启后可继续。 |
 
@@ -90,9 +94,9 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 | `X_API_APP_KEY` | 字符串 | 旧版控制台可选 | 旧版控制台的 APP ID，对应官方请求头 `X-Api-App-Key`。仅当 `X_API_KEY` 留空时使用。 |
 | `X_API_ACCESS_KEY` | 字符串 | 旧版控制台可选 | 旧版控制台的 Access Token，对应官方请求头 `X-Api-Access-Key`。仅当 `X_API_KEY` 留空时使用；旧版页面里的 Secret Key 不直接发送到 SAUC WebSocket。 |
 | `X_API_RESOURCE_ID` | 字符串，默认 `volc.bigasr.sauc.duration` | 否/按账号 | 已开通的流式语音识别资源 ID，对应 `X-Api-Resource-Id`。并发版使用 `volc.bigasr.sauc.concurrent`，小时版使用 `volc.bigasr.sauc.duration`，实际以控制台为准。 |
-| `SPEECH_ENDPOINT` | URL，默认 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async` | 否 | 豆包大模型流式语音识别（双向流式优化版）WebSocket 地址。除非账号文档要求，否则不要改成 HTTP 地址。 |
-| `BOOSTING_TABLE_ID` / `BOOSTING_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `corpus.boosting_table_id` / `boosting_table_name`。每个实时连接只使用一张热词表，ID 优先。 |
-| `CORRECT_TABLE_ID` / `CORRECT_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `corpus.correct_table_id` / `correct_table_name`。每个实时连接只使用一张替换词表，ID 优先。 |
+| `SPEECH_ENDPOINT` | URL，默认 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async` | 否 | 豆包大模型流式语音识别（ASR）的“双向流式模式（优化版本）”WebSocket 地址。除非账号文档要求，否则不要改成 HTTP 地址。 |
+| `BOOSTING_TABLE_ID` / `BOOSTING_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `corpus.boosting_table_id` / `boosting_table_name`。每个流式语音识别请求只使用一张热词表，ID 优先。 |
+| `CORRECT_TABLE_ID` / `CORRECT_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `corpus.correct_table_id` / `correct_table_name`。每个流式语音识别请求只使用一张替换词表，ID 优先。 |
 | `END_WINDOW_SIZE` | 正整数毫秒，默认 `800` | 否 | 官方 `request.end_window_size`，二遍模式的 VAD 强制判停时间，最小 200。 |
 
 服务端握手请求头还会自动生成同一 UUID 的 `X-Api-Connect-Id` 和 `X-Api-Request-Id`，不需要配置。响应中的 `X-Tt-Logid` 会被保留到连接状态/错误信息，用于火山侧排障。连接流程为：
@@ -102,7 +106,7 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 3. 发送 audio-only gzip 二进制帧；
 4. 收到最终结果后写入时间线并触发合规分析。
 
-火山引擎服务端在约 8 秒未收到下一音频包时会返回 `45000081` 并结束会话。主播停顿期间，服务端会在连续 2 秒未收到浏览器音频后发送约 100 ms 的静音 audio-only 帧作为保活；保活帧不会写入原始音频、16 kHz ASR 音频或时间线。暂停、结束直播或连接关闭时会立即清理保活定时器。
+火山引擎服务端在约 8 秒未收到下一音频包时会返回 `45000081` 并结束会话。主播停顿期间，服务端会在连续约 400 ms 未收到浏览器音频后，以约 400 ms 间隔发送约 100 ms 的静音 audio-only 帧作为保活；若仍发生等包超时，会自动进行有限次数重连。保活帧不会写入原始音频、16 kHz ASR 音频或时间线。暂停、结束直播或连接关闭时会立即清理保活定时器。
 
 浏览器会同时保留两条音轨：发送给 ASR 的 16 kHz PCM，以及蓝牙设备原始采样率 PCM。服务端先把音频包聚合成约 256 KB 的切片，通过独立队列异步写入 `.data/timeline/<sessionId>/audio.chunks/`；停播后再顺序合并为完整 PCM 并删除临时切片，合并完成后才进入归档队列。音频写入和合并不占用语义合规分析队列。豆包大模型流式语音识别连接尚未 ready 时最多缓冲约 160 KB 音频，超过后会停止收音并提示连接异常。
 
@@ -123,6 +127,15 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 | `ARK_LOCAL_FAST_PATH` | `true` 或 `false`，默认 `true` | 否 | 内置规则或已发布直播间规则命中 `warning` 时立即返回本地预警，不等待模型；`blocked` 本来就始终立即返回。设为 `false` 可用于对比模型结果。 |
 | `ARK_COMPLIANCE_CACHE_TTL_MS` | 非负毫秒，默认 `30000` | 否 | 相同直播间、商品、规则版本和转录文本的短时结果缓存，减少 ASR 重复片段造成的重复请求；设为 `0` 关闭。缓存只存在当前服务进程内，不写入云端。 |
 | `ARK_PRODUCT_PARSE_TIMEOUT_MS` | 毫秒，默认 `10000` | 否 | 商品粘贴识别的独立超时。失败时退回本地字段识别，并要求场控确认。 |
+| `ARK_PHRASE_REWRITE_TIMEOUT_MS` | 毫秒，默认 `4000` | 否 | 主播话术库中单条豆包改写的超时；失败时保留原版本，可继续人工编辑。 |
+
+实时风险档位由场控在本场会话中切换：
+
+- `严审`：每句本地词级检查 + 每句豆包语义检查，携带同一商品最近约 90 秒上下文。
+- `均衡`：每句本地词级检查 + 每句豆包语义检查，携带同一商品最近约 60 秒上下文。
+- `优化`：每句本地词级检查；普通安全话术每三句抽样一次豆包，出现隐喻/规避信号时立即送审，携带最近约 45 秒上下文。
+
+切换商品会重建上下文窗口，标记为“其他人”的转录不会进入主播商品语义上下文。模型结果分为 `term`、`sentence`、`context` 三类，只有 `term` 可进入自动规则候选。
 
 合规请求体由服务端生成，结构如下。`store: false` 避免方舟为每句直播话术保存 Responses 上下文，未启用知识库时使用 `thinking: disabled`；`service_tier` 使用 `ARK_SERVICE_TIER` 的官方值。启用 `KNOWLEDGE_RESOURCE_ID` 时按官方知识库工具要求自动切换 `thinking: auto` 和 `service_tier: auto`：
 
@@ -178,7 +191,19 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 
 同时发送官方请求头 `ark-beta-knowledge-search: true`。规则创建、审核、回滚和停用仍以本地/业务数据库为事实源；知识库只用于模型判断时的语义召回。
 
-### 2.6 TOS 原始音频归档
+### 2.6 规则与主播话术异步同步
+
+本地规则库和主播话术库是实时链路的事实源。以下参数同时填写 URL 与 KEY 后，服务端会把版本化变更事件写入本地 outbox，并在后台发送到自建网关：
+
+| 参数 | 说明 |
+| --- | --- |
+| `RULE_SYNC_URL` / `RULE_SYNC_KEY` | 规则创建、智能发现、证据升级、审核、编辑、回滚和启停事件。 |
+| `PHRASE_LIBRARY_SYNC_URL` / `PHRASE_LIBRARY_SYNC_KEY` | 话术归档、新增、改写、选为参考和回滚事件。 |
+| `RULE_SYNC_TIMEOUT_MS` / `PHRASE_LIBRARY_SYNC_TIMEOUT_MS` | 单次请求超时，默认 5000 毫秒。 |
+
+网关应按资源 `id + version + action` 幂等处理，再写入火山数据库或知识库。失败任务采用指数退避并在服务重启后继续；云端故障不会阻塞直播。知识库适合保存语义案例和主播参考素材，已发布词级规则仍应保留在本地/业务数据库快路径。
+
+### 2.7 TOS 原始音频归档
 
 TOS 不直接由实时链路调用。停止收音后，服务端先把会话 manifest POST 到归档网关，再使用网关返回的预签名 URL 流式 PUT 音频文件。
 
@@ -210,7 +235,7 @@ manifest 请求体：
 
 随后每个 URL 接收一次 `PUT`，请求头为 `Content-Type: application/octet-stream` 和 `Content-Length`。归档网关负责把这些内容写入火山 TOS，并自行处理对象 key、租户隔离和幂等。主播重新开始收音时，在途上传会被取消，任务留在本地等待下一次停止。
 
-### 2.7 数据库与 Redis
+### 2.8 数据库与 Redis
 
 `DATABASE_URL` 和 `REDIS_URL` 目前只用于开播检查和 SaaS 架构预留：
 

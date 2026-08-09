@@ -8,6 +8,8 @@ describe('analyzeTranscript', () => {
 
     expect(result.risk).toBe('blocked');
     expect(result.title).toContain('外观效果');
+    expect(result.matchedTerms?.[0]).toContain('毛孔');
+    expect(result.matchedTerms?.[0]).toContain('看不见');
   });
 
   it('flags universal suitability claims as a warning', async () => {
@@ -15,6 +17,7 @@ describe('analyzeTranscript', () => {
 
     expect(result.risk).toBe('warning');
     expect(result.reason).toContain('所有人');
+    expect(result.matchedTerms?.[0]).toContain('所有肤质');
   });
 
   it('flags an absolute efficacy claim and gives the host a product-safe replacement', async () => {

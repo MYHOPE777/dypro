@@ -95,6 +95,105 @@ describe('pasted product parsing', () => {
 });
 
 describe('collaborative compliance rules', () => {
+  it('stores high-confidence Doubao findings as reviewable room candidates', () => {
+    const { catalog, directory } = createCatalog();
+    const rules = new FileRuleCatalog(catalog, path.join(directory, 'rules.json'));
+
+    const learned = rules.learnFromResult('room-default', 'live-learning-test', {
+      id: 'doubao-result',
+      productId: 'serum',
+      risk: 'blocked',
+      title: '虚假效果承诺',
+      reason: '该表达对所有消费者作出确定效果保证。',
+      alternative: '可以改为：实际体验因人而异，请以商品页面为准。',
+      policyRef: '直播电商宣传规范',
+      confidence: 0.97,
+      source: 'doubao',
+      ruleKind: 'term',
+      transcript: '这一款保证三天彻底改善',
+      matchedTerms: ['保证三天彻底改善'],
+      createdAt: Date.now(),
+    });
+
+    expect(learned).toHaveLength(1);
+    expect(learned[0]).toMatchObject({
+      roomId: 'room-default',
+      pattern: '保证三天彻底改善',
+      risk: 'blocked',
+      status: 'pending_review',
+      origin: 'learned',
+      evidenceCount: 1,
+      confidence: 0.97,
+    });
+    expect(rules.listActive('room-default')).toEqual([]);
+  });
+
+  it('does not learn uncertain findings or findings without an exact matched term', () => {
+    const { catalog, directory } = createCatalog();
+    const rules = new FileRuleCatalog(catalog, path.join(directory, 'rules.json'));
+    const finding = {
+      id: 'uncertain-result', productId: 'serum', risk: 'warning' as const, title: '需核验', reason: '证据不足',
+      alternative: '以页面信息为准。', policyRef: '平台规则', confidence: 0.92, source: 'doubao' as const,
+      transcript: '今天价格不错', matchedTerms: ['价格不错'], ruleKind: 'term' as const, createdAt: Date.now(),
+    };
+
+    expect(rules.learnFromResult('room-default', 'live-learning-test', finding)).toEqual([]);
+    expect(rules.learnFromResult('room-default', 'live-learning-test', { ...finding, confidence: 0.99, matchedTerms: ['原话里没有的词'] })).toEqual([]);
+    expect(rules.list('room-default')).toEqual([]);
+  });
+
+  it('merges repeated evidence and promotes cross-room candidates to shared review', () => {
+    const { catalog, directory } = createCatalog();
+    const secondRoom = catalog.createRoom({ name: '二号直播间', accountName: '二号账号', ownerActorId: 'owner-b' });
+    const rules = new FileRuleCatalog(catalog, path.join(directory, 'rules.json'));
+    const finding = {
+      id: 'finding-1', productId: 'serum', risk: 'warning' as const, title: '价格承诺', reason: '无法核验全网价格。',
+      alternative: '当前价格以商品页面为准。', policyRef: '价格宣传规范', confidence: 0.96, source: 'doubao' as const,
+      transcript: '这是全平台最低价', matchedTerms: ['全平台最低价'], ruleKind: 'term' as const, createdAt: Date.now(),
+    };
+
+    const first = rules.learnFromResult('room-default', 'live-first', finding)[0];
+    const second = rules.learnFromResult('room-default', 'live-second', { ...finding, id: 'finding-2', confidence: 0.98 })[0];
+    const crossRoom = rules.learnFromResult(secondRoom.id, 'live-third', { ...finding, id: 'finding-3' })[0];
+
+    expect(second.id).toBe(first.id);
+    expect(crossRoom.id).toBe(first.id);
+    expect(crossRoom).toMatchObject({ scope: 'shared', status: 'pending_review', evidenceCount: 3, confidence: 0.98 });
+    expect(crossRoom.evidenceRoomIds).toEqual(expect.arrayContaining(['room-default', secondRoom.id]));
+    expect(rules.list('room-default')).toHaveLength(1);
+    expect(rules.list(secondRoom.id)).toHaveLength(1);
+  });
+
+  it('treats rejection as correction feedback and suppresses the same learned candidate', () => {
+    const { catalog, directory } = createCatalog();
+    const rules = new FileRuleCatalog(catalog, path.join(directory, 'rules.json'));
+    const finding = {
+      id: 'finding-rejected', productId: 'serum', risk: 'warning' as const, title: '待核验表达', reason: '模型认为需要核验。',
+      alternative: '以页面为准。', policyRef: '平台规则', confidence: 0.98, source: 'doubao' as const,
+      transcript: '这个词其实是商品名', matchedTerms: ['这个词'], ruleKind: 'term' as const, createdAt: Date.now(),
+    };
+
+    const candidate = rules.learnFromResult('room-default', 'live-first', finding)[0];
+    rules.reject(candidate.id, 'owner', '这是已核验的商品专有名称');
+
+    expect(rules.learnFromResult('room-default', 'live-second', { ...finding, id: 'finding-again' })).toEqual([]);
+    expect(rules.list('room-default')).toHaveLength(1);
+    expect(rules.list('room-default')[0].status).toBe('rejected');
+  });
+
+  it('never turns sentence or context semantics into automatic term rules', () => {
+    const { catalog, directory } = createCatalog();
+    const rules = new FileRuleCatalog(catalog, path.join(directory, 'rules.json'));
+    const finding = {
+      id: 'context-finding', productId: 'supplement', risk: 'blocked' as const, title: '健康暗示', reason: '上下文隐喻人体器官。',
+      alternative: '只介绍产品成分和使用方法。', policyRef: '健康宣传', confidence: 0.99, source: 'doubao' as const,
+      transcript: '发动机需要好汽油', matchedTerms: ['发动机', '汽油'], ruleKind: 'context' as const, createdAt: Date.now(),
+    };
+
+    expect(rules.learnFromResult('room-default', 'live-context', finding)).toEqual([]);
+    expect(rules.list('room-default')).toEqual([]);
+  });
+
   it('publishes room rules immediately and gates shared rules behind owner approval', () => {
     const { catalog, directory } = createCatalog();
     const sourceRoom = catalog.createRoom({ name: '源直播间', accountName: '源账号', ownerActorId: 'owner-a' });

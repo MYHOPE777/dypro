@@ -49,7 +49,7 @@ describe('session timeline export', () => {
     now += 900;
     session.ingestTranscript('这款耳机适合日常通勤使用', true, { startTimeMs: 120, endTimeMs: 820 });
     session.endLive();
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await session.waitForPersistence();
 
     const timeline = timelineStore.exportSession(session.id);
     const transcript = timeline?.events.find((event) => event.type === 'transcript.final');
@@ -64,7 +64,7 @@ describe('session timeline export', () => {
       occurredAt: Date.parse('2026-08-06T10:00:01.900Z'),
       occurredAtIso: '2026-08-06T10:00:01.900Z',
       offsetMs: 820,
-      productId: 'serum',
+      productId: 'headphones',
       payload: { text: '这款耳机适合日常通勤使用', startOffsetMs: 120, endOffsetMs: 820 },
     });
   });

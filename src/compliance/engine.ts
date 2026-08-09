@@ -1,5 +1,5 @@
 import safeRegex from 'safe-regex2';
-import type { ComplianceResult, ComplianceRule, Product, RiskLevel } from '../shared/types';
+import type { ComplianceResult, ComplianceRule, Product, RiskLevel, RiskProfile } from '../shared/types';
 
 export type AnalysisInput = {
   roomId?: string;
@@ -7,6 +7,8 @@ export type AnalysisInput = {
   transcript: string;
   product?: Pick<Product, 'id' | 'name' | 'category' | 'price' | 'compliantPhrases'>;
   customRules?: ComplianceRule[];
+  riskProfile?: RiskProfile;
+  context?: { text: string; segmentCount: number; windowStartMs: number; windowEndMs: number };
 };
 
 export type ComplianceAnalyzer = {
@@ -21,6 +23,24 @@ type Rule = {
   alternative: string | ((product?: AnalysisInput['product']) => string);
   policyRef: string;
 };
+
+function matchedTerms(transcript: string, pattern: RegExp): string[] {
+  const match = transcript.match(pattern);
+  return match?.[0] ? [match[0]] : [];
+}
+
+function customMatchedTerms(transcript: string, rule: ComplianceRule): string[] {
+  if (rule.matchType === 'contains') {
+    const index = transcript.toLocaleLowerCase().indexOf(rule.pattern.toLocaleLowerCase());
+    return index < 0 ? [] : [transcript.slice(index, index + rule.pattern.length)];
+  }
+  try {
+    const match = safeRegex(rule.pattern) ? transcript.match(new RegExp(rule.pattern, 'iu')) : null;
+    return match?.[0] ? [match[0]] : [];
+  } catch {
+    return [];
+  }
+}
 
 const RULES: Rule[] = [
   {
@@ -118,6 +138,7 @@ export function evaluateCustomRules(input: AnalysisInput): ComplianceResult | nu
     source: 'custom-rule',
     transcript: input.transcript,
     createdAt: Date.now(),
+    matchedTerms: customMatchedTerms(input.transcript, rule),
   };
 }
 
@@ -142,6 +163,7 @@ export async function analyzeTranscript(input: AnalysisInput): Promise<Complianc
       source: 'local-fallback',
       transcript: input.transcript,
       createdAt: now,
+      matchedTerms: [],
     };
   }
 
@@ -157,6 +179,7 @@ export async function analyzeTranscript(input: AnalysisInput): Promise<Complianc
     source: 'local-fallback',
     transcript: input.transcript,
     createdAt: now,
+    matchedTerms: matchedTerms(input.transcript, rule.pattern),
   };
 }
 
