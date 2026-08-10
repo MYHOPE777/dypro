@@ -2,18 +2,18 @@
 
 本文对应项目根目录的 `.env.example`。本地运行时复制为 `.env`，然后按需要填写。服务端通过 `dotenv` 读取配置，浏览器不会收到这些变量。
 
-如果现在只准备接入火山引擎，可以直接参考并复制 [`config/volcengine.env.example`](../config/volcengine.env.example)。该文件按“豆包大模型流式语音识别（ASR）→ 豆包大模型 → 方舟知识库搜索 → TOS 归档 → 数据库预留”的顺序排列，并在每个参数旁标注获取位置、发送位置和是否必填；它是模板，不包含真实密钥。
+如果现在只准备接入火山引擎，可以直接参考并复制 [`config/volcengine.env.example`](../config/volcengine.env.example)。该文件按“豆包大模型流式语音识别（ASR）→ 火山方舟 Responses API（豆包大模型）→ 火山方舟知识库搜索 → TOS 归档 → 数据库预留”的顺序排列，并在每个参数旁标注获取位置、发送位置和是否必填；它是模板，不包含真实密钥。
 
 ## 官方术语与参数映射
 
-语音链路的正式产品名称是**豆包大模型流式语音识别（ASR）**，本项目接入其官方“双向流式模式（优化版本）” WebSocket（SAUC）。项目环境变量只是服务端配置入口，实际发送到火山引擎的名称保持官方定义：
+语音链路的正式产品名称是**豆包大模型流式语音识别（ASR）**，本项目接入其官方“双向流式模式（优化版本）”WebSocket 接口。项目环境变量只是服务端配置入口，实际发送到火山引擎的名称保持官方定义：
 
 | 配置用途 | 官方名称或字段 | 在本项目中的配置入口 |
 | --- | --- | --- |
 | 新版鉴权 | 请求头 `X-Api-Key`（App Key） | `X_API_KEY` |
 | 兼容旧版鉴权 | 请求头 `X-Api-App-Key`、`X-Api-Access-Key` | `X_API_APP_KEY`、`X_API_ACCESS_KEY` |
 | 流式识别资源 | 请求头 `X-Api-Resource-Id` | `X_API_RESOURCE_ID` |
-| WebSocket 接入地址 | 豆包大模型流式语音识别官方 SAUC 地址 | `SPEECH_ENDPOINT` |
+| WebSocket 接入地址 | 豆包大模型流式语音识别“双向流式模式（优化版本）”官方地址 | `SPEECH_ENDPOINT` |
 | 热词词表 | `request.corpus.boosting_table_id` / `boosting_table_name` | `BOOSTING_TABLE_ID` / `BOOSTING_TABLE_NAME` |
 | 替换词词表 | `request.corpus.correct_table_id` / `correct_table_name` | `CORRECT_TABLE_ID` / `CORRECT_TABLE_NAME` |
 | 识别上下文 | `request.corpus.context`，含 `context_type`、`context_data` | 由商品、纠错词和话术上下文生成 |
@@ -27,8 +27,8 @@
 | 模式 | 必填配置 | 行为 |
 | --- | --- | --- |
 | 本地演示 | 无 | 使用本地商品、规则和演示输入；云依赖显示为“待配置” |
-| 本地直播 | `X_API_KEY`、`ARK_API_KEY`、`ARK_MODEL` | 蓝牙麦克风经浏览器送入豆包大模型流式语音识别（ASR），方舟负责判定；云故障自动回退本地规则 |
-| 本地实时直播 + 停播归档 | 上一行配置 + TOS 三项 | 停止收音后才上传音频和时间线；收音期间只写本地文件 |
+| 本地直播 | `X_API_KEY`、`ARK_API_KEY`、`ARK_MODEL` | 蓝牙麦克风经浏览器送入豆包大模型流式语音识别（ASR），火山方舟 Responses API 负责判定；云故障自动回退本地规则 |
+| 本地直播 + 停播归档 | 上一行配置 + TOS 三项 | 停止收音后才上传音频和时间线；流式语音识别期间只写本地文件 |
 | 多人局域网 | `AUTH_TOKEN_SECRET`、`AUTH_USERS_JSON` | 控制台启用登录、直播间授权和规则审核；正式使用必须 HTTPS/WSS |
 | SaaS 预留 | `DATABASE_URL`、`REDIS_URL` 等 | 当前仅显示就绪状态，尚未替换本地 JSON adapter，不应误认为已连接数据库 |
 
@@ -112,7 +112,7 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 | `X_API_KEY` | 字符串 | 新版控制台豆包大模型流式语音识别必填 | 豆包语音新版控制台的 App Key，对应 WebSocket 请求头 `X-Api-Key`。不要放入前端。 |
 | `X_API_APP_KEY` | 字符串 | 旧版控制台可选 | 旧版控制台的 APP ID，对应官方请求头 `X-Api-App-Key`。仅当 `X_API_KEY` 留空时使用。 |
 | `X_API_ACCESS_KEY` | 字符串 | 旧版控制台可选 | 旧版控制台的 Access Token，对应官方请求头 `X-Api-Access-Key`。仅当 `X_API_KEY` 留空时使用；旧版页面里的 Secret Key 不直接发送到 SAUC WebSocket。 |
-| `X_API_RESOURCE_ID` | 字符串，默认 `volc.bigasr.sauc.duration` | 否/按账号 | 已开通的豆包大模型流式语音识别资源 ID，对应 `X-Api-Resource-Id`。并发版使用 `volc.bigasr.sauc.concurrent`，小时版使用 `volc.bigasr.sauc.duration`，实际以控制台为准。 |
+| `X_API_RESOURCE_ID` | 字符串，默认 `volc.bigasr.sauc.duration` | 否/按账号 | 对应官方请求头 `X-Api-Resource-Id`。豆包流式语音识别模型 1.0：小时版 `volc.bigasr.sauc.duration`、并发版 `volc.bigasr.sauc.concurrent`；模型 2.0：小时版 `volc.seedasr.sauc.duration`、并发版 `volc.seedasr.sauc.concurrent`。必须使用控制台实际开通的值。 |
 | `SPEECH_ENDPOINT` | URL，默认 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async` | 否 | 豆包大模型流式语音识别（ASR）的“双向流式模式（优化版本）”WebSocket 地址。除非账号文档要求，否则不要改成 HTTP 地址。 |
 | `BOOSTING_TABLE_ID` / `BOOSTING_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `corpus.boosting_table_id` / `boosting_table_name`。每个流式语音识别请求只使用一张热词表，ID 优先。 |
 | `CORRECT_TABLE_ID` / `CORRECT_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `corpus.correct_table_id` / `correct_table_name`。每个流式语音识别请求只使用一张替换词表，ID 优先。 |
@@ -122,10 +122,10 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 
 1. 建立 WebSocket；
 2. 发送 full client request，声明 `pcm_s16le`、16 kHz、单声道；
-3. 发送 audio-only gzip 二进制帧；
+3. 发送 audio only request gzip 二进制帧；
 4. 收到最终结果后写入时间线并触发合规分析。
 
-火山引擎服务端在约 8 秒未收到下一音频包时会返回 `45000081` 并结束会话。主播停顿期间，服务端会在连续约 400 ms 未收到浏览器音频后，以约 400 ms 间隔发送约 100 ms 的静音 audio-only 帧作为保活；若仍发生等包超时，会自动进行有限次数重连。保活帧不会写入原始音频、16 kHz ASR 音频或时间线。暂停、结束直播或连接关闭时会立即清理保活定时器。
+火山引擎服务端在约 8 秒未收到下一音频包时会返回 `45000081` 并结束会话。主播停顿期间，服务端会在连续约 400 ms 未收到浏览器音频后，以约 400 ms 间隔发送约 100 ms 的静音 audio only request 作为保活；若仍发生等包超时，会自动进行有限次数重连。保活帧不会写入原始音频、16 kHz ASR 音频或时间线。暂停、结束直播或连接关闭时会立即清理保活定时器。
 
 浏览器会同时保留两条音轨：发送给 ASR 的 16 kHz PCM，以及蓝牙设备原始采样率 PCM。服务端先把音频包聚合成约 256 KB 的切片，通过独立队列异步写入 `.data/timeline/<sessionId>/audio.chunks/`；停播后再顺序合并为完整 PCM 并删除临时切片，合并完成后才进入归档队列。音频写入和合并不占用语义合规分析队列。豆包大模型流式语音识别连接尚未 ready 时最多缓冲约 160 KB 音频，超过后会停止收音并提示连接异常。
 
@@ -137,18 +137,18 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 
 | 参数 | 类型/默认值 | 是否必填 | 说明 |
 | --- | --- | --- | --- |
-| `ARK_API_KEY` | 字符串 | 实时判定/商品解析必填 | 方舟 API Key，通过 `Authorization: Bearer <key>` 发送。 |
-| `ARK_MODEL` | 字符串 | 实时判定/商品解析必填 | 官方 Responses 请求体 `model`，可填写 Model ID 或已开通 Responses API 的 Endpoint ID，例如 `doubao-seed-2-1-pro-260628`。不要填写 API Key 名称；不支持 Responses API 的智能路由接入点会返回 `AccessDenied`。 |
+| `ARK_API_KEY` | 字符串 | 直播话术判定/商品解析必填 | 火山方舟 API Key，通过 `Authorization: Bearer <key>` 发送。 |
+| `ARK_MODEL` | 字符串 | 直播话术判定/商品解析必填 | 火山方舟 Responses API 请求体 `model`，可填写 Model ID 或已开通 Responses API 的 Endpoint ID，例如 `doubao-seed-2-1-pro-260628`。不要填写 API Key 名称；不支持 Responses API 的智能路由接入点会返回 `AccessDenied`。 |
 | `ARK_BASE_URL` | URL，默认 `https://ark.cn-beijing.volces.com/api/v3` | 否 | 官方 SDK 的 `base_url`；服务端自动请求 `${ARK_BASE_URL}/responses`。 |
 | `ARK_SERVICE_TIER` | `auto` 或 `fast`，默认 `auto` | 否 | 对应火山方舟 Responses API 官方 `service_tier` 参数。`auto` 使用在线推理（常规）；`fast` 使用在线推理（低延迟），需要控制台为当前模型开通低延迟服务。当前官方文档列出的 Fast 支持模型包括 `doubao-seed-2-1-turbo`、`doubao-seed-2-0-pro`、`doubao-seed-2-0-lite`、`doubao-seed-2-0-mini` 系列；实际以控制台为准。启用 `KNOWLEDGE_RESOURCE_ID` 时服务端自动使用 `auto`，因为低延迟 Responses API 不支持 `knowledge_search`。`fast` 超出限流时平台可自动降级到在线推理（常规）。 |
-| `ARK_TIMEOUT_MS` | 毫秒，默认 `5000` | 否 | 实时话术判定截止时间。常规在线推理建议 5000；低延迟推理接入点可调低。超时、非 2xx、返回非 JSON 时自动使用本地规则，保证主播不停播。 |
+| `ARK_TIMEOUT_MS` | 毫秒，默认 `5000` | 否 | 直播话术判定截止时间。常规在线推理建议 5000；低延迟推理接入点可调低。超时、非 2xx、返回非 JSON 时自动使用本地规则，保证主播不停播。 |
 | `ARK_COMPLIANCE_MAX_OUTPUT_TOKENS` | 160-800，默认 `200` | 否 | 合规 JSON 最大输出 token。系统要求豆包只输出结构化字段，减少无关解释可降低响应延迟；200 已覆盖当前短标题、原因和替换话术约束，若业务话术明显更长再调高。 |
 | `ARK_LOCAL_FAST_PATH` | `true` 或 `false`，默认 `true` | 否 | 内置规则或已发布直播间规则命中 `warning` 时立即返回本地预警，不等待模型；`blocked` 本来就始终立即返回。设为 `false` 可用于对比模型结果。 |
 | `ARK_COMPLIANCE_CACHE_TTL_MS` | 非负毫秒，默认 `30000` | 否 | 相同直播间、商品、规则版本和转录文本的短时结果缓存，减少 ASR 重复片段造成的重复请求；设为 `0` 关闭。缓存只存在当前服务进程内，不写入云端。 |
 | `ARK_PRODUCT_PARSE_TIMEOUT_MS` | 毫秒，默认 `10000` | 否 | 商品粘贴识别的独立超时。失败时退回本地字段识别，并要求场控确认。 |
 | `ARK_PHRASE_REWRITE_TIMEOUT_MS` | 毫秒，默认 `4000` | 否 | 主播话术库中单条豆包改写的超时；失败时保留原版本，可继续人工编辑。 |
 
-实时风险档位由场控在本场会话中切换：
+直播风险档位由场控在本场会话中切换：
 
 - `严审`：每句本地词级检查 + 每句豆包语义检查，携带同一商品最近约 90 秒上下文。
 - `均衡`：每句本地词级检查 + 每句豆包语义检查，携带同一商品最近约 60 秒上下文。
@@ -190,7 +190,7 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 
 ### 2.5 方舟私域知识库搜索（Responses API）
 
-方舟知识库在本项目中是“召回增强层”，精确规则仍以本地规则库为事实源。通过官方 Responses API `knowledge_search` 工具调用，不使用自定义检索或规则索引网关。
+火山方舟知识库在本项目中是“召回增强层”，精确规则仍以本地规则库为事实源。通过火山方舟 Responses API 官方 `knowledge_search` 工具调用，不使用自定义检索或规则索引网关。
 
 | 参数 | 类型/默认值 | 是否必填 | 说明 |
 | --- | --- | --- | --- |
@@ -212,7 +212,7 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 
 ### 2.6 规则与主播话术异步同步
 
-本地规则库和主播话术库是实时链路的事实源。以下参数同时填写 URL 与 KEY 后，服务端会把版本化变更事件写入本地 outbox，并在后台发送到自建网关：
+本地规则库和主播话术库是直播处理链路的事实源。以下参数同时填写 URL 与 KEY 后，服务端会把版本化变更事件写入本地 outbox，并在后台发送到自建网关：
 
 | 参数 | 说明 |
 | --- | --- |
@@ -224,7 +224,7 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 
 ### 2.7 场次文案与音频异步归档
 
-实时链路始终先把时间线、最终文案和音频保存到本地。停止收音后，服务端再把会话 manifest POST 到归档网关；网关应把文案、备注和时间线写入业务数据库，并返回音频对象存储的预签名 URL。数据库或对象存储不可用时，任务保留在本地队列并后台重试，不阻塞下一场直播。
+直播处理链路始终先把时间线、最终文案和音频保存到本地。停止收音后，服务端再把会话 manifest POST 到归档网关；网关应把文案、备注和时间线写入业务数据库，并返回音频对象存储的预签名 URL。数据库或对象存储不可用时，任务保留在本地队列并后台重试，不阻塞下一场直播。
 
 | 参数 | 类型/默认值 | 是否必填 | 说明 |
 | --- | --- | --- | --- |
@@ -271,8 +271,8 @@ manifest 请求体：
 
 1. 先只填写本地路径，运行 `npm run dev` 验证商品、规则、演示输入和主播屏。
 2. 填写豆包大模型流式语音识别 `X_API_KEY`，确认 `X_API_RESOURCE_ID` 和蓝牙麦克风权限后测试收音。
-3. 填写方舟 `ARK_API_KEY` 和 `ARK_MODEL`，测试实时判定和商品粘贴识别。
-4. 如使用私域规则/案例召回，填写方舟知识库资源 ID，首句合规请求会通过 `knowledge_search` 验证。
+3. 填写火山方舟 `ARK_API_KEY` 和 `ARK_MODEL`，测试直播话术判定和商品粘贴识别。
+4. 如使用私域规则/案例召回，填写火山方舟知识库资源 ID，首句合规请求会通过 `knowledge_search` 验证。
 5. 最后配置 TOS 归档网关，在停止收音后检查 `.data/archive/queue.json` 和网关接收记录。
 6. 需要多人使用时，同时配置认证两项并在 HTTPS/WSS 反向代理后开放局域网访问。
 
@@ -282,7 +282,7 @@ manifest 请求体：
 - `AUTH_TOKEN_SECRET` 至少 32 个字符；不要使用仓库 README 中的占位值。
 - 多人模式禁止 `ALLOW_INSECURE_AUTH=true` 长期运行。
 - TOS 预签名 URL 只应短期有效，网关应校验 `sessionId`、租户和资产清单。
-- 方舟知识库只存规则/案例副本，不要把原始音频或不必要的个人信息索引进去。
+- 火山方舟知识库只存规则/案例副本，不要把原始音频或不必要的个人信息索引进去。
 
 ## 5. 配置后的验证
 
@@ -294,7 +294,7 @@ curl http://localhost:8787/api/readiness
 curl http://localhost:8787/api/health
 ```
 
-`/api/readiness` 会分别显示豆包大模型流式语音识别、豆包、认证、TOS、方舟知识库搜索、数据库和 Redis 的配置状态；状态为“已配置”只表示环境变量完整，真实可用性仍需通过一次对应业务请求验证。
+`/api/readiness` 会分别显示豆包大模型流式语音识别、火山方舟 Responses API（豆包大模型）、认证、TOS、火山方舟知识库搜索、数据库和 Redis 的配置状态；状态为“已配置”只表示环境变量完整，真实可用性仍需通过一次对应业务请求验证。
 
 ## 6. 版本发布与本地备份
 
