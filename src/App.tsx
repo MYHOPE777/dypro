@@ -1,1268 +1,383 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import {
-  Activity,
   AlertTriangle,
-  ArrowUpRight,
-  Check,
-  ClipboardPaste,
-  Database,
-  ChevronRight,
+  Archive,
+  BookOpen,
+  CheckCircle2,
+  ChevronDown,
   CircleStop,
-  FileAudio,
-  ExternalLink,
-  Headphones,
-  HardDrive,
-  History,
-  Keyboard,
-  LockKeyhole,
-  LogOut,
-  Mic,
-  Monitor,
-  Pencil,
-  Pause,
-  Plus,
-  Play,
-  QrCode,
+  Clock3,
   Copy,
-  Radio,
+  Database,
+  ExternalLink,
+  History,
+  Mic,
+  MonitorUp,
+  Package,
+  Pause,
+  Pencil,
+  Play,
+  Plus,
   RefreshCw,
+  QrCode,
   Save,
-  ShieldCheck,
+  Send,
+  ShieldAlert,
   Sparkles,
-  Cloud,
-  CloudOff,
-  Download,
-  Volume2,
-  Wifi,
   UserRound,
   UsersRound,
-  XCircle,
+  X,
 } from 'lucide-react';
 import QRCode from 'qrcode';
-import { DEFAULT_PRODUCT } from './shared/products';
-import { complianceForLatestSegment, complianceForPrompt } from './compliance/currentCompliance';
-import { canSelectInputDevice, switchInputDevice } from './microphoneDevice';
-import type { ComplianceResult, ComplianceRule, CoachSuggestion, LiveRoom, Product, ProductImportResponse, PresenterPhrase, PresenterProfile, RuleAuditEntry, ServerMessage, SessionHistorySummary, SessionState, SessionTimelineExport, SpeakerLabel, SpeakerSource, SpeechCorrectionEntry, TimelineEvent, TranscriptSegment } from './shared/types';
+import { LiveSessionClient } from './clients/liveSessionClient';
+import { SessionReviewClient } from './clients/sessionReviewClient';
+import { CatalogClient } from './clients/catalogClient';
+import { DisplayLinkClient, type DisplayLink } from './clients/displayLinkClient';
+import { DEFAULT_PRODUCT, PRODUCTS } from './shared/products';
+import type { ComplianceResult, ComplianceRule, CoachPurpose, PresenterPhrase, PresenterProfile, Product, TranscriptSegment } from './shared/types';
+import type { LiveCommand, LiveSessionSnapshot, SessionReview, SessionSummary } from './shared/v2';
 
-type Role = 'operator' | 'display';
-type AuthIdentity = { actorId: string; displayName: string; role: 'operator' | 'reviewer'; roomIds: string[] };
-type OperatorAccess = AuthIdentity & { token: string; mode: 'multi-user' | 'local-only' };
-type Readiness = {
-  readyForLive: boolean;
-  readyForProduction: boolean;
-  mode: 'production' | 'live-with-local-persistence' | 'demo';
-  streamingAsr: { configured: boolean; label: string };
-  arkResponses: { configured: boolean; label: string };
-  auth: { configured: boolean; label: string };
-  storage: { configured: boolean; label: string };
-  database: { configured: boolean; label: string };
-  objectStorage: { configured: boolean; label: string; status?: { pending: number; failed: number } };
-  redis: { configured: boolean; label: string };
-  knowledge: { configured: boolean; available: boolean; label: string; detail: string; lastError?: string };
+const EMPTY: LiveSessionSnapshot = {
+  sessionId: '', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '默认主播', lifecycle: 'idle',
+  product: DEFAULT_PRODUCT, lineup: PRODUCTS, partialTranscript: '', transcriptHistory: [], latestCompliance: null, alerts: [], coachSuggestions: [], coachPending: false,
+  riskProfile: 'balanced', stats: { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 }, contentRevision: 0, latestSequence: 0, createdAt: Date.now(), updatedAt: Date.now(),
 };
 
-function storedActorId(): string {
-  const stored = localStorage.getItem('live-actor');
-  if (stored) return stored;
-  const generated = `operator-${Math.random().toString(36).slice(2, 10)}`;
-  localStorage.setItem('live-actor', generated);
-  return generated;
+function currentDisplayAlias(): string | undefined {
+  const match = window.location.pathname.match(/^\/screen\/([a-z0-9]{8})\/?$/iu);
+  return match?.[1]?.toUpperCase();
 }
 
-function accessHeaders(actorId: string, token = '', contentType = false): Record<string, string> {
-  return {
-    ...(contentType ? { 'Content-Type': 'application/json' } : {}),
-    'X-Actor-Id': actorId,
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-  };
+function currentSessionId(useStoredSession = true): string | undefined {
+  return new URLSearchParams(window.location.search).get('session')
+    ?? (useStoredSession ? localStorage.getItem('v2-live-session') : null)
+    ?? undefined;
 }
 
-const EMPTY_STATE: SessionState = {
-  sessionId: '',
-  roomId: 'room-default',
-  presenterId: 'presenter-default',
-  presenterName: '默认主播',
-  product: DEFAULT_PRODUCT,
-  lineup: [DEFAULT_PRODUCT],
-  isListening: false,
-  captureState: 'idle',
-  partialTranscript: '',
-  transcriptHistory: [],
-  latestCompliance: null,
-  riskProfile: 'balanced',
-  productContextStartedAt: 0,
-  alerts: [],
-  stats: { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 },
-  lastEventAt: Date.now(),
-};
-
-function useLiveSession(role: Role, access?: OperatorAccess) {
-  const [state, setState] = useState<SessionState>(EMPTY_STATE);
-  const [sessionId, setSessionId] = useState(() => new URLSearchParams(window.location.search).get('session') ?? localStorage.getItem('live-session') ?? '');
-  const [roomId] = useState(() => new URLSearchParams(window.location.search).get('room') ?? localStorage.getItem('live-room') ?? 'room-default');
-  const displayAlias = role === 'display' ? /^\/screen\/([A-Z0-9]{8})$/u.exec(window.location.pathname)?.[1] : undefined;
-  const [localActorId] = useState(storedActorId);
-  const actorId = access?.actorId ?? localActorId;
+function useLive(role: 'operator' | 'display') {
+  const [snapshot, setSnapshot] = useState(EMPTY);
+  const [products, setProducts] = useState<Product[]>(PRODUCTS);
+  const [status, setStatus] = useState('正在连接');
   const [connected, setConnected] = useState(false);
-  const [status, setStatus] = useState('正在连接会话');
-  const [captureDeniedVersion, setCaptureDeniedVersion] = useState(0);
-  const [analysisStartedAt, setAnalysisStartedAt] = useState<number | null>(null);
-  const socketRef = useRef<WebSocket | null>(null);
-  const sessionIdRef = useRef(sessionId);
-  const analysisSegmentRef = useRef<string | null>(null);
+  const clientRef = useRef<LiveSessionClient | null>(null);
 
   useEffect(() => {
-    let reconnectTimer: number | undefined;
-    let disposed = false;
-    const connect = () => {
-      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-      const socket = new WebSocket(`${protocol}://${window.location.host}/ws`);
-      socketRef.current = socket;
-      socket.onopen = () => {
-        setConnected(true);
-        socket.send(JSON.stringify({ type: 'session.join', sessionId: sessionIdRef.current || undefined, roomId, displayAlias, actorId, token: access?.token || undefined, role }));
-      };
-      socket.onmessage = (event) => {
-        const message = JSON.parse(event.data) as ServerMessage;
-        if (message.type === 'connection.ready') {
-          sessionIdRef.current = message.sessionId;
-          setSessionId(message.sessionId);
-          localStorage.setItem('live-session', message.sessionId);
-          setStatus('会话已连接');
-        } else if (message.type === 'state.snapshot') {
-          setState(message.state);
-          if (message.state.latestCompliance?.segmentId === message.state.transcriptHistory.at(-1)?.id) {
-            analysisSegmentRef.current = null;
-            setAnalysisStartedAt(null);
-          }
-        } else if (message.type === 'transcript.partial') {
-          setState((current) => ({ ...current, partialTranscript: message.segment.text }));
-        } else if (message.type === 'transcript.final') {
-          analysisSegmentRef.current = message.segment.id;
-          setAnalysisStartedAt(Date.now());
-          setState((current) => {
-            const existingIndex = current.transcriptHistory.findIndex((segment) => segment.id === message.segment.id);
-            const transcriptHistory = existingIndex < 0
-              ? [...current.transcriptHistory, message.segment].slice(-20)
-              : current.transcriptHistory.map((segment, index) => index === existingIndex ? message.segment : segment);
-            return { ...current, partialTranscript: '', transcriptHistory };
-          });
-        } else if (message.type === 'compliance.result') {
-          if (analysisSegmentRef.current === message.result.segmentId) {
-            analysisSegmentRef.current = null;
-            setAnalysisStartedAt(null);
-          }
-        } else if (message.type === 'system.status') {
-          setStatus(message.message);
-        } else if (message.type === 'capture.denied') {
-          setCaptureDeniedVersion((current) => current + 1);
-          setStatus(message.message);
-        } else if (message.type === 'system.error') {
-          setStatus(message.message);
+    const displayAlias = role === 'display' ? currentDisplayAlias() : undefined;
+    const client = new LiveSessionClient({ role, roomId: 'room-default', displayAlias, sessionId: currentSessionId(!displayAlias) });
+    clientRef.current = client;
+    const unsubscribe = client.subscribe((next) => {
+      setSnapshot(next);
+      setProducts([...client.products]);
+      setConnected(client.connected);
+      if (next.sessionId) {
+        localStorage.setItem('v2-live-session', next.sessionId);
+        const query = new URLSearchParams(window.location.search);
+        if (!query.get('session') && role === 'operator') {
+          query.set('session', next.sessionId);
+          window.history.replaceState(null, '', `${window.location.pathname}?${query}`);
         }
-      };
-      socket.onclose = () => {
-        setConnected(false);
-        analysisSegmentRef.current = null;
-        setAnalysisStartedAt(null);
-        if (!disposed) reconnectTimer = window.setTimeout(connect, 1800);
-      };
-      socket.onerror = () => setStatus('连接暂时不可用，正在重试');
-    };
-    connect();
-    return () => {
-      disposed = true;
-      if (reconnectTimer) window.clearTimeout(reconnectTimer);
-      socketRef.current?.close();
-    };
-  }, [access?.token, actorId, displayAlias, role, roomId]);
-
-  const send = useCallback((message: object) => {
-    if (socketRef.current?.readyState !== WebSocket.OPEN) return false;
-    socketRef.current.send(JSON.stringify(message));
-    return true;
-  }, []);
-
-  return { state, sessionId, roomId, actorId, connected, status, captureDeniedVersion, analysisStartedAt, send };
-}
-
-function useOperatorAccess() {
-  const [localActorId] = useState(storedActorId);
-  const [access, setAccess] = useState<OperatorAccess | null>(null);
-  const [readiness, setReadiness] = useState<Readiness | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [message, setMessage] = useState('');
-
-  useEffect(() => {
-    let disposed = false;
-    const token = localStorage.getItem('live-auth-token') ?? '';
-    const refreshReadiness = async () => {
-      const response = await fetch('/api/readiness');
-      if (!response.ok) throw new Error('开播检查暂时不可用');
-      const ready = await response.json() as Readiness;
-      if (!disposed) setReadiness(ready);
-    };
-    void Promise.all([fetch('/api/auth/status', { headers: accessHeaders(localActorId, token) }), fetch('/api/readiness')]).then(async ([authResponse, readinessResponse]) => {
-      const auth = await authResponse.json() as { mode: OperatorAccess['mode']; authenticated: boolean; identity?: AuthIdentity; message?: string };
-      const ready = await readinessResponse.json() as Readiness;
-      if (disposed) return;
-      setReadiness(ready);
-      if (auth.authenticated && auth.identity) setAccess({ ...auth.identity, token, mode: auth.mode });
-      else {
-        localStorage.removeItem('live-auth-token');
-        setMessage(auth.message ?? '请登录控制台');
       }
-    }).catch((error: unknown) => { if (!disposed) setMessage(error instanceof Error ? error.message : String(error)); }).finally(() => { if (!disposed) setLoading(false); });
-    const readinessTimer = window.setInterval(() => { void refreshReadiness().catch(() => undefined); }, 5_000);
-    return () => {
-      disposed = true;
-      window.clearInterval(readinessTimer);
-    };
-  }, [localActorId]);
+    });
+    const unsubscribeStatus = client.onStatus((next) => { setStatus(next); setConnected(client.connected); });
+    client.connect();
+    return () => { unsubscribe(); unsubscribeStatus(); client.close(); clientRef.current = null; };
+  }, [role]);
 
-  const login = async (actorId: string, password: string) => {
-    setMessage('');
-    try {
-      const response = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ actorId, password }) });
-      const body = await response.json() as { identity?: AuthIdentity; token?: string; message?: string };
-      if (!response.ok || !body.identity || !body.token) return setMessage(body.message ?? '登录失败');
-      localStorage.setItem('live-auth-token', body.token);
-      localStorage.setItem('live-actor', body.identity.actorId);
-      setAccess({ ...body.identity, token: body.token, mode: 'multi-user' });
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
-    }
-  };
-
-  const logout = () => {
-    localStorage.removeItem('live-auth-token');
-    setAccess(null);
-    setMessage('已退出登录');
-  };
-
-  return { access, readiness, loading, message, login, logout };
+  const send = useCallback((command: LiveCommand) => clientRef.current?.send(command) ?? false, []);
+  const sendAudio = useCallback((pcm: ArrayBuffer | Uint8Array) => clientRef.current?.sendAudio(pcm) ?? false, []);
+  return { snapshot, products, status, connected, send, sendAudio };
 }
 
-function useMicrophone(send: (message: object) => void, streamingEnabled: boolean) {
-  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
-  const [deviceId, setDeviceId] = useState('');
-  const [error, setError] = useState('');
+function useMicrophone(sendAudio: (pcm: ArrayBuffer | Uint8Array) => boolean) {
   const [capturing, setCapturing] = useState(false);
-  const [level, setLevel] = useState(0);
+  const [error, setError] = useState('');
   const streamRef = useRef<MediaStream | null>(null);
   const contextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const requestVersionRef = useRef(0);
-  const deviceIdRef = useRef('');
-  const streamingRef = useRef(streamingEnabled);
-  const lastLevelUpdateRef = useRef(0);
-
-  useEffect(() => { streamingRef.current = streamingEnabled; }, [streamingEnabled]);
-
-  const refresh = useCallback(async () => {
-    if (!navigator.mediaDevices?.enumerateDevices) return;
-    const list = await navigator.mediaDevices.enumerateDevices();
-    const inputs = list.filter((device) => device.kind === 'audioinput');
-    setDevices(inputs);
-    const selectedStillExists = deviceIdRef.current && inputs.some((input) => input.deviceId === deviceIdRef.current);
-    if ((!deviceIdRef.current || !selectedStillExists) && inputs[0]) {
-      deviceIdRef.current = inputs[0].deviceId;
-      setDeviceId(inputs[0].deviceId);
-    }
-  }, []);
-
-  useEffect(() => {
-    void refresh();
-    navigator.mediaDevices?.addEventListener('devicechange', refresh);
-    return () => navigator.mediaDevices?.removeEventListener('devicechange', refresh);
-  }, [refresh]);
 
   const stop = useCallback(() => {
-    requestVersionRef.current += 1;
     processorRef.current?.disconnect();
-    processorRef.current = null;
-    contextRef.current?.close();
-    contextRef.current = null;
+    contextRef.current?.close().catch(() => undefined);
     streamRef.current?.getTracks().forEach((track) => track.stop());
+    processorRef.current = null;
+    contextRef.current = null;
     streamRef.current = null;
     setCapturing(false);
-    setLevel(0);
   }, []);
 
   useEffect(() => stop, [stop]);
 
-  const start = useCallback(async (requestedDeviceId = deviceIdRef.current) => {
-    if (streamRef.current) return true;
-    const requestVersion = requestVersionRef.current + 1;
-    requestVersionRef.current = requestVersion;
+  const start = useCallback(async () => {
+    setError('');
     try {
-      setError('');
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { deviceId: requestedDeviceId ? { exact: requestedDeviceId } : undefined, channelCount: 1, echoCancellation: true, noiseSuppression: true },
-      });
-      if (requestVersionRef.current !== requestVersion) {
-        stream.getTracks().forEach((track) => track.stop());
-        return false;
-      }
-      streamRef.current = stream;
-      const context = new AudioContext();
-      contextRef.current = context;
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+      const context = new AudioContext({ sampleRate: 16_000 });
       const source = context.createMediaStreamSource(stream);
       const processor = context.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
       processor.onaudioprocess = (event) => {
-        const input = event.inputBuffer.getChannelData(0);
-        let energy = 0;
-        for (const sample of input) energy += sample * sample;
-        const now = performance.now();
-        if (now - lastLevelUpdateRef.current >= 80) {
-          const rms = Math.sqrt(energy / Math.max(1, input.length));
-          setLevel(Math.min(100, Math.round(rms * 360)));
-          lastLevelUpdateRef.current = now;
-        }
-        if (!streamingRef.current) return;
-        const ratio = context.sampleRate / 16000;
-        const rawOutput = new Int16Array(input.length);
-        for (let index = 0; index < rawOutput.length; index += 1) {
-          rawOutput[index] = Math.max(-1, Math.min(1, input[index])) * 0x7fff;
-        }
-        const rawBytes = new Uint8Array(rawOutput.buffer);
-        let rawBinary = '';
-        for (const byte of rawBytes) rawBinary += String.fromCharCode(byte);
-        send({ type: 'audio.raw', data: btoa(rawBinary), sampleRate: context.sampleRate });
-        const output = new Int16Array(Math.floor(input.length / ratio));
-        for (let index = 0; index < output.length; index += 1) {
-          const value = input[Math.min(input.length - 1, Math.floor(index * ratio))];
-          output[index] = Math.max(-1, Math.min(1, value)) * 0x7fff;
-        }
-        const bytes = new Uint8Array(output.buffer);
-        let binary = '';
-        for (const byte of bytes) binary += String.fromCharCode(byte);
-        send({ type: 'audio', data: btoa(binary) });
+        const samples = event.inputBuffer.getChannelData(0);
+        const pcm = new Int16Array(samples.length);
+        for (let index = 0; index < samples.length; index += 1) pcm[index] = Math.max(-1, Math.min(1, samples[index])) * 0x7fff;
+        sendAudio(pcm.buffer);
       };
       source.connect(processor);
-      const silentSink = context.createGain();
-      silentSink.gain.value = 0;
-      processor.connect(silentSink);
-      silentSink.connect(context.destination);
+      processor.connect(context.destination);
+      streamRef.current = stream;
+      contextRef.current = context;
+      processorRef.current = processor;
       setCapturing(true);
-      void refresh();
-      return true;
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '无法访问麦克风');
-      return false;
+      setError(cause instanceof Error ? cause.message : '无法使用麦克风');
+      stop();
     }
-  }, [refresh, send]);
+  }, [sendAudio, stop]);
 
-  const selectDevice = useCallback(async (nextDeviceId: string) => {
-    if (deviceIdRef.current === nextDeviceId) return true;
-    deviceIdRef.current = nextDeviceId;
-    setDeviceId(nextDeviceId);
-    return switchInputDevice(nextDeviceId, { capturing: Boolean(streamRef.current), stop, start });
-  }, [start, stop]);
-
-  return { devices, deviceId, selectDevice, start, stop, capturing, level, error, refresh };
+  return { capturing, error, start, stop };
 }
 
-function RiskIcon({ risk }: { risk: ComplianceResult['risk'] }) {
-  if (risk === 'blocked') return <XCircle size={18} strokeWidth={2.4} />;
-  if (risk === 'warning') return <AlertTriangle size={18} strokeWidth={2.4} />;
-  return <Check size={18} strokeWidth={2.4} />;
+function formatTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 }
 
-function RiskLabel({ risk }: { risk: ComplianceResult['risk'] }) {
-  return risk === 'blocked' ? '高风险 · 立即替换' : risk === 'warning' ? '需留意 · 建议替换' : '表达可继续';
+function lifecycleText(lifecycle: LiveSessionSnapshot['lifecycle']): string {
+  return ({ idle: '待开播', live: '直播中', paused: '已暂停', ending: '正在收尾', ended: '已结束' })[lifecycle];
 }
 
-function formatReplayOffset(offsetMs: number | null): string {
-  if (offsetMs === null) return '未建立时间基准';
-  const hours = Math.floor(offsetMs / 3_600_000);
-  const minutes = Math.floor((offsetMs % 3_600_000) / 60_000);
-  const seconds = Math.floor((offsetMs % 60_000) / 1_000);
-  const milliseconds = offsetMs % 1_000;
-  return `+${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${milliseconds.toString().padStart(3, '0')}`;
+function riskText(risk: ComplianceResult['risk'] | undefined): string {
+  return risk === 'blocked' ? '高风险' : risk === 'warning' ? '需注意' : '表达安全';
 }
 
-function formatTranscriptOffset(offsetMs: number | null): string {
-  return offsetMs === null ? '演示话术' : formatReplayOffset(offsetMs);
+function SpeakerBadge({ segment }: { segment: TranscriptSegment }) {
+  const automatic = segment.speakerSource === 'automatic';
+  return <span className={`v2-speaker ${segment.speaker === 'other' ? 'other' : 'host'} ${automatic ? 'automatic' : ''}`}>
+    {segment.speaker === 'other' ? <UsersRound size={11} /> : <UserRound size={11} />}
+    {segment.speaker === 'other' ? '其他人' : automatic ? `${segment.speakerId ?? '待确认'}` : '主播'}
+  </span>;
 }
 
-type DisplayLinkResponse = { alias: string; displayUrl: string; expiresAt: number; expiresInSeconds: number };
-
-function AppHeader({ state, connected, status, mode, access }: { state: SessionState; connected: boolean; status: string; mode: Role; access?: OperatorAccess }) {
-  const [displayLink, setDisplayLink] = useState<DisplayLinkResponse | null>(null);
-  const [qrCode, setQrCode] = useState('');
-  const [shareOpen, setShareOpen] = useState(false);
-  const [shareError, setShareError] = useState('');
-  const [copied, setCopied] = useState(false);
-  useEffect(() => {
-    if (mode !== 'operator' || !state.sessionId || !access || !connected) {
-      setDisplayLink(null);
-      setQrCode('');
-      return;
-    }
-    let disposed = false;
-    setShareError('');
-    void fetch(`/api/session/${encodeURIComponent(state.sessionId)}/display-link`, { method: 'POST', headers: accessHeaders(access.actorId, access.token) })
-      .then(async (response) => {
-        const payload = await response.json() as DisplayLinkResponse & { message?: string };
-        if (!response.ok) throw new Error(payload.message ?? '主播屏入口生成失败');
-        return payload;
-      })
-      .then((payload) => { if (!disposed) setDisplayLink(payload); })
-      .catch((error: unknown) => { if (!disposed) setShareError(error instanceof Error ? error.message : '主播屏入口生成失败'); });
-    return () => { disposed = true; };
-  }, [access?.actorId, access?.token, connected, mode, state.sessionId]);
-  useEffect(() => {
-    if (!displayLink) return;
-    let disposed = false;
-    void QRCode.toDataURL(displayLink.displayUrl, { width: 240, margin: 2, errorCorrectionLevel: 'M' })
-      .then((dataUrl) => { if (!disposed) setQrCode(dataUrl); })
-      .catch(() => { if (!disposed) setQrCode(''); });
-    return () => { disposed = true; };
-  }, [displayLink]);
-  const copyDisplayUrl = async () => {
-    if (!displayLink || !navigator.clipboard) return;
-    try {
-      await navigator.clipboard.writeText(displayLink.displayUrl);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1_500);
-    } catch { setCopied(false); }
-  };
-  return (
-    <header className="topbar">
-      <div className="brand-lockup">
-        <div className="brand-mark"><ShieldCheck size={19} /></div>
-        <div><div className="brand-name">dypro</div><div className="brand-sub">抖音直播合规预警</div></div>
-      </div>
-      <div className="live-chip"><span className={`signal-dot ${connected ? 'on' : ''}`} />{connected ? 'LIVE SESSION' : 'CONNECTING'}<span className="chip-divider" />{state.sessionId || '等待会话'}</div>
-      <div className="top-actions">
-        <div className="status-copy"><span className={`status-indicator ${connected ? 'ok' : 'muted'}`} />{status}</div>
-        {mode === 'operator' && <>
-          {displayLink ? <a className="icon-button quiet" href={displayLink.displayUrl} target="_blank" rel="noreferrer" title="打开主播屏"><Monitor size={17} /><span>主播屏</span><ExternalLink size={13} /></a> : <button type="button" className="icon-button quiet" disabled title="正在生成主播屏入口"><Monitor size={17} /><span>主播屏</span></button>}
-          <div className="display-share">
-            <button type="button" className="icon-button quiet display-share-trigger" disabled={!displayLink} onClick={() => setShareOpen((open) => !open)} title="查看主播屏二维码"><QrCode size={17} /><span>{displayLink ? `扫码 · ${displayLink.alias}` : '主播屏二维码'}</span></button>
-            {shareOpen && displayLink && <section className="display-share-panel" aria-label="主播屏入口">
-              <div className="display-share-head"><div><strong>主播屏入口</strong><small>临时地址 · {new Date(displayLink.expiresAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 失效</small></div><button type="button" className="icon-button quiet" onClick={() => setShareOpen(false)} title="关闭二维码">×</button></div>
-              {qrCode ? <img className="display-share-qr" src={qrCode} alt={`主播屏二维码 ${displayLink.alias}`} /> : <div className="display-share-qr-loading">正在生成二维码</div>}
-              <div className="display-share-code"><span>短地址名称</span><strong>{displayLink.alias}</strong></div>
-              <div className="display-share-actions"><a href={displayLink.displayUrl} target="_blank" rel="noreferrer"><Monitor size={14} />打开主播屏</a><button type="button" onClick={() => void copyDisplayUrl()} disabled={!navigator.clipboard} title="复制主播屏地址">{copied ? <Check size={14} /> : <Copy size={14} />}</button></div>
-              {shareError && <small className="display-share-error">{shareError}</small>}
-            </section>}
-          </div>
-        </>}
-        {mode === 'display' && <a className="icon-button quiet" href={`/?session=${state.sessionId}&room=${state.roomId}`} title="打开控制台"><ArrowUpRight size={17} /><span>控制台</span></a>}
-      </div>
-    </header>
-  );
-}
-
-function ProductRail({ state, send, onOpenLibrary }: { state: SessionState; send: (message: object) => void; onOpenLibrary: () => void }) {
-  return (
-    <section className="rail-section product-rail">
-      <div className="section-kicker">当前商品 <span>PRODUCT QUEUE</span></div>
-      <div className="product-list">
-        {state.lineup.map((product) => <button type="button" className={`product-item ${state.product.id === product.id ? 'selected' : ''}`} key={product.id} onClick={() => send({ type: 'product.select', productId: product.id })}>
-          <img src={product.image} alt="" /><span className="product-item-copy"><strong>{product.name}</strong><small>{product.category} · {product.price}</small></span><ChevronRight size={15} className="product-chevron" />
-        </button>)}
-      </div>
-      <button type="button" className="library-button" onClick={onOpenLibrary}><ClipboardPaste size={14} />管理商品库与本场清单</button>
-    </section>
-  );
-}
-
-type RuleDraft = Pick<ComplianceRule, 'name' | 'scope' | 'matchType' | 'pattern' | 'risk' | 'title' | 'reason' | 'alternative' | 'policyRef'>;
-
-const EMPTY_RULE: RuleDraft = {
-  name: '', scope: 'room', matchType: 'contains', pattern: '', risk: 'warning', title: '', reason: '', alternative: '', policyRef: '内部收集规则',
-};
-
-const RULE_STATUS_LABEL: Record<ComplianceRule['status'], string> = {
-  draft: '草稿', pending_review: '待审核', published: '已生效', rejected: '已驳回', rolled_back: '已回滚',
-};
-const RULE_ACTION_LABEL: Record<RuleAuditEntry['action'], string> = {
-  created: '创建', learned: '智能发现', observed: '新增证据', submitted: '提交审核', approved: '审核通过', rejected: '驳回', edited: '保存新版本', rolled_back: '回滚', disabled: '停用', enabled: '启用',
-};
-
-function WorkspaceModal({ state, access, send, onClose, onLogout }: { state: SessionState; access: OperatorAccess; send: (message: object) => boolean; onClose: () => void; onLogout: () => void }) {
-  const actorId = access.actorId;
-  const [tab, setTab] = useState<'products' | 'rules' | 'phrases'>('products');
-  const [rooms, setRooms] = useState<LiveRoom[]>([]);
-  const [products, setProducts] = useState<Product[]>([]);
-  const [selectedIds, setSelectedIds] = useState<string[]>(state.lineup.map((product) => product.id));
-  const [importText, setImportText] = useState('');
-  const [importResult, setImportResult] = useState<ProductImportResponse | null>(null);
-  const [rules, setRules] = useState<ComplianceRule[]>([]);
-  const [audits, setAudits] = useState<RuleAuditEntry[]>([]);
-  const [ruleDraft, setRuleDraft] = useState<RuleDraft>(EMPTY_RULE);
-  const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
-  const [newRoomName, setNewRoomName] = useState('');
-  const [newAccountName, setNewAccountName] = useState('');
-  const [actorDraft, setActorDraft] = useState(actorId);
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState('');
-
-  const actorHeaders = accessHeaders(actorId, access.token, true);
-  const refresh = useCallback(async () => {
-    const [roomsResponse, productsResponse, rulesResponse, auditsResponse] = await Promise.all([
-      fetch('/api/rooms', { headers: actorHeaders }), fetch(`/api/rooms/${state.roomId}/products`, { headers: actorHeaders }), fetch(`/api/rooms/${state.roomId}/rules`, { headers: actorHeaders }), fetch(`/api/rooms/${state.roomId}/rules/audits`, { headers: actorHeaders }),
-    ]);
-    if (!roomsResponse.ok || !productsResponse.ok || !rulesResponse.ok || !auditsResponse.ok) throw new Error('工作区数据读取失败');
-    setRooms(await roomsResponse.json() as LiveRoom[]);
-    setProducts(await productsResponse.json() as Product[]);
-    setRules(await rulesResponse.json() as ComplianceRule[]);
-    setAudits(await auditsResponse.json() as RuleAuditEntry[]);
-  }, [access.token, actorId, state.roomId]);
-
-  useEffect(() => { void refresh().catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error))); }, [refresh]);
-
-  const switchRoom = (roomId: string) => {
-    localStorage.setItem('live-room', roomId);
-    localStorage.removeItem('live-session');
-    window.location.assign(`/?room=${roomId}`);
-  };
-
-  const switchActor = () => {
-    const nextActor = actorDraft.trim();
-    if (!nextActor) return;
-    localStorage.setItem('live-actor', nextActor);
-    window.location.reload();
-  };
-
-  const parseProduct = async () => {
-    if (!importText.trim()) return;
-    setBusy(true);
-    setMessage('');
-    try {
-      const response = await fetch('/api/products/parse', { method: 'POST', headers: actorHeaders, body: JSON.stringify({ text: importText }) });
-      const body = await response.json() as ProductImportResponse & { message?: string };
-      if (!response.ok) throw new Error(body.message ?? '商品识别失败');
-      setImportResult(body);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const saveProduct = async () => {
-    if (!importResult) return;
-    setBusy(true);
-    setMessage('');
-    try {
-      const response = await fetch(`/api/rooms/${state.roomId}/products`, { method: 'POST', headers: actorHeaders, body: JSON.stringify({ product: importResult.product }) });
-      const saved = await response.json() as Product & { message?: string };
-      if (!response.ok) throw new Error(saved.message ?? '商品保存失败');
-      setSelectedIds((current) => [...new Set([...current, saved.id])]);
-      setImportText('');
-      setImportResult(null);
-      await refresh();
-      setMessage('商品已保存到当前直播间');
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const createRoom = async () => {
-    if (!newRoomName.trim() || !newAccountName.trim()) return;
-    const response = await fetch('/api/rooms', { method: 'POST', headers: actorHeaders, body: JSON.stringify({ name: newRoomName, accountName: newAccountName }) });
-    const body = await response.json() as LiveRoom & { message?: string };
-    if (!response.ok) return setMessage(body.message ?? '直播间创建失败');
-    switchRoom(body.id);
-  };
-
-  const saveRule = async () => {
-    setBusy(true);
-    setMessage('');
-    try {
-      const response = await fetch(editingRuleId ? `/api/rules/${editingRuleId}` : `/api/rooms/${state.roomId}/rules`, { method: editingRuleId ? 'PATCH' : 'POST', headers: actorHeaders, body: JSON.stringify(ruleDraft) });
-      const body = await response.json() as ComplianceRule & { message?: string };
-      if (!response.ok) throw new Error(body.message ?? '规则保存失败');
-      setRuleDraft(EMPTY_RULE);
-      setEditingRuleId(null);
-      await refresh();
-      setMessage(body.status === 'pending_review' ? '共享规则已提交审核' : '规则已立即生效');
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const ruleAction = async (rule: ComplianceRule, action: 'approve' | 'reject' | 'rollback') => {
-    setBusy(true);
-    setMessage('');
-    try {
-      const body = action === 'rollback' ? { targetVersion: Math.max(1, rule.version - 1) } : {};
-      const response = await fetch(`/api/rules/${rule.id}/${action}`, { method: 'POST', headers: actorHeaders, body: JSON.stringify(body) });
-      const result = await response.json() as { message?: string };
-      if (!response.ok) throw new Error(result.message ?? '规则操作失败');
-      await refresh();
-      setMessage('规则状态已更新');
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const currentRoom = rooms.find((room) => room.id === state.roomId);
-  const canManageRule = (rule: ComplianceRule) => access.role === 'reviewer' || rule.createdBy === actorId || (rule.scope === 'room' && currentRoom?.ownerActorId === actorId);
-  const setRuleEnabled = async (rule: ComplianceRule) => {
-    setBusy(true);
-    setMessage('');
-    try {
-      const response = await fetch(`/api/rules/${rule.id}/enabled`, { method: 'POST', headers: actorHeaders, body: JSON.stringify({ enabled: !rule.enabled }) });
-      const result = await response.json() as { message?: string };
-      if (!response.ok) throw new Error(result.message ?? '规则启停失败');
-      await refresh();
-      setMessage(rule.enabled ? '规则已停用' : '规则已重新启用');
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-  return <div className="modal-backdrop" role="presentation"><section className="workspace-modal" role="dialog" aria-modal="true" aria-label="直播间工作区">
-    <header className="workspace-head"><div><span className="section-kicker">直播间工作区 <span>ROOM DATA</span></span><h2>{currentRoom?.name ?? '当前直播间'}</h2><p>{currentRoom?.accountName ?? state.roomId} · 负责人 {currentRoom?.ownerActorId ?? 'owner'}</p></div>{access.mode === 'multi-user' ? <div className="actor-identity"><span><LockKeyhole size={13} />{access.displayName}</span><small>{access.role === 'reviewer' ? '规则审核人' : '场控账号'}</small><button type="button" onClick={onLogout} title="退出登录"><LogOut size={14} /></button></div> : <div className="actor-switch"><input value={actorDraft} onChange={(event) => setActorDraft(event.target.value)} aria-label="当前操作人账号" /><button type="button" onClick={switchActor}>切换操作人</button></div>}<button type="button" className="modal-close" onClick={onClose} title="关闭">×</button></header>
-    <div className="room-toolbar"><select value={state.roomId} onChange={(event) => switchRoom(event.target.value)} aria-label="切换直播间">{rooms.map((room) => <option key={room.id} value={room.id}>{room.name} · {room.accountName}</option>)}</select><input value={newRoomName} onChange={(event) => setNewRoomName(event.target.value)} placeholder="新直播间名称" /><input value={newAccountName} onChange={(event) => setNewAccountName(event.target.value)} placeholder="抖音账号名称" /><button type="button" onClick={() => void createRoom()}><Plus size={14} />创建</button></div>
-    <div className="workspace-tabs"><button type="button" className={tab === 'products' ? 'active' : ''} onClick={() => setTab('products')}><Database size={15} />商品库</button><button type="button" className={tab === 'rules' ? 'active' : ''} onClick={() => setTab('rules')}><ShieldCheck size={15} />规则库</button><button type="button" className={tab === 'phrases' ? 'active' : ''} onClick={() => setTab('phrases')}><Sparkles size={15} />主播话术库</button></div>
-    {tab === 'products' ? <div className="workspace-grid">
-      <section className="catalog-pane"><div className="pane-head"><div><strong>长期商品库</strong><span>{products.length} 件</span></div><button type="button" title="刷新" onClick={() => void refresh()}><RefreshCw size={14} /></button></div><div className="catalog-list">{products.map((product) => <label className="catalog-row" key={product.id}><input type="checkbox" checked={selectedIds.includes(product.id)} onChange={(event) => setSelectedIds((current) => event.target.checked ? [...new Set([...current, product.id])] : current.filter((id) => id !== product.id))} /><img src={product.image} alt="" /><span><strong>{product.name}</strong><small>{product.price} · 库存 {product.stock ?? '待确认'} · {product.sku || '无 SKU'}</small></span></label>)}</div><button type="button" className="primary-wide" disabled={selectedIds.length === 0} onClick={() => { if (send({ type: 'lineup.set', productIds: selectedIds })) onClose(); else setMessage('会话连接中，请稍后重试'); }}><Save size={15} />保存为本场商品清单</button></section>
-      <section className="import-pane"><div className="pane-head"><div><strong>粘贴识别商品</strong><span>豆包结构化</span></div></div><textarea value={importText} onChange={(event) => setImportText(event.target.value)} placeholder="粘贴商品标题、详情、价格、库存、SKU、卖点等文本" /><button type="button" className="secondary-wide" disabled={busy || !importText.trim()} onClick={() => void parseProduct()}><ClipboardPaste size={15} />{busy ? '识别中' : '识别商品信息'}</button>{importResult && <div className="product-draft"><div className="draft-source">{importResult.source === 'doubao' ? 'DOUBAO' : 'LOCAL'} · {Math.round(importResult.confidence * 100)}%</div><label>名称<input value={importResult.product.name} onChange={(event) => setImportResult({ ...importResult, product: { ...importResult.product, name: event.target.value } })} /></label><div className="draft-fields"><label>价格<input value={importResult.product.price} onChange={(event) => setImportResult({ ...importResult, product: { ...importResult.product, price: event.target.value } })} /></label><label>库存<input type="number" value={importResult.product.stock ?? ''} onChange={(event) => setImportResult({ ...importResult, product: { ...importResult.product, stock: event.target.value ? Number(event.target.value) : null } })} /></label></div><label>SKU<input value={importResult.product.sku} onChange={(event) => setImportResult({ ...importResult, product: { ...importResult.product, sku: event.target.value } })} /></label>{importResult.warnings.map((warning) => <p key={warning}>{warning}</p>)}<button type="button" className="primary-wide" onClick={() => void saveProduct()}><Save size={15} />保存到商品库</button></div>}</section>
-    </div> : tab === 'rules' ? <div className="workspace-grid rules-grid">
-      <section className="rule-form"><div className="pane-head"><div><strong>{editingRuleId ? '编辑规则新版本' : '新增内部规则'}</strong><span>房间规则立即生效，共享规则需审核</span></div></div><input value={ruleDraft.name} onChange={(event) => setRuleDraft({ ...ruleDraft, name: event.target.value })} placeholder="规则名称" /><div className="draft-fields"><select value={ruleDraft.scope} onChange={(event) => setRuleDraft({ ...ruleDraft, scope: event.target.value as RuleDraft['scope'] })}><option value="room">当前直播间</option><option value="shared">共享规则</option></select><select value={ruleDraft.risk} onChange={(event) => setRuleDraft({ ...ruleDraft, risk: event.target.value as RuleDraft['risk'] })}><option value="warning">需留意</option><option value="blocked">高风险</option><option value="safe">安全提示（不覆盖高风险）</option></select></div><div className="draft-fields"><select value={ruleDraft.matchType} onChange={(event) => setRuleDraft({ ...ruleDraft, matchType: event.target.value as RuleDraft['matchType'] })}><option value="contains">包含关键词</option><option value="regex">正则表达式</option></select><input value={ruleDraft.pattern} onChange={(event) => setRuleDraft({ ...ruleDraft, pattern: event.target.value })} placeholder="违规词或匹配表达式" /></div><input value={ruleDraft.title} onChange={(event) => setRuleDraft({ ...ruleDraft, title: event.target.value })} placeholder="预警标题" /><textarea value={ruleDraft.reason} onChange={(event) => setRuleDraft({ ...ruleDraft, reason: event.target.value })} placeholder="违规原因" /><textarea value={ruleDraft.alternative} onChange={(event) => setRuleDraft({ ...ruleDraft, alternative: event.target.value })} placeholder="主播可立即照读的替代表达" /><button type="button" className="primary-wide" disabled={busy || !ruleDraft.name.trim() || !ruleDraft.pattern.trim() || !ruleDraft.title.trim() || !ruleDraft.reason.trim() || !ruleDraft.alternative.trim()} onClick={() => void saveRule()}><Save size={15} />{editingRuleId ? '保存新版本' : '保存规则'}</button></section>
-      <section className="catalog-pane"><div className="pane-head"><div><strong>规则与审核</strong><span>{rules.length} 条 · 日志 {audits.length} 条</span></div><button type="button" title="刷新" onClick={() => void refresh()}><RefreshCw size={14} /></button></div><div className="rule-list">{rules.map((rule) => <div className="rule-row" key={rule.id}><div><span className={`rule-status ${rule.status} ${rule.enabled ? '' : 'disabled'}`}>{rule.enabled ? RULE_STATUS_LABEL[rule.status] : '已停用'}</span><strong>{rule.name}</strong><small>v{rule.version} · {rule.scope === 'shared' ? '共享' : '当前直播间'} · {rule.pattern}{rule.origin === 'learned' ? ` · 智能沉淀 ${Math.round((rule.confidence ?? 0) * 100)}% · 命中 ${rule.evidenceCount ?? 1} 次${(rule.evidenceRoomIds?.length ?? 1) > 1 ? ` · ${rule.evidenceRoomIds?.length} 个直播间` : ''}` : ''}</small></div><p>{rule.reason}</p><div className="rule-actions"><button type="button" disabled={busy} onClick={() => { setEditingRuleId(rule.id); setRuleDraft({ name: rule.name, scope: rule.scope, matchType: rule.matchType, pattern: rule.pattern, risk: rule.risk, title: rule.title, reason: rule.reason, alternative: rule.alternative, policyRef: rule.policyRef }); }}>编辑</button>{(access.role === 'reviewer' || (rule.scope === 'room' && currentRoom?.ownerActorId === actorId)) && rule.status === 'pending_review' && <><button type="button" disabled={busy} onClick={() => void ruleAction(rule, 'approve')}>审核通过</button><button type="button" disabled={busy} onClick={() => void ruleAction(rule, 'reject')}>驳回</button></>}{rule.version > 1 && canManageRule(rule) && <button type="button" disabled={busy} onClick={() => void ruleAction(rule, 'rollback')}>回滚上一版</button>}{canManageRule(rule) && rule.status === 'published' && <button type="button" disabled={busy} onClick={() => void setRuleEnabled(rule)}>{rule.enabled ? '停用' : '重新启用'}</button>}</div></div>)}</div><div className="audit-list"><strong>最近操作日志</strong>{audits.slice(-6).reverse().map((audit) => <div key={audit.id}><span>{new Date(audit.occurredAt).toLocaleString('zh-CN', { hour12: false })}</span><em>{audit.actorId}</em><span>{RULE_ACTION_LABEL[audit.action]}</span></div>)}</div></section>
-    </div> : <PresenterPhrasePanel state={state} access={access} send={send} />}
-    {message && <div className="workspace-message">{message}</div>}
-  </section></div>;
-}
-
-function MicPanel({ state, connected, captureDeniedVersion, send, onOpenReview }: { state: SessionState; connected: boolean; captureDeniedVersion: number; send: (message: object) => boolean; onOpenReview: () => void }) {
-  const microphone = useMicrophone(send, state.captureState === 'live' && state.isListening);
-  const [showDevices, setShowDevices] = useState(false);
-  const selected = microphone.devices.find((device) => device.deviceId === microphone.deviceId);
-  const canSelectDevice = canSelectInputDevice(state.captureState, connected);
-  useEffect(() => { if (captureDeniedVersion > 0) microphone.stop(); }, [captureDeniedVersion, microphone.stop]);
-  useEffect(() => { if (!connected) microphone.stop(); }, [connected, microphone.stop]);
-  useEffect(() => { if (state.captureState === 'ended') microphone.stop(); }, [microphone.stop, state.captureState]);
-
-  const startLive = async (resume = false) => {
-    if (!await microphone.start()) return;
-    if (!send({ type: resume ? 'control.resume' : 'control.start' })) microphone.stop();
-  };
-  const endLive = () => {
-    if (send({ type: 'control.end' })) microphone.stop();
-  };
-  const pauseLive = () => {
-    if (send({ type: 'control.pause' })) microphone.stop();
-  };
-  const deviceTitle = state.captureState === 'ended' ? '本场直播已结束'
-    : state.captureState === 'paused' ? '直播收音已暂停'
-      : state.captureState === 'live' ? microphone.capturing ? '直播收音运行中' : '其他控制台正在收音'
-        : microphone.capturing ? '正在测试输入音量' : '蓝牙麦克风待检测';
-  const levelLabel = microphone.level >= 18 ? '音量正常' : microphone.level >= 5 ? '声音偏低' : '等待声音';
-  return <section className="rail-section mic-section">
-    <div className="section-kicker">直播收音 <span>{state.captureState.toUpperCase()}</span></div>
-    <div className="mic-device-row"><div className={`mic-orb ${microphone.capturing ? 'active' : ''}`}><Mic size={21} /></div><div className="mic-device-name"><strong>{deviceTitle}</strong><small>{selected?.label || '尚未取得麦克风设备名称'}</small></div></div>
-    <button type="button" className="device-toggle" disabled={!canSelectDevice} onClick={() => { setShowDevices((value) => !value); void microphone.refresh(); }}><Headphones size={15} />选择输入设备 <ChevronRight size={14} className={showDevices ? 'rotate' : ''} /></button>
-    {showDevices && <div className="device-select-wrap"><select value={microphone.deviceId} onChange={(event) => { void microphone.selectDevice(event.target.value); }} aria-label="选择麦克风" disabled={!canSelectDevice}><option value="">系统默认输入</option>{microphone.devices.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label || `麦克风 ${device.deviceId.slice(0, 5)}`}</option>)}</select></div>}
-    {microphone.error && <div className="inline-error"><AlertTriangle size={14} />{microphone.error}</div>}
-    {microphone.capturing && <div className="mic-meter"><div className="mic-meter-track"><i style={{ width: `${Math.max(2, microphone.level)}%` }} /></div><span>{levelLabel}</span></div>}
-    {state.captureState === 'idle' && <div className="mic-control-stack"><button type="button" className="test-control" onClick={() => microphone.capturing ? microphone.stop() : void microphone.start()} disabled={!connected}><Activity size={15} />{microphone.capturing ? '结束设备测试' : '检测并测试麦克风'}</button><button type="button" className="main-control start" onClick={() => void startLive()} disabled={!connected}><Radio size={16} />开始直播收音</button></div>}
-    {state.captureState === 'live' && <div className="mic-control-stack horizontal"><button type="button" className="test-control" onClick={pauseLive} disabled={!connected}><Pause size={15} fill="currentColor" />暂停</button><button type="button" className="main-control stop" onClick={endLive} disabled={!connected}><CircleStop size={16} />结束直播</button></div>}
-    {state.captureState === 'paused' && <div className="mic-control-stack horizontal"><button type="button" className="main-control start" onClick={() => void startLive(true)} disabled={!connected}><Play size={16} fill="currentColor" />继续收音</button><button type="button" className="main-control stop" onClick={endLive} disabled={!connected}><CircleStop size={16} />结束直播</button></div>}
-    <button type="button" className="review-control" onClick={onOpenReview}><History size={16} />{state.captureState === 'ended' ? '复核本场与历史' : '查看历史直播记录'}</button>
-    <span className="capture-note"><span className={`capture-dot ${state.isListening ? 'active' : ''}`} />{state.captureState === 'live' ? '流式语音识别中' : state.captureState === 'paused' ? '流式语音识别已暂停' : state.captureState === 'ended' ? '本地已归档' : microphone.capturing ? '本地设备测试' : '流式语音识别待命'}</span>
+function TranscriptFeed({ snapshot, compact = false }: { snapshot: LiveSessionSnapshot; compact?: boolean }) {
+  const items = snapshot.transcriptHistory.slice(compact ? -4 : -8);
+  return <section className={`v2-transcript ${compact ? 'compact' : ''}`}>
+    <header><div><span>实时转录</span><strong>{snapshot.partialTranscript ? '识别中' : '已同步'}</strong></div><small>共 {snapshot.transcriptHistory.length} 段</small></header>
+    {snapshot.partialTranscript && <div className="v2-partial"><span>···</span><p>{snapshot.partialTranscript}</p></div>}
+    <div className="v2-transcript-list">
+      {items.map((segment) => <article key={segment.id}><time>{formatTime(segment.timestamp)}</time><SpeakerBadge segment={segment} /><p>{segment.text}</p></article>)}
+      {!items.length && !snapshot.partialTranscript && <div className="v2-empty">开始收音后，识别结果会出现在这里</div>}
+    </div>
   </section>;
 }
 
-type ReviewTranscript = TranscriptSegment & {
-  audioStartMs: number | null;
-  audioEndMs: number | null;
-  revisions: number;
-  compliance?: Pick<ComplianceResult, 'risk' | 'matchedTerms'>;
-};
-
-function buildReviewTranscripts(events: TimelineEvent[]): ReviewTranscript[] {
-  const transcripts = new Map<string, ReviewTranscript>();
-  const speakerBindings = new Map<string, SpeakerLabel>();
-  for (const event of events) {
-    if (event.type === 'transcript.final') {
-      const segmentId = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
-      const text = typeof event.payload.text === 'string' ? event.payload.text : '';
-      if (!segmentId || !text) continue;
-      const audioStartSample = typeof event.payload.audioStartSample === 'number' ? event.payload.audioStartSample : null;
-      const audioEndSample = typeof event.payload.audioEndSample === 'number' ? event.payload.audioEndSample : null;
-      transcripts.set(segmentId, {
-        id: segmentId,
-        text,
-        isFinal: true,
-        timestamp: event.occurredAt,
-        offsetMs: event.offsetMs,
-        startOffsetMs: typeof event.payload.startOffsetMs === 'number' ? event.payload.startOffsetMs : null,
-        endOffsetMs: typeof event.payload.endOffsetMs === 'number' ? event.payload.endOffsetMs : event.offsetMs,
-        speaker: event.payload.speaker === 'other' ? 'other' : 'host',
-        ...(typeof event.payload.speakerId === 'string' ? { speakerId: event.payload.speakerId } : {}),
-        ...(event.payload.speakerSource === 'automatic' || event.payload.speakerSource === 'manual' || event.payload.speakerSource === 'default' ? { speakerSource: event.payload.speakerSource } : {}),
-        ...(typeof event.payload.speakerConfidence === 'number' ? { speakerConfidence: event.payload.speakerConfidence } : {}),
-        audioStartMs: audioStartSample === null ? null : Math.round((audioStartSample / 16_000) * 1_000),
-        audioEndMs: audioEndSample === null ? null : Math.round((audioEndSample / 16_000) * 1_000),
-        revisions: 0,
-      });
-    }
-    if (event.type === 'transcript.corrected') {
-      const segmentId = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
-      const correctedText = typeof event.payload.correctedText === 'string' ? event.payload.correctedText : '';
-      const existing = transcripts.get(segmentId);
-      if (existing && correctedText) transcripts.set(segmentId, { ...existing, text: correctedText, compliance: undefined, revisions: existing.revisions + 1 });
-    }
-    if (event.type === 'transcript.annotated') {
-      const segmentId = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
-      const existing = transcripts.get(segmentId);
-      const speaker = event.payload.speaker === 'other' ? 'other' : 'host';
-      const speakerId = typeof event.payload.speakerId === 'string' ? event.payload.speakerId : existing?.speakerId;
-      if (speakerId) speakerBindings.set(speakerId, speaker);
-      if (existing) transcripts.set(segmentId, {
-        ...existing,
-        speaker,
-        speakerSource: 'manual',
-        ...(speakerId ? { speakerId } : {}),
-        speakerConfidence: 1,
-      });
-    }
-    if (event.type === 'compliance.result') {
-      const segmentId = typeof event.payload.transcriptSegmentId === 'string' ? event.payload.transcriptSegmentId : '';
-      const existing = transcripts.get(segmentId);
-      if (existing) transcripts.set(segmentId, {
-        ...existing,
-        compliance: {
-          risk: event.payload.risk === 'blocked' || event.payload.risk === 'warning' ? event.payload.risk : 'safe',
-          matchedTerms: Array.isArray(event.payload.matchedTerms) ? event.payload.matchedTerms.filter((term): term is string => typeof term === 'string') : [],
-        },
-      });
-    }
-  }
-  return [...transcripts.values()]
-    .map((segment) => segment.speakerId && speakerBindings.has(segment.speakerId)
-      ? { ...segment, speaker: speakerBindings.get(segment.speakerId)!, speakerSource: 'manual' as const, speakerConfidence: 1 }
-      : segment)
-    .sort((first, second) => first.timestamp - second.timestamp);
-}
-
-function deriveTextDifference(originalText: string, correctedText: string): { wrongText: string; correctText: string } | null {
-  const original = [...originalText];
-  const corrected = [...correctedText];
-  let prefix = 0;
-  while (prefix < original.length && prefix < corrected.length && original[prefix] === corrected[prefix]) prefix += 1;
-  let suffix = 0;
-  while (suffix < original.length - prefix && suffix < corrected.length - prefix && original[original.length - 1 - suffix] === corrected[corrected.length - 1 - suffix]) suffix += 1;
-  const wrongText = original.slice(prefix, original.length - suffix).join('').trim();
-  const correctText = corrected.slice(prefix, corrected.length - suffix).join('').trim();
-  return wrongText && correctText && wrongText !== correctText ? { wrongText, correctText } : null;
-}
-
-function syncCaption(summary?: SessionHistorySummary): string {
-  if (!summary || summary.sync.state === 'local-only') return '仅保存在本机';
-  if (summary.sync.state === 'approval-required') return '待复核确认上传';
-  if (summary.sync.state === 'pending') return '已确认，正在上传';
-  if (summary.sync.state === 'failed') return '上传失败，将自动重试';
-  return '已上传知识库和数据库';
-}
-
-function SessionReviewModal({ state, access, onClose }: { state: SessionState; access: OperatorAccess; onClose: () => void }) {
-  const [history, setHistory] = useState<SessionHistorySummary[]>([]);
-  const [selectedSessionId, setSelectedSessionId] = useState(state.captureState === 'ended' ? state.sessionId : '');
-  const [timeline, setTimeline] = useState<SessionTimelineExport | null>(null);
-  const [corrections, setCorrections] = useState<SpeechCorrectionEntry[]>([]);
-  const [audioUrl, setAudioUrl] = useState('');
-  const [noteDraft, setNoteDraft] = useState('');
-  const [editing, setEditing] = useState<{ segment: ReviewTranscript; text: string; wrongText: string; correctText: string; learn: boolean; pairTouched: boolean } | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState('正在载入直播记录');
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const audioUrlRef = useRef('');
-  const selectedSummary = history.find((session) => session.sessionId === selectedSessionId);
-  const selectedEditable = selectedSummary?.captureState === 'ended';
-
-  const loadHistory = useCallback(async () => {
-    const response = await fetch(`/api/rooms/${state.roomId}/sessions`, { headers: accessHeaders(access.actorId, access.token) });
-    if (!response.ok) throw new Error('历史直播记录读取失败');
-    const sessions = await response.json() as SessionHistorySummary[];
-    setHistory(sessions);
-    setSelectedSessionId((current) => {
-      if (current && sessions.some((session) => session.sessionId === current)) return current;
-      if (state.captureState === 'ended' && sessions.some((session) => session.sessionId === state.sessionId)) return state.sessionId;
-      return sessions.find((session) => session.sessionId !== state.sessionId && session.captureState !== 'live')?.sessionId ?? sessions[0]?.sessionId ?? '';
-    });
-  }, [access.actorId, access.token, state.captureState, state.roomId, state.sessionId]);
-
-  const loadDetails = useCallback(async () => {
-    if (!selectedSessionId) {
-      setTimeline(null);
-      return;
-    }
-    const headers = accessHeaders(access.actorId, access.token);
-    const [timelineResponse, correctionsResponse, audioResponse] = await Promise.all([
-      fetch(`/api/session/${selectedSessionId}/timeline`, { headers }),
-      fetch(`/api/rooms/${state.roomId}/speech-corrections`, { headers }),
-      fetch(`/api/session/${selectedSessionId}/audio.wav`, { headers }),
-    ]);
-    if (!timelineResponse.ok) throw new Error('场次时间线读取失败');
-    if (!correctionsResponse.ok) throw new Error('长期纠错词库读取失败');
-    setTimeline(await timelineResponse.json() as SessionTimelineExport);
-    setCorrections(await correctionsResponse.json() as SpeechCorrectionEntry[]);
-    if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
-    audioUrlRef.current = '';
-    setAudioUrl('');
-    if (audioResponse.ok) {
-      const nextUrl = URL.createObjectURL(await audioResponse.blob());
-      audioUrlRef.current = nextUrl;
-      setAudioUrl(nextUrl);
-    }
-    setEditing(null);
-    setMessage(audioResponse.ok ? '' : '本场没有可播放的音频');
-  }, [access.actorId, access.token, selectedSessionId, state.roomId]);
-
-  useEffect(() => {
-    void loadHistory().catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error)));
-    return () => { if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current); };
-  }, [loadHistory]);
-  useEffect(() => {
-    if (!selectedSessionId) return;
-    void loadDetails().catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error)));
-    const settleTimer = window.setTimeout(() => { void Promise.all([loadDetails(), loadHistory()]).catch(() => undefined); }, 2_500);
-    return () => window.clearTimeout(settleTimer);
-  }, [loadDetails, selectedSessionId]);
-  useEffect(() => { setNoteDraft(selectedSummary?.note ?? ''); }, [selectedSummary?.note, selectedSessionId]);
-
-  const refreshSelected = async () => {
-    await Promise.all([loadDetails(), loadHistory()]);
-  };
-  const transcripts = buildReviewTranscripts(timeline?.events ?? []);
-  const beginEdit = (segment: ReviewTranscript) => {
-    if (!selectedEditable) return;
-    setEditing({ segment, text: segment.text, wrongText: '', correctText: '', learn: true, pairTouched: false });
-  };
-  const updateDraft = (text: string) => setEditing((current) => {
-    if (!current) return null;
-    const derived = deriveTextDifference(current.segment.text, text);
-    return { ...current, text, ...(!current.pairTouched ? { wrongText: derived?.wrongText ?? '', correctText: derived?.correctText ?? '' } : {}) };
-  });
-  const saveCorrection = async () => {
-    if (!editing?.text.trim() || !selectedSessionId) return;
-    setBusy(true); setMessage('');
-    try {
-      const response = await fetch(`/api/session/${selectedSessionId}/transcripts/${editing.segment.id}`, {
-        method: 'PATCH',
-        headers: accessHeaders(access.actorId, access.token, true),
-        body: JSON.stringify({ text: editing.text.trim(), learn: editing.learn, wrongText: editing.wrongText.trim() || undefined, correctText: editing.correctText.trim() || undefined }),
-      });
-      const result = await response.json() as { message?: string };
-      if (!response.ok) throw new Error(result.message ?? '转录纠错失败');
-      const learned = editing.learn && editing.wrongText && editing.correctText;
-      setEditing(null);
-      await refreshSelected();
-      setMessage(learned ? '已保存到本机，并加入长期纠错词库；复核后可确认上传' : '转录已保存到本机；复核后可确认上传');
-    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
-    finally { setBusy(false); }
-  };
-  const saveNote = async () => {
-    if (!selectedSessionId || !selectedEditable) return;
-    setBusy(true); setMessage('');
-    try {
-      const response = await fetch(`/api/session/${selectedSessionId}/note`, {
-        method: 'PATCH', headers: accessHeaders(access.actorId, access.token, true), body: JSON.stringify({ note: noteDraft }),
-      });
-      const result = await response.json() as SessionHistorySummary & { message?: string };
-      if (!response.ok) throw new Error(result.message ?? '场次备注保存失败');
-      await refreshSelected();
-      setMessage('备注已保存到本机；复核后可确认上传');
-    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
-    finally { setBusy(false); }
-  };
-  const setSpeaker = async (segment: ReviewTranscript) => {
-    if (!selectedSessionId || !selectedEditable) return;
-    setBusy(true);
-    try {
-      const speaker = segment.speakerSource === 'automatic' ? 'host' : segment.speaker === 'other' ? 'host' : 'other';
-      const response = await fetch(`/api/session/${selectedSessionId}/transcripts/${segment.id}`, {
-        method: 'PATCH', headers: accessHeaders(access.actorId, access.token, true), body: JSON.stringify({ speaker, speakerId: segment.speakerId }),
-      });
-      const result = await response.json() as { message?: string };
-      if (!response.ok) throw new Error(result.message ?? '说话人标记失败');
-      await refreshSelected();
-      setMessage(`已标记为${speaker === 'other' ? '其他人' : '主播'}，修改已保存到本机`);
-    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
-    finally { setBusy(false); }
-  };
-  const setCorrectionEnabled = async (correction: SpeechCorrectionEntry) => {
-    setBusy(true);
-    try {
-      const response = await fetch(`/api/rooms/${state.roomId}/speech-corrections/${correction.id}/enabled`, {
-        method: 'POST', headers: accessHeaders(access.actorId, access.token, true), body: JSON.stringify({ enabled: !correction.enabled }),
-      });
-      if (!response.ok) throw new Error('纠错词状态更新失败');
-      await loadDetails();
-    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
-    finally { setBusy(false); }
-  };
-  const playSegment = (segment: ReviewTranscript) => {
-    if (!audioRef.current) return;
-    audioRef.current.currentTime = Math.max(0, (segment.audioStartMs ?? segment.startOffsetMs ?? segment.offsetMs ?? 0) / 1_000);
-    void audioRef.current.play();
-  };
-  const downloadTranscript = async () => {
-    if (!selectedSessionId) return;
-    try {
-      const response = await fetch(`/api/session/${selectedSessionId}/transcript.txt`, { headers: accessHeaders(access.actorId, access.token) });
-      if (!response.ok) throw new Error('本地文案下载失败');
-      const url = URL.createObjectURL(await response.blob());
-      const link = document.createElement('a');
-      link.href = url; link.download = `${selectedSessionId}.transcript.txt`; link.click();
-      URL.revokeObjectURL(url);
-    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
-  };
-  const approveArchive = async () => {
-    if (!selectedSessionId || !selectedEditable || !selectedSummary) return;
-    if (noteDraft !== selectedSummary.note) {
-      setMessage('备注有未保存的修改，请先保存备注再确认上传');
-      return;
-    }
-    setBusy(true); setMessage('');
-    try {
-      const response = await fetch(`/api/session/${selectedSessionId}/archive`, {
-        method: 'POST', headers: accessHeaders(access.actorId, access.token, true), body: '{}',
-      });
-      const result = await response.json() as SessionHistorySummary & { message?: string };
-      if (!response.ok) throw new Error(result.message ?? '确认上传失败');
-      await loadHistory();
-      setMessage('已人工确认，正在后台上传知识库和数据库；可以直接开始下一场直播');
-    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
-    finally { setBusy(false); }
-  };
-  const startNewSession = () => {
-    localStorage.removeItem('live-session');
-    window.location.assign(`/?room=${encodeURIComponent(state.roomId)}`);
-  };
-
-  return <div className="modal-backdrop" role="presentation"><section className="review-modal history-modal" role="dialog" aria-modal="true" aria-label="直播记录">
-    <header className="review-head"><div><span className="section-kicker">直播记录 <span>SESSION HISTORY</span></span><h2>音频、文案与复盘</h2><p>下播先保存到本机，复核确认后再上传；无需处理完上一场再开播</p></div><div className="review-head-actions"><button type="button" className="new-session-button" onClick={startNewSession}><Plus size={15} />新开一场直播</button><button type="button" className="modal-close" onClick={onClose} title="关闭">×</button></div></header>
-    <div className="history-layout"><aside className="history-sidebar"><div className="pane-head"><div><strong>历史场次</strong><span>{history.length} 场保存在本机</span></div><button type="button" title="刷新" onClick={() => void loadHistory()}><RefreshCw size={14} /></button></div><div className="history-session-list">{history.map((session) => <button type="button" className={`history-session ${session.sessionId === selectedSessionId ? 'selected' : ''}`} key={session.sessionId} onClick={() => setSelectedSessionId(session.sessionId)}><span><strong>{new Date(session.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}</strong><em>{session.presenterName}</em></span><small>{session.productNames.join('、') || '未记录商品'} · {session.transcriptCount} 条</small>{session.note && <p>{session.note}</p>}<span className={`history-sync ${session.sync.state}`}>{session.sync.state === 'synced' ? <Cloud size={11} /> : session.sync.state === 'failed' ? <CloudOff size={11} /> : <HardDrive size={11} />}{syncCaption(session)}</span></button>)}</div>{history.length === 0 && <div className="review-empty">还没有可复核的直播记录</div>}</aside>
-      <section className="history-detail">{selectedSummary ? <><div className="history-summary"><div><strong>{new Date(selectedSummary.createdAt).toLocaleString('zh-CN', { hour12: false })}</strong><span>{selectedSummary.presenterName} · {selectedSummary.productNames.join('、') || '未记录商品'}</span></div><div><span className={`history-sync ${selectedSummary.sync.state}`}>{selectedSummary.sync.state === 'synced' ? <Cloud size={12} /> : selectedSummary.sync.state === 'failed' ? <CloudOff size={12} /> : <HardDrive size={12} />}{syncCaption(selectedSummary)}</span>{(selectedSummary.sync.state === 'local-only' || selectedSummary.sync.state === 'approval-required' || selectedSummary.sync.state === 'failed') && <button type="button" className="archive-confirm-button" disabled={busy || !selectedEditable || noteDraft !== selectedSummary.note} onClick={() => void approveArchive()} title={noteDraft !== selectedSummary.note ? '请先保存备注' : '确认后上传知识库和数据库'}><Database size={14} />{selectedSummary.sync.state === 'failed' ? '重新上传' : '确认上传'}</button>}<button type="button" className="icon-button quiet" onClick={() => void downloadTranscript()} title="下载本地文案"><Download size={15} /></button></div></div><div className="session-note-editor"><label htmlFor="session-note">本场备注</label><textarea id="session-note" value={noteDraft} disabled={!selectedEditable} onChange={(event) => setNoteDraft(event.target.value)} placeholder="记录商品节奏、主播状态、待改话术或下一场安排" maxLength={1_000} /><button type="button" disabled={busy || !selectedEditable || noteDraft === selectedSummary.note} onClick={() => void saveNote()}><Save size={13} />保存备注</button></div><div className="review-audio"><div><FileAudio size={18} /><span><strong>本场识别音频</strong><small>{timeline?.audio ? `${Math.round(timeline.audio.durationMs / 1000)} 秒 · ${Math.round(timeline.audio.byteLength / 1024)} KB · 已保存在本机` : '本场暂无完整音频'}</small></span></div>{audioUrl ? <audio ref={audioRef} controls preload="metadata" src={audioUrl} /> : <span className="review-audio-empty">暂无音频</span>}</div><div className="review-grid"><section className="review-transcripts"><div className="pane-head"><div><strong>时间戳转录</strong><span>可回听、纠错并沉淀为下一场的长期纠错词</span></div></div><div className="review-transcript-list">{transcripts.map((segment) => <div className={`review-transcript-row ${segment.compliance?.risk ?? ''}`} key={segment.id}><button type="button" className="segment-play" onClick={() => playSegment(segment)} disabled={!audioUrl} title="播放对应音频"><Play size={13} fill="currentColor" /></button><time><span>{formatReplayOffset(segment.offsetMs)}</span><small>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour12: false })}</small><SpeakerTag speaker={segment.speaker} speakerId={segment.speakerId} speakerSource={segment.speakerSource} onClick={selectedEditable ? () => void setSpeaker(segment) : undefined} /></time><div className="review-transcript-copy">{editing?.segment.id === segment.id ? <form onSubmit={(event) => { event.preventDefault(); void saveCorrection(); }}><textarea value={editing.text} onChange={(event) => updateDraft(event.target.value)} autoFocus /><div className="correction-pair"><label>错误词<input value={editing.wrongText} onChange={(event) => setEditing({ ...editing, wrongText: event.target.value, pairTouched: true })} placeholder="自动提取" /></label><span>→</span><label>正确词<input value={editing.correctText} onChange={(event) => setEditing({ ...editing, correctText: event.target.value, pairTouched: true })} placeholder="自动提取" /></label></div><label className="learn-toggle"><input type="checkbox" checked={editing.learn} onChange={(event) => setEditing({ ...editing, learn: event.target.checked })} />加入当前直播间长期纠错词库</label><div className="review-edit-actions"><button type="submit" disabled={busy || !editing.text.trim()}><Save size={13} />保存纠错</button><button type="button" onClick={() => setEditing(null)}>取消</button></div></form> : <><p>{transcriptMarkup(segment.text, segment.compliance)}</p><div><span>{segment.revisions > 0 ? `已修正 ${segment.revisions} 次` : '原始转录'}</span><button type="button" title="纠正这句转录" disabled={!selectedEditable} onClick={() => beginEdit(segment)}><Pencil size={13} /></button></div></>}</div></div>)}</div>{transcripts.length === 0 && <div className="review-empty">本场还没有最终转录</div>}</section><aside className="correction-library"><div className="pane-head"><div><strong>长期纠错词库</strong><span>下一场自动修正并加入识别上下文</span></div></div><div className="correction-list">{corrections.map((correction) => <div className={`correction-row ${correction.enabled ? '' : 'disabled'}`} key={correction.id}><div><strong>{correction.wrongText}</strong><span>→</span><strong>{correction.correctText}</strong></div><small>确认 {correction.confirmations} 次 · {correction.enabled ? '已生效' : '已停用'}</small><button type="button" disabled={busy} onClick={() => void setCorrectionEnabled(correction)}>{correction.enabled ? '停用' : '重新启用'}</button></div>)}</div>{corrections.length === 0 && <div className="review-empty">修正转录后可沉淀主播专属词库</div>}</aside></div></> : <div className="review-empty history-empty"><History size={20} />选择一场直播查看音频与文案</div>}</section></div>
-    {message && <div className="review-message">{message}</div>}
-  </section></div>;
-}
-
-function Waveform({ active }: { active: boolean }) {
-  return <div className={`waveform ${active ? 'active' : ''}`} aria-hidden="true">{Array.from({ length: 32 }, (_, index) => <i key={index} style={{ '--bar': `${16 + ((index * 13) % 24)}%`, '--delay': `${index * 35}ms` } as React.CSSProperties} />)}</div>;
-}
-
-function speakerLetter(speakerId?: string): string {
-  const match = /^speaker-(\d+)$/u.exec(speakerId ?? '');
-  if (!match) return '';
-  return String.fromCharCode(64 + Number(match[1]));
-}
-
-function speakerCaption(speaker: SpeakerLabel = 'host', speakerId?: string, source?: SpeakerSource): string {
-  const letter = speakerLetter(speakerId);
-  if (source === 'automatic') return `发言人 ${letter || '?'} · 待确认`;
-  if (speaker === 'other') return `其他人${letter ? ` ${letter}` : ''}`;
-  return '主播';
-}
-
-function SpeakerTag({ speaker = 'host', speakerId, speakerSource, onClick }: { speaker?: SpeakerLabel; speakerId?: string; speakerSource?: SpeakerSource; onClick?: () => void }) {
-  const isOther = speaker === 'other';
-  const automatic = speakerSource === 'automatic';
-  return <button type="button" className={`speaker-tag ${isOther ? 'other' : 'host'} ${automatic ? 'automatic' : ''} speaker-${speakerLetter(speakerId).toLowerCase()}`} onClick={onClick} disabled={!onClick} title={automatic ? '点击确认这位发言人身份' : onClick ? '点击切换说话人身份' : undefined}><>{isOther || automatic ? <UsersRound size={11} /> : <UserRound size={11} />}</>{speakerCaption(speaker, speakerId, speakerSource)}</button>;
-}
-
-function toggleSpeaker(segment: Pick<TranscriptSegment, 'speaker' | 'speakerSource'>): SpeakerLabel {
-  // The first click confirms the system's candidate as the host. A second
-  // click can then move the same candidate to the other-speaker role.
-  if (segment.speakerSource === 'automatic') return 'host';
-  return segment.speaker === 'other' ? 'host' : 'other';
-}
-
-function transcriptMarkup(text: string, result: Pick<ComplianceResult, 'risk' | 'matchedTerms'> | null | undefined) {
-  const terms = [...new Set((result?.matchedTerms ?? []).map((term) => term.trim()).filter(Boolean))].sort((first, second) => second.length - first.length);
-  if (terms.length === 0) return text;
-  const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const matcher = new RegExp(terms.map(escapeRegExp).join('|'), 'giu');
-  const nodes: ReactNode[] = [];
-  let cursor = 0;
-  for (const match of text.matchAll(matcher)) {
-    const index = match.index ?? 0;
-    if (index > cursor) nodes.push(text.slice(cursor, index));
-    nodes.push(<mark className={`transcript-risk-mark ${result?.risk ?? 'warning'}`} key={`${index}-${match[0]}`}>{match[0]}</mark>);
-    cursor = index + match[0].length;
-  }
-  if (cursor < text.length) nodes.push(text.slice(cursor));
-  return nodes;
-}
-
-function TranscriptStage({ state, send }: { state: SessionState; send: (message: object) => void }) {
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [draft, setDraft] = useState('');
-  const lastFinal = state.transcriptHistory[state.transcriptHistory.length - 1];
-  const latestIsCurrent = lastFinal && lastFinal.timestamp >= state.productContextStartedAt;
-  const speakerGroups = [...state.transcriptHistory.reduce((groups, segment) => {
-    const key = segment.speakerId ?? segment.speaker ?? 'host';
-    const current = groups.get(key);
-    groups.set(key, { segment, count: (current?.count ?? 0) + 1 });
-    return groups;
-  }, new Map<string, { segment: TranscriptSegment; count: number }>()).values()];
-  return <section className="stage-section transcript-stage">
-    <div className="section-heading"><div><span className="section-kicker">豆包大模型流式语音识别 <span>ASR</span></span><h1>{state.partialTranscript || (latestIsCurrent ? lastFinal?.text : null) || '等待主播开口'}</h1></div><div className="asr-badge"><span className="signal-dot on" />{state.isListening ? '流式语音识别中' : '待识别'}</div></div>
-    <Waveform active={state.isListening} />
-    {speakerGroups.length > 0 && <div className="speaker-groups" aria-label="本场发言人"><span>本场发言人</span>{speakerGroups.map(({ segment, count }) => <button type="button" key={segment.speakerId ?? segment.speaker} className={`speaker-group ${segment.speakerSource === 'automatic' ? 'automatic' : ''}`} onClick={() => send({ type: 'transcript.speaker', segmentId: segment.id, speaker: toggleSpeaker(segment), speakerId: segment.speakerId })} title="点击确认或切换该发言人身份"><i />{speakerCaption(segment.speaker, segment.speakerId, segment.speakerSource)} <em>{count}句</em></button>)}</div>}
-    <div className="transcript-feed">{state.transcriptHistory.slice(-4).map((segment, index) => { const compliance = state.alerts.find((alert) => alert.segmentId === segment.id); return <div className={`feed-line ${index === state.transcriptHistory.slice(-4).length - 1 ? 'current' : ''} ${compliance?.risk ?? ''}`} key={segment.id}><time><span>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span><em>{formatTranscriptOffset(segment.offsetMs)}</em><SpeakerTag speaker={segment.speaker} speakerId={segment.speakerId} speakerSource={segment.speakerSource} onClick={() => send({ type: 'transcript.speaker', segmentId: segment.id, speaker: toggleSpeaker(segment), speakerId: segment.speakerId })} /></time>{editingId === segment.id ? <form className="transcript-edit" onSubmit={(event) => { event.preventDefault(); if (draft.trim()) { send({ type: 'transcript.correct', segmentId: segment.id, text: draft.trim(), learn: true }); setEditingId(null); } }}><input value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><button type="submit" title="保存并学习纠错"><Save size={13} /></button><button type="button" title="取消纠错" onClick={() => setEditingId(null)}>×</button></form> : <><span>{transcriptMarkup(segment.text, compliance)}</span>{segment.isFinal && <button type="button" className="transcript-edit-button" title="纠正这句转录" onClick={() => { setEditingId(segment.id); setDraft(segment.text); }}><Pencil size={12} /></button>}</>}</div>; })}</div>
-  </section>;
-}
-
-function coachAlternatives(state: SessionState): CoachSuggestion[] {
-  const current = state.coachSuggestions?.filter((suggestion) => suggestion.text.trim()) ?? [];
-  const legacy = state.coachSuggestion && !current.some((suggestion) => suggestion.id === state.coachSuggestion?.id) ? [state.coachSuggestion] : [];
-  const productFallbacks = [
-    ...state.product.compliantPhrases,
-    `${state.product.name}可以结合材质、规格和日常使用场景来了解。`,
-    `大家最关心${state.product.name}哪个细节？评论区告诉我。`,
-    '需要的朋友可以打开商品卡查看规格与实时价格。',
+function CoachBoard({ snapshot, display = false }: { snapshot: LiveSessionSnapshot; display?: boolean }) {
+  const suggestions = snapshot.coachSuggestions.length ? snapshot.coachSuggestions : [
+    { id: 'empty-1', purpose: '塑品' as const, text: `可以先介绍${snapshot.product.name}的核心使用场景。`, reason: '建立商品价值', source: 'local-fallback' as const, createdAt: Date.now() },
+    { id: 'empty-2', purpose: '互动' as const, text: '问问大家最想了解哪个细节，再按页面信息逐项说明。', reason: '引导评论互动', source: 'local-fallback' as const, createdAt: Date.now() },
+    { id: 'empty-3', purpose: '转化' as const, text: '需要的朋友可以打开商品卡，确认规格和实时价格。', reason: '承接下单动作', source: 'local-fallback' as const, createdAt: Date.now() },
   ];
-  const purposes: CoachSuggestion['purpose'][] = ['塑品', '互动', '转化'];
-  const fallbackSuggestions = productFallbacks.map((text, index): CoachSuggestion => ({
-    id: `display-fallback-${state.product.id}-${index}`,
-    purpose: purposes[index % purposes.length],
-    text,
-    reason: index === 0 ? '介绍商品价值' : index === 1 ? '引导观众互动' : '承接购买动作',
-    source: 'local-fallback',
-    createdAt: state.lastEventAt,
-  }));
-  return [...current, ...legacy, ...fallbackSuggestions]
-    .filter((suggestion, index, all) => all.findIndex((item) => item.text === suggestion.text) === index)
-    .slice(0, 3);
-}
-
-function PromptPanel({ state, compact = false }: { state: SessionState; compact?: boolean }) {
-  const latest = complianceForPrompt({ ...state, productId: state.product.id });
-  const latestSegment = state.transcriptHistory.at(-1);
-  const latestSegmentIsCurrent = Boolean(latestSegment && latestSegment.timestamp >= state.productContextStartedAt);
-  const currentCompliance = complianceForLatestSegment(state);
-  const pending = Boolean(state.partialTranscript || (latestSegmentIsCurrent && !currentCompliance));
-  const coach = coachAlternatives(state)[0];
-  const phrase = coach?.text || (latest && latest.risk !== 'safe'
-    ? latest.alternative
-    : state.product.compliantPhrases[0] || '根据商品页面信息介绍材质、规格和使用场景，价格与库存以页面实时信息为准。');
-  return <section className={`prompt-panel ${latest?.risk ?? 'safe'} ${compact ? 'compact' : ''}`}>
-    <div className="prompt-head"><div><span className="section-kicker">主播提词 <span>豆包直播教练</span></span><h2>{coach ? `${coach.purpose} · 下一句` : latest && latest.risk !== 'safe' ? '现在请替换为' : pending ? '分析中，先用安全表达' : '当前商品建议表达'}</h2></div><Sparkles size={20} /></div>
-    <p className="prompt-quote">{phrase}</p>
-    <div className="prompt-foot"><span><Keyboard size={14} />{state.coachPending ? '正在生成' : '建议照读'}</span><span className="prompt-product">{state.product.name}</span></div>
+  return <section className={`v2-coach-board ${display ? 'display' : ''}`}>
+    <header><div><Sparkles size={16} /><span>主播下一句</span></div><small>{snapshot.coachPending ? '正在结合本场状态优化' : '三段备选话术'}</small></header>
+    <div className="v2-coach-grid">{suggestions.slice(0, 3).map((suggestion, index) => <article key={suggestion.id}><div><b>{index + 1}</b><strong>{suggestion.purpose}</strong></div><p>{suggestion.text}</p><small>{suggestion.reason}</small></article>)}</div>
   </section>;
 }
 
-function formatAnalysisLatency(ms: number | null | undefined): string {
-  if (ms === null || ms === undefined) return '等待响应';
-  return ms < 1_000 ? `${ms} ms` : `${(ms / 1_000).toFixed(1)} s`;
-}
-
-function useAnalysisElapsed(pending: boolean, pendingSince: number | null): number | null {
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    if (!pending || pendingSince === null) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 100);
-    return () => window.clearInterval(timer);
-  }, [pending, pendingSince]);
-  return pending && pendingSince !== null ? Math.max(0, now - pendingSince) : null;
-}
-
-function CompliancePanel({ result, pending = false, pendingSince = null }: { result: ComplianceResult | null; pending?: boolean; pendingSince?: number | null }) {
-  const elapsedMs = useAnalysisElapsed(pending, pendingSince);
-  const latency = pending ? elapsedMs : result?.analysisMs;
-  const resolved = result ?? { risk: 'safe' as const, title: pending ? '正在分析当前话术' : '等待下一句', reason: pending ? '分析完成前先使用上方商品安全表达。' : '系统会在每个转录片段完成后即时分析。', policyRef: '豆包大模型 · 抖音直播规则', confidence: 0 };
-  return <section className={`compliance-panel ${resolved.risk}`}>
-    <div className="compliance-top"><div className="risk-pill"><RiskIcon risk={resolved.risk} /><span><RiskLabel risk={resolved.risk} /></span></div><div className="compliance-meta"><span className="analysis-latency">{pending ? `响应中 ${formatAnalysisLatency(latency)}` : latency === null || latency === undefined ? '实时监测' : `响应 ${formatAnalysisLatency(latency)}`}</span><span className="confidence">{resolved.confidence ? `${Math.round(resolved.confidence * 100)}% 置信` : ''}</span></div></div>
-    <h3>{resolved.title}</h3><p>{resolved.reason}</p><div className="policy-ref"><ShieldCheck size={14} />{resolved.policyRef}</div>
+function RiskPanel({ snapshot, display = false }: { snapshot: LiveSessionSnapshot; display?: boolean }) {
+  const result = snapshot.latestCompliance;
+  const risk = result?.risk ?? 'safe';
+  return <section className={`v2-risk-panel ${risk} ${display ? 'display' : ''}`}>
+    <header><div>{risk === 'safe' ? <CheckCircle2 size={17} /> : <ShieldAlert size={17} />}<strong>{riskText(risk)}</strong></div>{typeof result?.analysisMs === 'number' && <span>{result.analysisMs}ms</span>}</header>
+    <h3>{result?.title ?? '当前没有风险提醒'}</h3>
+    <p>{result?.reason ?? '本地规则会持续检查主播表达，模型判断完成后会在这里更新。'}</p>
+    {result && risk !== 'safe' && <div className="v2-risk-advice"><span>建议替换</span><strong>{result.alternative.replace(/^可以改为：/u, '')}</strong></div>}
+    {!display && <div className="v2-alert-log"><span>近期提醒</span>{snapshot.alerts.slice(0, 4).map((alert) => <div key={alert.id}><i className={alert.risk} /><p>{alert.title}</p><time>{formatTime(alert.createdAt)}</time></div>)}</div>}
   </section>;
 }
 
-function DemoInput({ state, send, access }: { state: SessionState; send: (message: object) => void; access: OperatorAccess }) {
-  const [text, setText] = useState('');
-  const [references, setReferences] = useState<PresenterPhrase[]>([]);
-  const loadReferences = useCallback(() => {
-    if (!state.presenterId || !state.roomId) return Promise.resolve();
-    return fetch(`/api/presenters/${state.presenterId}/phrases?productId=${encodeURIComponent(state.product.id)}`, { headers: accessHeaders(access.actorId, access.token) })
-      .then((response) => response.ok ? response.json() as Promise<PresenterPhrase[]> : [])
-      .then((phrases) => { setReferences(phrases.filter((phrase) => phrase.status === 'reference').slice(0, 3)); })
-      .catch(() => { setReferences([]); });
-  }, [access.actorId, access.token, state.product.id, state.presenterId, state.roomId]);
-  useEffect(() => {
-    void loadReferences();
-    const refresh = () => { void loadReferences(); };
-    window.addEventListener('phrase-library-updated', refresh);
-    return () => window.removeEventListener('phrase-library-updated', refresh);
-  }, [loadReferences]);
-  return <section className="demo-bar"><div className="demo-label"><ClipboardPaste size={15} />主播专属话术 <span>{references.length ? `${references.length} 条参考` : '本场结束后自动归档'}</span></div><div className="demo-actions">{references.map((phrase) => <button type="button" className="demo-chip" key={phrase.id} title="填入参考话术" onClick={() => setText(phrase.text)}>{phrase.text}</button>)}</div><form onSubmit={(event) => { event.preventDefault(); if (text.trim()) { send({ type: 'demo.transcript', text: text.trim() }); setText(''); } }} className="demo-form"><input value={text} onChange={(event) => setText(event.target.value)} placeholder="输入一句测试话术，或从主播专属库选择" /><button type="submit" title="发送模拟话术"><ArrowUpRight size={16} /></button></form></section>;
+function ProductRail({ snapshot, products, send, openHistory, openLibrary }: { snapshot: LiveSessionSnapshot; products: Product[]; send: (command: LiveCommand) => boolean; openHistory: () => void; openLibrary: () => void }) {
+  return <aside className="v2-left-rail">
+    <section><header><Package size={15} /><span>本场商品</span></header><div className="v2-product-list">{products.map((product) => <button type="button" className={snapshot.product.id === product.id ? 'active' : ''} key={product.id} onClick={() => send({ type: 'select_product', productId: product.id })}><img src={product.image} alt="" /><span><strong>{product.name}</strong><small>{product.category} · {product.price}</small></span></button>)}</div></section>
+    <section className="v2-risk-profile"><header><ShieldAlert size={15} /><span>风控等级</span></header><div>{(['strict', 'balanced', 'optimized'] as const).map((profile) => <button type="button" className={snapshot.riskProfile === profile ? 'active' : ''} key={profile} onClick={() => send({ type: 'set_risk_profile', profile })}>{profile === 'strict' ? '严格' : profile === 'balanced' ? '均衡' : '优化'}</button>)}</div></section>
+    <button type="button" className="v2-history-button" onClick={openLibrary}><BookOpen size={15} />资料管理</button>
+    <button type="button" className="v2-history-button secondary" onClick={openHistory}><History size={15} />历史复核</button>
+  </aside>;
 }
 
-function PresenterPhrasePanel({ state, access, send }: { state: SessionState; access: OperatorAccess; send: (message: object) => boolean }) {
-  const [presenters, setPresenters] = useState<PresenterProfile[]>([]);
-  const [phrases, setPhrases] = useState<PresenterPhrase[]>([]);
-  const [selectedPresenterId, setSelectedPresenterId] = useState(state.presenterId);
-  const [draft, setDraft] = useState('');
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [purpose, setPurpose] = useState<PresenterPhrase['purpose']>('塑品');
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState('');
-  const [newPresenterName, setNewPresenterName] = useState('');
-
-  useEffect(() => {
-    if (selectedPresenterId && selectedPresenterId !== state.presenterId) send({ type: 'presenter.select', presenterId: selectedPresenterId });
-  }, [selectedPresenterId, send, state.presenterId]);
-
-  const headers = accessHeaders(access.actorId, access.token, true);
-  const load = useCallback(async () => {
-    const presentersResponse = await fetch(`/api/rooms/${state.roomId}/presenters`, { headers });
-    if (!presentersResponse.ok) throw new Error('主播档案读取失败');
-    const nextPresenters = await presentersResponse.json() as PresenterProfile[];
-    setPresenters(nextPresenters);
-    const activeId = nextPresenters.some((presenter) => presenter.id === selectedPresenterId) ? selectedPresenterId : nextPresenters[0]?.id;
-    if (!activeId) return setPhrases([]);
-    setSelectedPresenterId(activeId);
-    const phrasesResponse = await fetch(`/api/presenters/${activeId}/phrases`, { headers });
-    if (!phrasesResponse.ok) throw new Error('主播话术读取失败');
-    setPhrases(await phrasesResponse.json() as PresenterPhrase[]);
-  }, [access.actorId, access.token, selectedPresenterId, state.roomId]);
-
-  useEffect(() => { void load().catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error))); }, [load]);
-
-  const save = async () => {
-    if (!draft.trim() || !selectedPresenterId) return;
-    setBusy(true); setMessage('');
-    try {
-      const url = editingId ? `/api/phrases/${editingId}` : `/api/presenters/${selectedPresenterId}/phrases`;
-      const response = await fetch(url, { method: editingId ? 'PATCH' : 'POST', headers, body: JSON.stringify({ text: draft, productId: state.product.id, purpose }) });
-      const body = await response.json() as PresenterPhrase & { message?: string };
-      if (!response.ok) throw new Error(body.message ?? '话术保存失败');
-      setDraft(''); setEditingId(null); await load(); window.dispatchEvent(new Event('phrase-library-updated')); setMessage('已保存为草稿，选定后才会用于下一场');
-    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
-    finally { setBusy(false); }
-  };
-
-  const action = async (phrase: PresenterPhrase, type: 'reference' | 'rewrite' | 'rollback') => {
-    setBusy(true); setMessage('');
-    try {
-      const url = type === 'reference' ? `/api/phrases/${phrase.id}/reference` : type === 'rewrite' ? `/api/phrases/${phrase.id}/rewrite` : `/api/phrases/${phrase.id}/rollback`;
-      const body = type === 'reference' ? { selected: phrase.status !== 'reference' } : type === 'rollback' ? { targetVersion: Math.max(1, phrase.version - 1) } : {};
-      const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
-      const result = await response.json() as { message?: string };
-      if (!response.ok) throw new Error(result.message ?? '话术操作失败');
-      await load(); window.dispatchEvent(new Event('phrase-library-updated')); setMessage(type === 'rewrite' ? '豆包已生成新草稿，请确认后选定' : type === 'reference' ? '参考状态已更新' : '已回滚到上一版');
-    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
-    finally { setBusy(false); }
-  };
-
-  const createPresenter = async () => {
-    if (!newPresenterName.trim()) return;
-    setBusy(true); setMessage('');
-    try {
-      const roomResponse = await fetch(`/api/rooms/${state.roomId}`, { headers });
-      const room = await roomResponse.json() as LiveRoom;
-      const response = await fetch(`/api/rooms/${state.roomId}/presenters`, { method: 'POST', headers, body: JSON.stringify({ name: newPresenterName, accountName: room.accountName }) });
-      const body = await response.json() as PresenterProfile & { message?: string };
-      if (!response.ok) throw new Error(body.message ?? '主播档案创建失败');
-      setNewPresenterName(''); setSelectedPresenterId(body.id); await load();
-    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
-    finally { setBusy(false); }
-  };
-
-  return <section className="phrase-library-pane"><div className="pane-head"><div><strong>主播专属话术库</strong><span>本地优先 · 归档、改写、选定后用于下一场</span></div><button type="button" title="刷新" onClick={() => void load()}><RefreshCw size={14} /></button></div><div className="phrase-presenter-row"><select value={selectedPresenterId} onChange={(event) => { setSelectedPresenterId(event.target.value); }} aria-label="选择主播">{presenters.map((presenter) => <option key={presenter.id} value={presenter.id}>{presenter.name} · {presenter.accountName}</option>)}</select><input value={newPresenterName} onChange={(event) => setNewPresenterName(event.target.value)} placeholder="新增主播名称" /><button type="button" disabled={busy || !newPresenterName.trim()} onClick={() => void createPresenter()}><Plus size={14} />新增主播</button></div><div className="phrase-editor"><select value={purpose} onChange={(event) => setPurpose(event.target.value as PresenterPhrase['purpose'])} aria-label="话术作用"><option value="塑品">塑品</option><option value="憋单">憋单</option><option value="逼单">逼单</option><option value="转化">转化</option><option value="互动">互动</option><option value="留人">留人</option><option value="答疑">答疑</option></select><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="输入主播常用话术或头部直播间参考话术" /><button type="button" className="primary-wide" disabled={busy || !draft.trim() || !selectedPresenterId} onClick={() => void save()}><Save size={15} />{editingId ? '保存新版本' : '保存草稿'}</button></div><div className="phrase-list">{phrases.length === 0 ? <div className="phrase-empty">本场结束后，主播说过的话会自动归档到这里。</div> : phrases.map((phrase) => <article className={`phrase-row ${phrase.status}`} key={phrase.id}><div><span className="phrase-status">{phrase.status === 'reference' ? '下一场参考' : phrase.status === 'retired' ? '已停用' : '草稿'}</span><strong>{phrase.text}</strong><small>{phrase.productId === null ? '通用话术' : phrase.productId === state.product.id ? state.product.name : '其他商品'} · v{phrase.version} · {phrase.source === 'imported' ? '外部录入' : phrase.source === 'doubao' ? '豆包改写' : phrase.source === 'session' ? '本场归档' : '人工'}</small></div><div className="phrase-actions"><button type="button" disabled={busy} onClick={() => { setEditingId(phrase.id); setDraft(phrase.text); setPurpose(phrase.purpose ?? '塑品'); }}>编辑</button><button type="button" disabled={busy} onClick={() => void action(phrase, 'rewrite')} title="用豆包生成新的草稿"><Sparkles size={13} />改写</button><button type="button" disabled={busy} onClick={() => void action(phrase, 'reference')}>{phrase.status === 'reference' ? '取消参考' : '选为参考'}</button>{phrase.version > 1 && <button type="button" disabled={busy} onClick={() => void action(phrase, 'rollback')}>回滚</button>}</div></article>)}</div>{message && <div className="workspace-message">{message}</div>}</section>;
-}
-
-function SessionStats({ state }: { state: SessionState }) {
-  return <div className="session-stats"><div><span>已播时长</span><strong>{Math.floor(state.stats.speakingSeconds / 60).toString().padStart(2, '0')}:{(state.stats.speakingSeconds % 60).toString().padStart(2, '0')}</strong></div><div><span>识别字数</span><strong>{state.stats.words}</strong></div><div><span>高风险</span><strong className="danger-text">{state.stats.blockedCount}</strong></div><div><span>需留意</span><strong className="warning-text">{state.stats.warningCount}</strong></div></div>;
-}
-
-function RiskProfileControl({ state, send }: { state: SessionState; send: (message: object) => void }) {
-  const profiles = [
-    { value: 'strict' as const, label: '严审' },
-    { value: 'balanced' as const, label: '均衡' },
-    { value: 'optimized' as const, label: '优化' },
-  ];
-  return <div className="risk-profile-control" role="group" aria-label="本场风险档位">{profiles.map((profile) => <button type="button" className={state.riskProfile === profile.value ? 'active' : ''} key={profile.value} onClick={() => send({ type: 'risk.profile', profile: profile.value })}>{profile.label}</button>)}</div>;
-}
-
-function LoginScreen({ readiness, message, onLogin }: { readiness: Readiness | null; message: string; onLogin: (actorId: string, password: string) => Promise<void> }) {
-  const [actorId, setActorId] = useState('');
-  const [password, setPassword] = useState('');
-  const [busy, setBusy] = useState(false);
-  const localOnlyBlocked = readiness && !readiness.auth.configured;
-  return <div className="access-shell"><div className="access-brand"><span className="brand-mark"><ShieldCheck size={19} /></span><strong>dypro</strong></div><section className="access-panel"><div className="access-icon"><LockKeyhole size={23} /></div><span className="section-kicker">控制台身份 <span>DYPRO ACCESS</span></span><h1>{localOnlyBlocked ? '当前设备仅可查看主播屏' : '登录直播控制台'}</h1>{localOnlyBlocked ? <p>多人账号尚未配置，控制操作仅允许在 MacBook 本机完成。</p> : <form onSubmit={(event) => { event.preventDefault(); setBusy(true); void onLogin(actorId.trim(), password).finally(() => setBusy(false)); }}><label>账号<input value={actorId} onChange={(event) => setActorId(event.target.value)} autoComplete="username" /></label><label>密码<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" /></label><button type="submit" disabled={busy || !actorId.trim() || !password}><LockKeyhole size={15} />{busy ? '正在登录' : '登录'}</button></form>}{message && <div className="access-message">{message}</div>}</section></div>;
-}
-
-function OperatorScreen({ access, onLogout }: { access: OperatorAccess; onLogout: () => void }) {
-  const session = useLiveSession('operator', access);
-  const [workspaceOpen, setWorkspaceOpen] = useState(false);
-  const [reviewOpen, setReviewOpen] = useState(false);
-  const currentCompliance = complianceForLatestSegment(session.state);
-  const latestSegment = session.state.transcriptHistory.at(-1);
-  const latestSegmentIsCurrent = Boolean(latestSegment && latestSegment.timestamp >= session.state.productContextStartedAt);
-  const compliancePending = Boolean(session.state.partialTranscript || (latestSegmentIsCurrent && !currentCompliance));
-  return <div className="app-shell operator-shell"><AppHeader state={session.state} connected={session.connected} status={session.status} mode="operator" access={access} /><main className="operator-grid"><aside className="left-rail"><ProductRail state={session.state} send={session.send} onOpenLibrary={() => setWorkspaceOpen(true)} /><MicPanel state={session.state} connected={session.connected} captureDeniedVersion={session.captureDeniedVersion} send={session.send} onOpenReview={() => setReviewOpen(true)} /><div className="rail-footer"><Wifi size={14} />局域网地址可供 iPad 访问</div></aside><section className="main-stage"><div className="stage-context"><div><span className="eyebrow">TODAY'S LIVE · 01</span><h2>{session.state.product.name}</h2></div><RiskProfileControl state={session.state} send={session.send} /></div><TranscriptStage state={session.state} send={session.send} /><DemoInput state={session.state} send={session.send} access={access} /></section><aside className="coach-rail"><PromptPanel state={session.state} /><CompliancePanel result={currentCompliance} pending={compliancePending} pendingSince={session.analysisStartedAt} /><section className="alert-history"><div className="section-kicker">近期提醒 <span>ALERT LOG</span></div>{session.state.alerts.length ? session.state.alerts.slice(0, 4).map((alert) => <div className="alert-row" key={alert.id}><div className={`alert-icon ${alert.risk}`}><RiskIcon risk={alert.risk} /></div><div><strong>{alert.title}</strong><small>{new Date(alert.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {alert.alternative.replace(/^可以改为：/u, '')}</small></div></div>) : <div className="empty-alert"><Check size={16} />暂无风险提醒</div>}</section></aside></main><footer className="operator-footer"><SessionStats state={session.state} /><div className="footer-note"><Activity size={15} />风险判断以豆包大模型为主，未配置密钥时使用本地规则即时兜底</div></footer>{workspaceOpen && <WorkspaceModal state={session.state} access={access} send={session.send} onClose={() => setWorkspaceOpen(false)} onLogout={onLogout} />}{reviewOpen && <SessionReviewModal state={session.state} access={access} onClose={() => setReviewOpen(false)} />}</div>;
-}
-
-function OperatorEntry() {
-  const auth = useOperatorAccess();
-  if (auth.loading) return <div className="access-shell"><div className="access-loading">正在验证控制台身份</div></div>;
-  if (!auth.access) return <LoginScreen readiness={auth.readiness} message={auth.message} onLogin={auth.login} />;
-  return <OperatorScreen access={auth.access} onLogout={auth.logout} />;
-}
-
-function DisplayScreen() {
-  const session = useLiveSession('display');
-  const result = complianceForLatestSegment(session.state);
-  const promptCompliance = complianceForPrompt({ ...session.state, productId: session.state.product.id });
-  const suggestions = coachAlternatives(session.state);
-  const latestTranscript = session.state.transcriptHistory.at(-1);
-  const latestSegment = latestTranscript && latestTranscript.timestamp >= session.state.productContextStartedAt ? latestTranscript : undefined;
-  const latestSegmentIsCurrent = Boolean(latestSegment && latestSegment.timestamp >= session.state.productContextStartedAt);
-  const pending = Boolean(session.state.partialTranscript || (latestSegmentIsCurrent && !result));
-  const elapsedMs = useAnalysisElapsed(pending, session.analysisStartedAt);
-  const latency = pending ? elapsedMs : result?.analysisMs;
-  const risk = result?.risk ?? (promptCompliance?.risk !== 'safe' ? promptCompliance?.risk ?? 'safe' : 'safe');
-  const hasRetainedReplacement = promptCompliance?.risk === 'warning' || promptCompliance?.risk === 'blocked';
-  const captureLabel = session.state.captureState === 'live' ? '正在收音' : session.state.captureState === 'paused' ? '直播暂停' : session.state.captureState === 'ended' ? '直播结束' : '等待开播';
-  const coachLatency = suggestions.find((suggestion) => suggestion.latencyMs !== undefined)?.latencyMs;
-  const riskAlternative = promptCompliance && promptCompliance.risk !== 'safe' ? promptCompliance.alternative.replace(/^可以改为：/u, '') : '';
-  const streamingText = session.state.partialTranscript || latestTranscript?.text || '等待主播开口';
-  const streamingSpeaker = session.state.partialTranscript ? undefined : latestTranscript;
-  const streamingSpeakerCaption = session.state.partialTranscript ? '发言人识别中' : speakerCaption(streamingSpeaker?.speaker, streamingSpeaker?.speakerId, streamingSpeaker?.speakerSource);
-  const streamingTime = session.state.partialTranscript
-    ? '识别中'
-    : latestTranscript ? new Date(latestTranscript.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '待识别';
-  return <div className={`app-shell display-shell risk-${risk}`}>
-    <AppHeader state={session.state} connected={session.connected} status={session.status} mode="display" />
-    <main className="display-main">
-      <div className="display-product"><img src={session.state.product.image} alt="" /><div><span className="eyebrow">ON AIR PRODUCT · {session.state.product.category}</span><h1>{session.state.product.name}</h1><strong>{session.state.product.price}</strong></div><div className="display-live"><span className={`signal-dot ${session.state.isListening ? 'on' : ''}`} />{captureLabel}</div></div>
-      <section className={`display-live-transcript ${session.state.partialTranscript ? 'partial' : ''}`}>
-        <header><div><span className="eyebrow">流式话术转录</span><strong>{streamingTime}</strong></div><span className={`display-transcript-speaker ${streamingSpeaker?.speaker === 'other' ? 'other' : ''} ${streamingSpeaker?.speakerSource === 'automatic' ? 'automatic' : ''}`}>{streamingSpeaker?.speakerSource === 'automatic' ? <UsersRound size={12} /> : streamingSpeaker?.speaker === 'other' ? <UsersRound size={12} /> : <UserRound size={12} />}{streamingSpeakerCaption}</span></header>
-        <p>{transcriptMarkup(streamingText, session.state.partialTranscript ? null : result)}</p>
-      </section>
-      <section className="display-coach-cues">
-        <header><div><span className="eyebrow">主播提词 · 下一句</span><h2>三段备选话术</h2></div><div className="display-meta"><span className="display-source">{session.state.coachPending ? '豆包生成中' : suggestions[0]?.source === 'doubao' ? '豆包直播教练' : '主播专属参考'}</span><span className="display-latency">{session.state.coachPending ? '实时更新' : coachLatency === undefined ? '随时参考' : `教练 ${formatAnalysisLatency(coachLatency)}`}</span></div></header>
-        <div className="display-coach-list">{suggestions.map((suggestion, index) => <article className="display-coach-item" key={suggestion.id}><div><span>{index + 1}</span><strong>{suggestion.purpose}</strong></div><p>{suggestion.text}</p><small>{suggestion.reason}</small></article>)}</div>
-      </section>
-      <section className={`display-alert ${risk}`}>
-        <div className="display-alert-head"><div className="display-risk-icon"><RiskIcon risk={risk} /></div><div><span className="eyebrow">风险预警</span><h2>{result ? <RiskLabel risk={risk} /> : hasRetainedReplacement ? '替换话术保持显示' : pending ? '正在分析当前话术' : '当前未发现高风险表达'}</h2></div><div className="display-meta"><span className="display-source">{pending ? 'ANALYZING' : promptCompliance?.source === 'custom-rule' ? 'CUSTOM RULE' : 'LOCAL GUARDRAIL'}</span><span className="display-latency">{pending ? `响应中 ${formatAnalysisLatency(latency)}` : latency === null || latency === undefined ? '实时监测' : `响应 ${formatAnalysisLatency(latency)}`}</span></div></div>
-        {(riskAlternative || result?.reason) && <div className="display-risk-detail">{riskAlternative && <p>{riskAlternative}</p>}{result?.reason && <small><AlertTriangle size={14} />{result.reason}</small>}</div>}
-      </section>
-    </main>
-    <footer className="display-footer"><div><ShieldCheck size={15} />抖音直播合规预警</div><div className="display-footer-stats"><span>监测 {session.state.stats.words} 字</span><span>高风险 {session.state.stats.blockedCount}</span><span>需留意 {session.state.stats.warningCount}</span></div></footer>
+function LiveControls({ snapshot, connected, status, send, sendAudio }: { snapshot: LiveSessionSnapshot; connected: boolean; status: string; send: (command: LiveCommand) => boolean; sendAudio: (pcm: ArrayBuffer | Uint8Array) => boolean }) {
+  const microphone = useMicrophone(sendAudio);
+  const begin = async () => { await microphone.start(); send({ type: snapshot.lifecycle === 'paused' ? 'resume' : 'start' }); };
+  const pause = () => { microphone.stop(); send({ type: 'pause' }); };
+  const end = () => { microphone.stop(); send({ type: 'end' }); };
+  return <div className="v2-live-controls">
+    <div className={`v2-connection ${connected ? 'online' : ''}`}><i />{status}</div>
+    {(snapshot.lifecycle === 'idle' || snapshot.lifecycle === 'paused') && <button type="button" className="primary" onClick={() => void begin()} disabled={!connected}><Mic size={15} />{snapshot.lifecycle === 'paused' ? '继续收音' : '开始收音'}</button>}
+    {snapshot.lifecycle === 'live' && <button type="button" onClick={pause}><Pause size={15} />暂停</button>}
+    {snapshot.lifecycle !== 'idle' && snapshot.lifecycle !== 'ended' && <button type="button" className="danger" onClick={end}><CircleStop size={15} />结束本场</button>}
+    {microphone.error && <span className="v2-control-error">{microphone.error}</span>}
   </div>;
 }
 
+function DemoInput({ snapshot, send }: { snapshot: LiveSessionSnapshot; send: (command: LiveCommand) => boolean }) {
+  const [text, setText] = useState('');
+  const submit = (event: FormEvent) => { event.preventDefault(); if (!text.trim()) return; send({ type: 'demo_transcript', text: text.trim() }); setText(''); };
+  const examples = snapshot.product.compliantPhrases.slice(0, 2);
+  return <section className="v2-demo"><span>对应商品参考话术</span><div>{examples.map((example) => <button type="button" key={example} onClick={() => send({ type: 'demo_transcript', text: example })}>{example}</button>)}</div><form onSubmit={submit}><input value={text} onChange={(event) => setText(event.target.value)} placeholder="粘贴或输入主播话术进行核验" /><button type="submit" title="提交"><Send size={14} /></button></form></section>;
+}
+
+function DisplayLinkPanel({ sessionId }: { sessionId: string }) {
+  const client = useMemo(() => new DisplayLinkClient(), []);
+  const [expanded, setExpanded] = useState(false);
+  const [link, setLink] = useState<DisplayLink | null>(null);
+  const [qrCode, setQrCode] = useState('');
+  const [message, setMessage] = useState('');
+  const [copied, setCopied] = useState(false);
+  const linkUrl = link ? new URL(link.path, window.location.origin).toString() : '';
+
+  useEffect(() => {
+    if (!expanded || !sessionId || link?.sessionId === sessionId) return;
+    let active = true;
+    setMessage('正在生成入口');
+    setLink(null);
+    setQrCode('');
+    void client.create(sessionId).then(async (next) => {
+      const url = new URL(next.path, window.location.origin).toString();
+      const svg = await QRCode.toString(url, { type: 'svg', width: 220, margin: 1, color: { dark: '#172018', light: '#ffffff' } });
+      if (!active) return;
+      setLink(next);
+      setQrCode(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`);
+      setMessage('');
+    }).catch((error) => { if (active) setMessage(error instanceof Error ? error.message : String(error)); });
+    return () => { active = false; };
+  }, [client, expanded, link?.sessionId, sessionId]);
+
+  const copyLink = async () => {
+    if (!linkUrl) return;
+    try {
+      await navigator.clipboard.writeText(linkUrl);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1_500);
+    } catch { setMessage('复制失败，请直接打开主播屏'); }
+  };
+
+  return <details className="v2-display-link" onToggle={(event) => setExpanded(event.currentTarget.open)}>
+    <summary><ChevronDown size={13} />主播屏入口</summary>
+    {expanded && <div className="v2-display-link-body">
+      {message && <span className="v2-display-link-message">{message}</span>}
+      {link && <>
+        <div className="v2-display-link-heading"><QrCode size={17} /><div><strong>临时入口 {link.alias}</strong><small>{new Date(link.expiresAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })} 前有效</small></div></div>
+        {qrCode && <img src={qrCode} alt="主播屏二维码" />}
+        <code>{linkUrl}</code>
+        <div className="v2-display-link-actions">
+          <button type="button" title="复制主播屏地址" onClick={() => void copyLink()}><Copy size={14} /><span>{copied ? '已复制' : '复制'}</span></button>
+          <a href={linkUrl} target="_blank" rel="noreferrer" title="在新窗口打开主播屏"><ExternalLink size={14} /><span>打开</span></a>
+        </div>
+      </>}
+    </div>}
+  </details>;
+}
+
+function LibraryWorkspace({ snapshot, products, send, onClose }: { snapshot: LiveSessionSnapshot; products: Product[]; send: (command: LiveCommand) => boolean; onClose: () => void }) {
+  const client = useMemo(() => new CatalogClient(), []);
+  const [tab, setTab] = useState<'products' | 'rules' | 'phrases'>('phrases');
+  const [rules, setRules] = useState<ComplianceRule[]>([]);
+  const [presenters, setPresenters] = useState<PresenterProfile[]>([]);
+  const [presenterId, setPresenterId] = useState(snapshot.presenterId);
+  const [phrases, setPhrases] = useState<PresenterPhrase[]>([]);
+  const [ruleDraft, setRuleDraft] = useState({ pattern: '', title: '', alternative: '' });
+  const [phraseDraft, setPhraseDraft] = useState('');
+  const [purpose, setPurpose] = useState<CoachPurpose>('塑品');
+  const [newPresenter, setNewPresenter] = useState('');
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const [ruleData, presenterData] = await Promise.all([client.rules(snapshot.roomId), client.presenters(snapshot.roomId)]);
+      setRules(ruleData.rules); setPresenters(presenterData);
+      const selected = presenterData.some((presenter) => presenter.id === presenterId) ? presenterId : presenterData[0]?.id ?? '';
+      setPresenterId(selected);
+      setPhrases(selected ? await client.phrases(selected) : []);
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+  }, [client, presenterId, snapshot.roomId]);
+  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { if (presenterId) void client.phrases(presenterId).then(setPhrases).catch(() => undefined); }, [client, presenterId]);
+  const run = async (task: () => Promise<unknown>) => { setBusy(true); setMessage(''); try { await task(); await load(); } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } finally { setBusy(false); } };
+  const addRule = () => run(async () => { await client.createRule(snapshot.roomId, { name: ruleDraft.title || ruleDraft.pattern, pattern: ruleDraft.pattern, risk: 'blocked', title: ruleDraft.title, reason: '命中当前直播间确认的高风险表达', alternative: ruleDraft.alternative, policyRef: '直播间自定义规则' }); setRuleDraft({ pattern: '', title: '', alternative: '' }); });
+  const addPhrase = () => run(async () => { await client.createPhrase(presenterId, { text: phraseDraft, productId: snapshot.product.id, purpose, status: 'draft' }); setPhraseDraft(''); });
+  const addPresenter = () => run(async () => { const presenter = await client.createPresenter(snapshot.roomId, newPresenter); setNewPresenter(''); setPresenterId(presenter.id); });
+
+  return <div className="v2-modal"><section className="v2-review-workspace v2-library-workspace">
+    <header><div><BookOpen size={19} /><span><strong>资料管理</strong><small>商品、风险规则与主播专属话术均保存在本机</small></span></div><button type="button" title="关闭" onClick={onClose}><X size={17} /></button></header>
+    <nav>{(['phrases', 'rules', 'products'] as const).map((item) => <button type="button" key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item === 'phrases' ? '主播话术' : item === 'rules' ? '风险规则' : '商品资料'}</button>)}</nav>
+    <main>{tab === 'products' && <div className="v2-library-products">{products.map((product) => <article key={product.id}><img src={product.image} alt="" /><div><strong>{product.name}</strong><small>{product.category} · {product.price} · {product.sku}</small><p>{product.description}</p></div></article>)}</div>}
+      {tab === 'rules' && <div className="v2-library-columns"><section><header><span>新增高置信规则</span></header><input value={ruleDraft.pattern} onChange={(event) => setRuleDraft({ ...ruleDraft, pattern: event.target.value })} placeholder="风险词或明确短语" /><input value={ruleDraft.title} onChange={(event) => setRuleDraft({ ...ruleDraft, title: event.target.value })} placeholder="提醒标题" /><textarea value={ruleDraft.alternative} onChange={(event) => setRuleDraft({ ...ruleDraft, alternative: event.target.value })} placeholder="主播可直接替换的安全表达" /><button type="button" disabled={busy || !ruleDraft.pattern || !ruleDraft.title || !ruleDraft.alternative} onClick={addRule}><Plus size={13} />保存规则</button></section><section className="v2-library-list">{rules.map((rule) => <article key={rule.id}><div><span className={rule.risk}>{rule.risk === 'blocked' ? '高风险' : '提醒'}</span><strong>{rule.name}</strong></div><p>{rule.pattern}</p><small>{rule.origin === 'learned' ? `自动沉淀 · 证据 ${rule.evidenceCount ?? 1} 次` : `人工规则 · v${rule.version}`}</small><button type="button" onClick={() => void run(() => client.setRuleEnabled(rule, !rule.enabled))}>{rule.enabled ? '停用' : '启用'}</button></article>)}</section></div>}
+      {tab === 'phrases' && <div className="v2-library-columns"><section><header><span>主播档案</span></header><select value={presenterId} onChange={(event) => setPresenterId(event.target.value)}>{presenters.map((presenter) => <option value={presenter.id} key={presenter.id}>{presenter.name}</option>)}</select><button type="button" disabled={!presenterId || presenterId === snapshot.presenterId} onClick={() => send({ type: 'select_presenter', presenterId })}><UserRound size={13} />{presenterId === snapshot.presenterId ? '本场当前主播' : '设为本场主播'}</button><div className="v2-inline-form"><input value={newPresenter} onChange={(event) => setNewPresenter(event.target.value)} placeholder="新增主播名称" /><button type="button" disabled={!newPresenter.trim() || busy} onClick={addPresenter}><Plus size={13} /></button></div><select value={purpose} onChange={(event) => setPurpose(event.target.value as CoachPurpose)}><option>塑品</option><option>憋单</option><option>逼单</option><option>转化</option><option>互动</option><option>留人</option><option>答疑</option></select><textarea value={phraseDraft} onChange={(event) => setPhraseDraft(event.target.value)} placeholder="录入头部直播间话术，或保存下一场参考表达" /><button type="button" disabled={busy || !presenterId || !phraseDraft.trim()} onClick={addPhrase}><Save size={13} />保存话术</button></section><section className="v2-library-list">{phrases.map((phrase) => <article key={phrase.id}><div><span className={phrase.status}>{phrase.status === 'reference' ? '下一场参考' : phrase.source === 'session' ? '下播归档' : '草稿'}</span><strong>{phrase.purpose ?? '通用'}</strong></div><p>{phrase.text}</p><small>{phrase.source === 'session' ? '来自历史直播' : phrase.source === 'manual' ? '人工录入' : '豆包改写'} · v{phrase.version}</small><button type="button" onClick={() => void run(() => client.updatePhrase(phrase.id, { status: phrase.status === 'reference' ? 'draft' : 'reference' }))}>{phrase.status === 'reference' ? '取消参考' : '选为参考'}</button></article>)}</section></div>}
+    </main>{message && <div className="v2-review-message">{message}</div>}
+  </section></div>;
+}
+
+function ReviewWorkspace({ roomId, onClose }: { roomId: string; onClose: () => void }) {
+  const client = useMemo(() => new SessionReviewClient(), []);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [selected, setSelected] = useState('');
+  const [review, setReview] = useState<SessionReview | null>(null);
+  const [note, setNote] = useState('');
+  const [editing, setEditing] = useState<{ segmentId: string; text: string } | null>(null);
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const loadSessions = useCallback(async () => {
+    try {
+      const items = await client.listSessions(roomId);
+      setSessions(items);
+      setSelected((current) => current || items[0]?.sessionId || '');
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+  }, [client, roomId]);
+  const loadReview = useCallback(async (sessionId: string) => {
+    if (!sessionId) { setReview(null); return; }
+    try { const next = await client.getReview(sessionId); setReview(next); setNote(next.summary.note); } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+  }, [client]);
+  useEffect(() => { void loadSessions(); }, [loadSessions]);
+  useEffect(() => { void loadReview(selected); }, [loadReview, selected]);
+
+  const run = async (task: () => Promise<unknown>) => {
+    setBusy(true); setMessage('');
+    try { await task(); await loadSessions(); await loadReview(selected); } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } finally { setBusy(false); }
+  };
+  const saveTranscript = () => editing && run(() => client.correctTranscript(selected, editing.segmentId, editing.text).then(() => setEditing(null)));
+  const assignSpeaker = (segment: TranscriptSegment) => run(() => client.assignSpeaker(selected, segment.id, segment.speaker === 'other' ? 'host' : 'other', segment.speakerId));
+  const saveNote = () => run(() => client.saveNote(selected, note));
+  const deliver = () => run(() => review?.delivery === 'failed' ? client.retryDelivery(selected) : client.approveDelivery(selected));
+
+  return <div className="v2-modal"><section className="v2-review-workspace">
+    <header><div><Archive size={19} /><span><strong>历史复核</strong><small>修改后重新人工确认，才会进入知识库和数据库上传队列</small></span></div><button type="button" title="关闭" onClick={onClose}><X size={17} /></button></header>
+    <div className="v2-review-layout"><aside><div className="v2-review-sidehead"><span>{sessions.length} 场直播</span><button type="button" title="刷新" onClick={() => void loadSessions()}><RefreshCw size={13} /></button></div>{sessions.map((session) => <button type="button" className={selected === session.sessionId ? 'active' : ''} key={session.sessionId} onClick={() => setSelected(session.sessionId)}><strong>{new Date(session.createdAt).toLocaleString('zh-CN', { hour12: false })}</strong><small>{session.presenterName} · {session.transcriptCount} 段</small><span className={session.delivery}>{session.delivery === 'synced' ? '已上传' : session.approval === 'approved' ? '已确认' : '待确认'}</span></button>)}</aside>
+      <main>{review ? <>
+        <div className="v2-review-summary"><div><strong>{review.summary.presenterName}</strong><span>内容版本 {review.summary.contentRevision}</span></div><div><span className={`v2-delivery ${review.delivery}`}>{review.delivery === 'synced' ? '已同步' : review.delivery === 'failed' ? '上传失败' : review.approval === 'approved' ? '已人工确认' : '等待人工确认'}</span><button type="button" onClick={deliver} disabled={busy || review.summary.lifecycle !== 'ended' || note !== review.summary.note}><Database size={14} />{review.delivery === 'failed' ? '重新上传' : '确认并上传'}</button></div></div>
+        <div className="v2-review-note"><textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录本场表现、待改话术和下一场安排" /><button type="button" disabled={busy || note === review.summary.note} onClick={saveNote}><Save size={13} />保存备注</button></div>
+        {review.audioPath && <audio controls preload="metadata" src={client.audioUrl(selected)} />}
+        <section className="v2-review-transcripts"><header><span>转录与说话人</span><small>主播 / 其他人可逐段纠正</small></header>{review.transcripts.map((segment) => <article key={segment.id}><time>{formatTime(segment.timestamp)}</time><button type="button" className="v2-speaker-button" onClick={() => void assignSpeaker(segment)} disabled={busy}><SpeakerBadge segment={segment} /></button>{editing?.segmentId === segment.id ? <div className="v2-review-edit"><textarea value={editing.text} onChange={(event) => setEditing({ ...editing, text: event.target.value })} /><button type="button" onClick={() => void saveTranscript()} disabled={busy}><Save size={13} /></button><button type="button" onClick={() => setEditing(null)}><X size={13} /></button></div> : <><p>{segment.text}</p><button type="button" title="纠正文本" onClick={() => setEditing({ segmentId: segment.id, text: segment.text })}><Pencil size={13} /></button></>}</article>)}</section>
+      </> : <div className="v2-empty">选择一场直播开始复核</div>}</main></div>
+    {message && <div className="v2-review-message">{message}</div>}
+  </section></div>;
+}
+
+function OperatorApp() {
+  const live = useLive('operator');
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  return <div className="v2-app">
+    <header className="v2-topbar"><div className="v2-brand"><span><MonitorUp size={18} /></span><div><strong>直播中控</strong><small>风险预警与主播提词</small></div></div><div className="v2-live-state"><i className={live.snapshot.lifecycle === 'live' ? 'live' : ''} /><span>{lifecycleText(live.snapshot.lifecycle)}</span><small>{live.snapshot.presenterName}</small></div><LiveControls snapshot={live.snapshot} connected={live.connected} status={live.status} send={live.send} sendAudio={live.sendAudio} /></header>
+    <div className="v2-operator-grid"><ProductRail snapshot={live.snapshot} products={live.products} send={live.send} openHistory={() => setHistoryOpen(true)} openLibrary={() => setLibraryOpen(true)} />
+      <main className="v2-main"><header className="v2-product-context"><div><span>当前商品</span><h1>{live.snapshot.product.name}</h1></div><strong>{live.snapshot.product.price}</strong></header><CoachBoard snapshot={live.snapshot} /><TranscriptFeed snapshot={live.snapshot} compact /><DemoInput snapshot={live.snapshot} send={live.send} /></main>
+      <aside className="v2-right-rail"><RiskPanel snapshot={live.snapshot} /><section className="v2-session-stats"><div><Clock3 size={14} /><span>直播时长</span><strong>{Math.floor(live.snapshot.stats.speakingSeconds / 60).toString().padStart(2, '0')}:{(live.snapshot.stats.speakingSeconds % 60).toString().padStart(2, '0')}</strong></div><div><AlertTriangle size={14} /><span>风险提醒</span><strong>{live.snapshot.stats.warningCount + live.snapshot.stats.blockedCount}</strong></div></section><DisplayLinkPanel sessionId={live.snapshot.sessionId} /></aside>
+    </div>{historyOpen && <ReviewWorkspace roomId={live.snapshot.roomId} onClose={() => setHistoryOpen(false)} />}{libraryOpen && <LibraryWorkspace snapshot={live.snapshot} products={live.products} send={live.send} onClose={() => setLibraryOpen(false)} />}
+  </div>;
+}
+
+function DisplayApp() {
+  const live = useLive('display');
+  const currentTranscript = live.snapshot.partialTranscript || live.snapshot.transcriptHistory.at(-1)?.text || '等待主播开始说话';
+  return <div className="v2-display"><header><div className="v2-brand"><span><MonitorUp size={18} /></span><div><strong>主播提示屏</strong><small>{live.snapshot.product.name}</small></div></div><div className="v2-live-state"><i className={live.snapshot.lifecycle === 'live' ? 'live' : ''} /><span>{lifecycleText(live.snapshot.lifecycle)}</span></div></header><main><section className="v2-display-transcript"><header><span>流式话术转录</span><SpeakerBadge segment={live.snapshot.transcriptHistory.at(-1) ?? { id: 'partial', text: '', isFinal: false, timestamp: Date.now(), offsetMs: null, startOffsetMs: null, endOffsetMs: null, speaker: 'host' }} /></header><p>{currentTranscript}</p></section><CoachBoard snapshot={live.snapshot} display /><RiskPanel snapshot={live.snapshot} display /></main><footer><span>{live.status}</span><strong>{live.snapshot.product.name} · {live.snapshot.product.price}</strong></footer></div>;
+}
+
 export default function App() {
-  return window.location.pathname.startsWith('/display') || window.location.pathname.startsWith('/screen/') ? <DisplayScreen /> : <OperatorEntry />;
+  return window.location.pathname.startsWith('/screen/') ? <DisplayApp /> : <OperatorApp />;
 }
