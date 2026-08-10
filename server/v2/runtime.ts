@@ -4,6 +4,7 @@ import type { LiveCommand, LiveEvent, LiveSessionSnapshot, SessionReview, Sessio
 import type { Product } from '../../src/shared/types';
 import { createDoubaoAnalyzer } from '../services';
 import { createDoubaoCoach } from '../providers/doubaoCoach';
+import { buildStreamingAsrContext } from '../providers/doubaoStreamingAsr';
 import { CaptureModule } from './capture';
 import { AudioFileWriter } from './audio';
 import { BoundedScheduler } from './scheduler';
@@ -56,12 +57,20 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
   const deliveryTimer = setInterval(() => { void delivery.flushOnce(); }, 5_000);
   deliveryTimer.unref();
   const sessions = new Map<string, LiveSession>();
-  const writers = new Map<string, AudioFileWriter>();
+  const writers = new Map<string, { source: AudioFileWriter; asr: AudioFileWriter }>();
   const products = PRODUCTS.map((product) => ({ ...product, updatedAt: product.updatedAt || Date.now() }));
   const roomId = 'room-default';
   store.ensureRoom({ id: roomId, tenantId: 'tenant-local', name: '默认直播间', accountName: '本地账号', ownerActorId: 'owner' });
   products.forEach((product) => store.upsertProduct('tenant-local', product, roomId));
   presenters.ensureDefault(roomId);
+
+  const syncBackgroundScheduling = (): void => {
+    const captureCritical = [...sessions.values()].some((candidate) => {
+      const lifecycle = candidate.snapshot().lifecycle;
+      return lifecycle === 'live' || lifecycle === 'ending';
+    });
+    if (captureCritical) scheduler.pauseBackground(); else scheduler.resumeBackground();
+  };
 
   const getOrCreateSession = (input: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string } = {}): LiveSession => {
     const requestedId = validSessionId(input.sessionId);
@@ -75,13 +84,20 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
     const presenter = requestedPresenter?.roomId === targetRoom ? requestedPresenter : defaultPresenter;
     const presenterId = presenter.id;
     const presenterName = input.presenterName?.trim() || presenter.name;
-    const writer = new AudioFileWriter(audioRoot, 'tenant-local', targetRoom, sessionId);
+    const writer = {
+      source: new AudioFileWriter(audioRoot, 'tenant-local', targetRoom, sessionId, 'source.pcm'),
+      asr: new AudioFileWriter(audioRoot, 'tenant-local', targetRoom, sessionId, 'asr-16k.pcm'),
+    };
     let liveSession!: LiveSession;
     const capture = new CaptureModule({
-      onPartial: (result) => liveSession.receiveAsr(result),
-      onFinal: (result) => liveSession.receiveAsr(result),
+      onPartial: (result) => liveSession.receiveAsr({ ...result, text: store.applySpeechCorrections(targetRoom, result.text).text }),
+      onFinal: (result) => liveSession.receiveAsr({ ...result, text: store.applySpeechCorrections(targetRoom, result.text).text }),
       onError: (error) => liveSession.captureFailure(error),
-      onAudio: (pcm, sampleRate, channels) => writer.append(pcm, sampleRate, channels),
+      onAudio: (pcm, sampleRate, channels, track) => writer[track].append(pcm, sampleRate, channels),
+      asrContext: () => {
+        const active = liveSession.snapshot().product;
+        return buildStreamingAsrContext(store.speechCorrectionHotwords(targetRoom), [active.name, active.category, ...active.sellingPoints]);
+      },
     });
     liveSession = new LiveSession({
       store, scheduler, products, capture,
@@ -99,15 +115,14 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
     });
     writers.set(sessionId, writer);
     liveSession.subscribe((event) => {
-      if (event.type === 'lifecycle.changed' && event.payload.lifecycle === 'live') scheduler.pauseBackground();
+      if (event.type === 'lifecycle.changed' || event.type === 'capture.error') syncBackgroundScheduling();
       if (event.type === 'session.ended') {
         const snapshot = liveSession.snapshot();
         presenters.archiveSession(snapshot.presenterId, sessionId, snapshot.product.id, snapshot.transcriptHistory);
-        void writer.finalize().then((asset) => { if (asset.byteLength > 0) store.registerAudioAsset({ id: `audio-${sessionId}`, sessionId, path: asset.path, byteLength: asset.byteLength, durationMs: asset.durationMs, sampleRate: asset.sampleRate, channels: asset.channels }); }).catch(() => undefined);
-      }
-      if (event.type === 'lifecycle.changed' && event.payload.lifecycle === 'ended') {
-        const anyLive = [...sessions.values()].some((candidate) => candidate.id !== sessionId && candidate.snapshot().lifecycle === 'live');
-        if (!anyLive) scheduler.resumeBackground();
+        void Promise.all([writer.source.finalize(), writer.asr.finalize()]).then(([source, asr]) => {
+          if (source.byteLength > 0) store.registerAudioAsset({ id: `audio-source-${sessionId}`, sessionId, path: source.path, encoding: 'pcm_s16le_source', byteLength: source.byteLength, durationMs: source.durationMs, sampleRate: source.sampleRate, channels: source.channels });
+          if (asr.byteLength > 0) store.registerAudioAsset({ id: `audio-asr-${sessionId}`, sessionId, path: asr.path, encoding: 'pcm_s16le_asr', byteLength: asr.byteLength, durationMs: asr.durationMs, sampleRate: asr.sampleRate, channels: asr.channels });
+        }).catch(() => undefined);
       }
     });
     sessions.set(sessionId, liveSession);
@@ -130,8 +145,9 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
       clearInterval(deliveryTimer);
       await Promise.all([...sessions.values()].filter((session) => session.snapshot().lifecycle !== 'ended').map((session) => session.dispatch({ type: 'stop' })));
       await Promise.all([...writers.entries()].map(async ([sessionId, writer]) => {
-        const asset = await writer.finalize().catch(() => null);
-        if (asset && asset.byteLength > 0) store.registerAudioAsset({ id: `audio-${sessionId}`, sessionId, path: asset.path, byteLength: asset.byteLength, durationMs: asset.durationMs, sampleRate: asset.sampleRate, channels: asset.channels });
+        const [source, asr] = await Promise.all([writer.source.finalize().catch(() => null), writer.asr.finalize().catch(() => null)]);
+        if (source && source.byteLength > 0) store.registerAudioAsset({ id: `audio-source-${sessionId}`, sessionId, path: source.path, encoding: 'pcm_s16le_source', byteLength: source.byteLength, durationMs: source.durationMs, sampleRate: source.sampleRate, channels: source.channels });
+        if (asr && asr.byteLength > 0) store.registerAudioAsset({ id: `audio-asr-${sessionId}`, sessionId, path: asr.path, encoding: 'pcm_s16le_asr', byteLength: asr.byteLength, durationMs: asr.durationMs, sampleRate: asr.sampleRate, channels: asr.channels });
       }));
       store.close();
     },

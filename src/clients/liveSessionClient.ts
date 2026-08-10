@@ -1,6 +1,8 @@
 import type { LiveCommand, LiveEvent, LiveSessionSnapshot } from '../shared/v2';
 import type { Product } from '../shared/types';
 import type { V2ClientFrame, V2ServerFrame } from '../shared/v2Protocol';
+import { encodeAudioFrame, type AudioTrack } from '../shared/v2Audio';
+import { clearAuthToken, storedAuthToken, V2_AUTH_REQUIRED_EVENT } from './authHeaders';
 
 export type LiveSessionClientOptions = { roomId: string; sessionId?: string; displayAlias?: string; role: 'operator' | 'display'; presenterId?: string; url?: string };
 export type LiveSessionClientListener = (snapshot: LiveSessionSnapshot, event?: LiveEvent) => void;
@@ -42,7 +44,8 @@ export class LiveSessionClient {
     socket.onopen = () => {
       this.connectedValue = true;
       this.setStatus('已连接');
-      this.sendFrame({ type: 'session.join', roomId: this.options.roomId, ...(this.options.sessionId ? { sessionId: this.options.sessionId } : {}), ...(this.options.displayAlias ? { displayAlias: this.options.displayAlias } : {}), role: this.options.role, actorId: this.options.role === 'display' ? 'local-display' : 'local-operator', ...(this.options.presenterId ? { presenterId: this.options.presenterId } : {}) });
+      const token = this.options.displayAlias ? undefined : storedAuthToken();
+      this.sendFrame({ type: 'session.join', roomId: this.options.roomId, ...(this.options.sessionId ? { sessionId: this.options.sessionId } : {}), ...(this.options.displayAlias ? { displayAlias: this.options.displayAlias } : {}), role: this.options.role, actorId: this.options.role === 'display' ? 'local-display' : 'local-operator', ...(token ? { token } : {}), ...(this.options.presenterId ? { presenterId: this.options.presenterId } : {}) });
     };
     socket.onmessage = (message) => {
       if (typeof message.data !== 'string') return;
@@ -58,6 +61,10 @@ export class LiveSessionClient {
         this.snapshotValue = frame.snapshot;
         this.notify(frame.snapshot, frame.event);
       } else if (frame.type === 'error') {
+        if (this.options.role === 'operator' && /请先登录|登录已过期|登录凭证/iu.test(frame.message)) {
+          clearAuthToken();
+          window.dispatchEvent(new Event(V2_AUTH_REQUIRED_EVENT));
+        }
         this.setStatus(frame.message);
       }
     };
@@ -82,10 +89,10 @@ export class LiveSessionClient {
     return true;
   }
 
-  sendAudio(pcm: ArrayBuffer | Uint8Array): boolean {
+  sendAudio(pcm: ArrayBuffer | Uint8Array, sampleRate = 16_000, track: AudioTrack = 'asr', channels = 1): boolean {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN || this.options.role === 'display') return false;
-    const payload = pcm instanceof ArrayBuffer ? pcm : new Uint8Array(pcm).buffer as ArrayBuffer;
-    this.socket.send(payload);
+    const bytes = pcm instanceof ArrayBuffer ? new Uint8Array(pcm) : pcm;
+    this.socket.send(encodeAudioFrame({ track, sampleRate, channels, pcm: bytes }).buffer);
     return true;
   }
 

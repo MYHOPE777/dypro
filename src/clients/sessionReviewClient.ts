@@ -1,5 +1,6 @@
 import type { DeliveryJob, SessionReview, SessionSummary } from '../shared/v2';
 import type { TranscriptSegment } from '../shared/types';
+import { authenticatedHeaders } from './authHeaders';
 
 export class SessionReviewClient {
   constructor(private readonly actorId = 'local-operator') {}
@@ -11,11 +12,17 @@ export class SessionReviewClient {
   async saveNote(sessionId: string, note: string): Promise<{ contentRevision: number; note: string }> { return this.request(`/api/v2/sessions/${encodeURIComponent(sessionId)}/note`, { method: 'POST', body: JSON.stringify({ note }) }); }
   async approveDelivery(sessionId: string): Promise<DeliveryJob> { return this.request(`/api/v2/sessions/${encodeURIComponent(sessionId)}/delivery/approve`, { method: 'POST', body: '{}' }); }
   async retryDelivery(sessionId: string): Promise<DeliveryJob> { return this.request(`/api/v2/sessions/${encodeURIComponent(sessionId)}/delivery/retry`, { method: 'POST', body: '{}' }); }
-  audioUrl(sessionId: string): string { return `/api/v2/sessions/${encodeURIComponent(sessionId)}/audio`; }
+  async loadAudioUrl(sessionId: string): Promise<string> {
+    const response = await fetch(`/api/v2/sessions/${encodeURIComponent(sessionId)}/audio`, { headers: authenticatedHeaders(undefined, this.actorId) });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({})) as { message?: string };
+      throw new Error(body.message ?? '音频加载失败');
+    }
+    return URL.createObjectURL(await response.blob());
+  }
 
   private async request<T>(url: string, init: RequestInit = {}): Promise<T> {
-    const headers = new Headers(init.headers);
-    headers.set('X-Actor-Id', this.actorId);
+    const headers = authenticatedHeaders(init.headers, this.actorId);
     if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
     const response = await fetch(url, { ...init, headers });
     const body = await response.json().catch(() => ({})) as T & { message?: string };

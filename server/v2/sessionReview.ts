@@ -2,6 +2,22 @@ import type { SpeakerLabel, TranscriptSegment } from '../../src/shared/types';
 import type { DeliveryJob, SessionReview, SessionSummary } from '../../src/shared/v2';
 import { SqliteFactStore } from './store';
 
+function deriveCorrection(originalText: string, correctedText: string): { wrongText: string; correctText: string } | undefined {
+  const original = [...originalText.trim()];
+  const corrected = [...correctedText.trim()];
+  if (original.join('') === corrected.join('')) return undefined;
+  let prefix = 0;
+  while (prefix < original.length && prefix < corrected.length && original[prefix] === corrected[prefix]) prefix += 1;
+  let suffix = 0;
+  while (suffix < original.length - prefix && suffix < corrected.length - prefix && original[original.length - 1 - suffix] === corrected[corrected.length - 1 - suffix]) suffix += 1;
+  const contextualStart = Math.max(0, prefix - 2);
+  const originalEnd = Math.min(original.length, original.length - suffix + 2);
+  const correctedEnd = Math.min(corrected.length, corrected.length - suffix + 2);
+  const wrongText = original.slice(contextualStart, originalEnd).join('').trim();
+  const correctText = corrected.slice(contextualStart, correctedEnd).join('').trim();
+  return wrongText && correctText && wrongText !== correctText ? { wrongText, correctText } : undefined;
+}
+
 export class SessionReviewModule {
   constructor(private readonly store: SqliteFactStore) {}
 
@@ -18,7 +34,8 @@ export class SessionReviewModule {
     const original = review.transcripts.find((segment) => segment.id === segmentId);
     if (!original || !text.trim()) throw new Error('转录片段不存在');
     const segment: TranscriptSegment = { ...original, text: text.trim(), timestamp: original.timestamp, isFinal: true };
-    return this.store.editReviewTranscript(sessionId, segmentId, segment, actorId);
+    const correction = deriveCorrection(original.text, segment.text);
+    return this.store.editReviewTranscript(sessionId, segmentId, segment, actorId, 'transcript.corrected', Date.now(), correction ? { roomId: review.summary.roomId, ...correction } : undefined);
   }
 
   assignSpeaker(sessionId: string, segmentId: string, speaker: SpeakerLabel, speakerId: string | undefined, actorId: string): { contentRevision: number; segment: TranscriptSegment } {

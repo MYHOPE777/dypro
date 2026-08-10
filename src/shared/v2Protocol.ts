@@ -7,6 +7,7 @@ export type V2JoinCommand = {
   roomId?: string;
   role: 'operator' | 'display';
   actorId?: string;
+  token?: string;
   displayAlias?: string;
   presenterId?: string;
 };

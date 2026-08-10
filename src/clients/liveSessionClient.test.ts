@@ -39,6 +39,7 @@ describe('LiveSessionClient', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     FakeWebSocket.instances = [];
+    localStorage.clear();
     vi.stubGlobal('WebSocket', FakeWebSocket);
   });
 
@@ -70,6 +71,19 @@ describe('LiveSessionClient', () => {
 
     expect(client.snapshot?.latestSequence).toBe(5);
     expect(received.at(-1)?.stats.words).toBe(5);
+    client.close();
+  });
+
+  it('authenticates operator joins with the stored signed token', () => {
+    localStorage.setItem('v2-auth-token', 'signed-operator-token');
+    const client = new LiveSessionClient({ roomId: 'room-default', role: 'operator' });
+
+    client.connect();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+
+    const join = JSON.parse(socket.sent[0] as string) as { command: { token?: string } };
+    expect(join.command.token).toBe('signed-operator-token');
     client.close();
   });
 });

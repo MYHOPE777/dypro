@@ -33,9 +33,14 @@ describe('realtime latency budgets', () => {
   it('stops waiting for remote analysis at the two second budget', async () => {
     vi.useFakeTimers();
     const coachUpdates: Array<{ suggestions: CoachSuggestion[]; pending: boolean }> = [];
+    let coachStarted = false;
     const pipeline = new RealtimeReviewPipeline({
       sessionId: 'timeout-session', scheduler: new BoundedScheduler({ modelGlobal: 1, modelPerSession: 1, background: 1 }),
       analyzer: { analyze: () => new Promise<ComplianceResult>(() => undefined) },
+      coach: {
+        suggest: () => new Promise<CoachSuggestion>(() => undefined),
+        suggestMany: () => { coachStarted = true; return new Promise<CoachSuggestion[]>(() => undefined); },
+      },
       isProductSegmentCurrent: () => true, isLatest: () => true, onCompliance: () => undefined,
       onCoach: (_segmentId, suggestions, pending) => coachUpdates.push({ suggestions, pending }),
     });
@@ -45,7 +50,29 @@ describe('realtime latency budgets', () => {
     await vi.advanceTimersByTimeAsync(1);
     await Promise.resolve();
     expect(coachUpdates.at(-1)?.pending).toBe(false);
+    expect(coachStarted).toBe(false);
     vi.useRealTimers();
+  });
+
+  it('starts semantic review and coaching in parallel', async () => {
+    let finishAnalysis!: (result: ComplianceResult) => void;
+    const analysis = new Promise<ComplianceResult>((resolve) => { finishAnalysis = resolve; });
+    let analysisStarted = false;
+    let coachStarted = false;
+    const pipeline = new RealtimeReviewPipeline({
+      sessionId: 'parallel-session', scheduler: new BoundedScheduler({ modelGlobal: 2, modelPerSession: 2, background: 1 }),
+      analyzer: { analyze: async () => { analysisStarted = true; return analysis; } },
+      coach: {
+        suggest: async () => ({ id: 'unused', purpose: '塑品', text: 'unused', reason: 'unused', source: 'doubao', createdAt: 1 }),
+        suggestMany: async () => { coachStarted = true; return []; },
+      },
+      isProductSegmentCurrent: () => true, isLatest: () => true, onCompliance: () => undefined, onCoach: () => undefined,
+    });
+
+    await pipeline.process({ token: { requestSequence: 1, productRevision: 0, segmentRevision: 0, segmentId: segment.id }, segment, product: DEFAULT_PRODUCT, riskProfile: 'balanced', context: { text: segment.text, segmentCount: 1, windowStartMs: 0, windowEndMs: 1 }, stats: { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 } });
+    await vi.waitFor(() => expect(analysisStarted).toBe(true));
+    expect(coachStarted).toBe(true);
+    finishAnalysis({ id: 'remote', productId: DEFAULT_PRODUCT.id, risk: 'safe', title: '可继续', reason: '安全', alternative: '', policyRef: 'test', confidence: 0.9, source: 'doubao', transcript: segment.text, createdAt: 1 });
   });
 
   it('keeps total latency on results and emits detailed stage timings for logs', async () => {

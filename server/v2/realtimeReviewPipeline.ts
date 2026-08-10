@@ -28,6 +28,8 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Pr
   });
 }
 
+const MODEL_BUDGET_MS = 2_000;
+
 function normalized(result: ComplianceResult, segment: TranscriptSegment, product: Product, now: number): ComplianceResult {
   return { ...result, id: result.id || `compliance-${now}`, segmentId: segment.id, productId: product.id, transcript: segment.text, createdAt: now };
 }
@@ -63,25 +65,41 @@ export class RealtimeReviewPipeline {
     const fallback = localSuggestions({ product, transcript: segment.text, compliance: local, stats: input.stats, referencePhrases: input.referencePhrases } as CoachInput).slice(0, 3);
     if (this.options.isLatest(token)) this.options.onCoach(segment.id, fallback, true);
 
-    const modelQueuedAt = this.monotonicNow();
-    void this.options.scheduler.run('model', this.options.sessionId, async () => {
-      const semanticStartedAt = this.monotonicNow();
-      const remote = await withTimeout(this.options.analyzer.analyze(analysisInput), 2_000, local);
+    const semanticQueuedAt = this.monotonicNow();
+    let semanticStartedAt: number | undefined;
+    const semanticTask = this.options.scheduler.run('model', this.options.sessionId, async () => {
+      semanticStartedAt = this.monotonicNow();
+      const remainingMs = MODEL_BUDGET_MS - this.elapsed(semanticQueuedAt, semanticStartedAt);
+      if (remainingMs <= 0) return { value: local, expired: true };
+      const result = await withTimeout(this.options.analyzer.analyze(analysisInput), remainingMs, local);
+      return { value: result.value, expired: result.timedOut };
+    });
+    void withTimeout(semanticTask, MODEL_BUDGET_MS, { value: local, expired: true }).then((remote) => {
       const semanticCompletedAt = this.monotonicNow();
-      const resolved = { ...normalized(remote.value, segment, product, this.now()), analysisMs: this.elapsed(processStartedAt, semanticCompletedAt) };
-      this.logTiming(input, 'semantic_review', processStartedAt, semanticStartedAt, semanticCompletedAt, modelQueuedAt, remote.timedOut, resolved.analysisTiming);
+      const resolved = { ...normalized(remote.value.value, segment, product, this.now()), analysisMs: this.elapsed(processStartedAt, semanticCompletedAt) };
+      this.logTiming(input, 'semantic_review', processStartedAt, semanticStartedAt ?? semanticCompletedAt, semanticCompletedAt, semanticQueuedAt, remote.timedOut || remote.value.expired, resolved.analysisTiming);
       if (!this.options.isProductSegmentCurrent(token)) return;
-      const latest = this.options.isLatest(token);
-      this.options.onCompliance(resolved, latest);
-      if (!latest) return;
+      this.options.onCompliance(resolved, this.options.isLatest(token));
+    }).catch(() => undefined);
 
-      const coachStartedAt = this.monotonicNow();
-      const remoteCoach = this.options.coach?.suggestMany
-        ? await withTimeout(this.options.coach.suggestMany({ product, transcript: segment.text, compliance: resolved, stats: input.stats, referencePhrases: input.referencePhrases }), 2_000, fallback)
-        : { value: fallback, timedOut: false };
+    if (!this.options.coach?.suggestMany) {
+      if (this.options.isLatest(token)) this.options.onCoach(segment.id, fallback, false);
+      this.logTiming(input, 'coach', processStartedAt, localCompletedAt, localCompletedAt, undefined, false);
+      return;
+    }
+    const coachQueuedAt = this.monotonicNow();
+    let coachStartedAt: number | undefined;
+    const coachTask = this.options.scheduler.run('model', this.options.sessionId, async () => {
+      coachStartedAt = this.monotonicNow();
+      const remainingMs = MODEL_BUDGET_MS - this.elapsed(coachQueuedAt, coachStartedAt);
+      if (remainingMs <= 0) return { value: fallback, expired: true };
+      const result = await withTimeout(this.options.coach!.suggestMany!({ product, transcript: segment.text, compliance: local, stats: input.stats, referencePhrases: input.referencePhrases }), remainingMs, fallback);
+      return { value: result.value, expired: result.timedOut };
+    });
+    void withTimeout(coachTask, MODEL_BUDGET_MS, { value: fallback, expired: true }).then((remoteCoach) => {
       const coachCompletedAt = this.monotonicNow();
-      this.logTiming(input, 'coach', processStartedAt, coachStartedAt, coachCompletedAt, undefined, remoteCoach.timedOut);
-      if (this.options.isLatest(token)) this.options.onCoach(segment.id, remoteCoach.value.slice(0, 3), false);
+      this.logTiming(input, 'coach', processStartedAt, coachStartedAt ?? coachCompletedAt, coachCompletedAt, coachQueuedAt, remoteCoach.timedOut || remoteCoach.value.expired);
+      if (this.options.isLatest(token)) this.options.onCoach(segment.id, remoteCoach.value.value.slice(0, 3), false);
     }).catch(() => {
       if (this.options.isLatest(token)) this.options.onCoach(segment.id, fallback, false);
     });

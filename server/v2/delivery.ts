@@ -38,9 +38,9 @@ export class DurableDelivery {
         this.store.updateDeliveryJob(idempotencyKey, 'uploading');
         try {
           for (const gateway of gateways) await gateway.deliver(review);
-          this.store.updateDeliveryJob(idempotencyKey, 'synced');
+          this.store.settleDeliveryJob(idempotencyKey, 'synced');
         } catch (error) {
-          this.store.updateDeliveryJob(idempotencyKey, 'failed', error instanceof Error ? error.message : String(error));
+          this.store.settleDeliveryJob(idempotencyKey, 'failed', error instanceof Error ? error.message : String(error));
         }
       });
       return 1;
@@ -70,16 +70,8 @@ export class DurableDelivery {
 }
 
 export function deliveryGatewaysFromEnv(env: NodeJS.ProcessEnv = process.env): DeliveryGateway[] {
-  const endpoints = [env.DATABASE_DELIVERY_URL, env.KNOWLEDGE_DELIVERY_URL].map((value) => value?.trim()).filter((value): value is string => Boolean(value));
-  return endpoints.map((endpoint) => ({
-    configured: true,
-    async deliver(review) {
-      const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: review.summary.sessionId, contentRevision: review.summary.contentRevision, summary: review.summary, transcripts: review.transcripts, audio: review.audioPath ? { localPath: review.audioPath } : null }) });
-      if (!response.ok) throw new Error(`上传网关返回 ${response.status}`);
-    },
-    async deliverResource(job) {
-      const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ deliveryType: 'resource', resourceType: job.resourceType, resourceId: job.resourceId, resourceVersion: job.resourceVersion, payload: job.payload }) });
-      if (!response.ok) throw new Error(`资源同步网关返回 ${response.status}`);
-    },
-  }));
+  // Cloud adapters are intentionally not wired in v0.3. Sending a Mac-local
+  // path to a remote HTTP endpoint would create a false successful delivery.
+  void env;
+  return [];
 }

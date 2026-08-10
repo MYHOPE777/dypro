@@ -2,6 +2,7 @@ import type { ComplianceAnalyzer } from '../../src/compliance/engine';
 import { analyzeTranscript } from '../../src/compliance/engine';
 import type { CoachPurpose, ComplianceResult, ComplianceRule, Product, SpeakerLabel, TranscriptSegment } from '../../src/shared/types';
 import type { LiveCommand, LiveEvent, LiveSessionListener, LiveSessionSnapshot } from '../../src/shared/v2';
+import type { AudioTrack } from '../../src/shared/v2Audio';
 import type { CoachProvider } from '../providers/doubaoCoach';
 import { findMentionedProduct } from '../productMentionMatcher';
 import { BoundedScheduler } from './scheduler';
@@ -14,7 +15,7 @@ export type CapturePort = {
   pause(): void;
   resume(): void;
   end(): Promise<void>;
-  pushAudio(pcm: Uint8Array, sampleRate: number, channels?: number): void;
+  pushAudio(pcm: Uint8Array, sampleRate: number, channels?: number, track?: AudioTrack): void;
   close?(): void;
 };
 
@@ -176,9 +177,12 @@ export class LiveSession {
       case 'audio':
         if (this.snapshotValue.lifecycle === 'live') {
           const channels = command.channels ?? 1;
-          this.speakerDiarizer.pushAudio(Buffer.from(command.pcm), this.audioOffsetMs);
-          this.audioOffsetMs += command.pcm.byteLength / Math.max(1, command.sampleRate * channels * 2) * 1_000;
-          this.capture.pushAudio(command.pcm, command.sampleRate, channels);
+          const track = command.track ?? 'asr';
+          if (track === 'asr') {
+            this.speakerDiarizer.pushAudio(Buffer.from(command.pcm), this.audioOffsetMs);
+            this.audioOffsetMs += command.pcm.byteLength / Math.max(1, command.sampleRate * channels * 2) * 1_000;
+          }
+          this.capture.pushAudio(command.pcm, command.sampleRate, channels, track);
         }
         return;
     }

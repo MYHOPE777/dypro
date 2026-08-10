@@ -122,6 +122,7 @@ export class AuthService {
   private readonly reviewerActorId: string;
   private readonly tokenTtlMs: number;
   private readonly now: () => number;
+  private readonly allowInsecure: boolean;
   readonly configured: boolean;
 
   constructor(env: NodeJS.ProcessEnv = process.env, now: () => number = Date.now) {
@@ -133,6 +134,7 @@ export class AuthService {
     this.reviewerActorId = env.RULE_REVIEWER_ACTOR_ID ?? 'owner';
     this.tokenTtlMs = readAuthTokenTtlMs(env);
     this.now = now;
+    this.allowInsecure = env.ALLOW_INSECURE_AUTH === 'true';
     this.configured = users.length > 0;
     if (this.configured && this.users.get(this.reviewerActorId)?.role !== 'reviewer') {
       throw new Error('RULE_REVIEWER_ACTOR_ID 必须对应 reviewer 账号');
@@ -156,6 +158,10 @@ export class AuthService {
     }
     if (!input.token) throw new Error('请先登录控制台');
     return this.verify(input.token);
+  }
+
+  assertControlTransport(input: { encrypted: boolean; remoteAddress?: string; forwardedProto?: string }): void {
+    if (!allowsControlTransport({ authConfigured: this.configured, allowInsecure: this.allowInsecure, ...input })) throw new Error('多人模式必须通过 HTTPS/WSS 访问控制台');
   }
 
   private sign(payload: TokenPayload): string {

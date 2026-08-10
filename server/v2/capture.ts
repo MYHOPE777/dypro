@@ -1,5 +1,6 @@
 import { createDoubaoStreamingAsr, getStreamingAsrConfig, type StreamingAsrResult } from '../providers/doubaoStreamingAsr';
 import type { CapturePort } from './liveSession';
+import type { AudioTrack } from '../../src/shared/v2Audio';
 
 export type CaptureAsrStream = { connect(): void; sendAudio(audio: Buffer): void; finish(): void; close(): void };
 export type CaptureAsrFactory = (options: {
@@ -7,6 +8,7 @@ export type CaptureAsrFactory = (options: {
   onError: (error: Error) => void;
   onReady: () => void;
   onClosed: () => void;
+  context?: string;
 }) => CaptureAsrStream | null;
 
 const RECOVERY_DELAYS_MS = [250, 750, 1_500];
@@ -26,12 +28,14 @@ export class CaptureModule implements CapturePort {
   private recoveryAttempt = 0;
   private generation = 0;
   private recoveryScheduled = false;
+  private audioTimelineMs = 0;
 
   constructor(private readonly options: {
     onPartial: (result: StreamingAsrResult) => void;
     onFinal: (result: StreamingAsrResult) => void;
     onError: (error: Error) => void;
-    onAudio?: (pcm: Uint8Array, sampleRate: number, channels: number) => void;
+    onAudio?: (pcm: Uint8Array, sampleRate: number, channels: number, track: AudioTrack) => void;
+    asrContext?: () => string | undefined;
     createAsr?: CaptureAsrFactory;
     drainTimeoutMs?: number;
   }) {
@@ -41,6 +45,7 @@ export class CaptureModule implements CapturePort {
       onError: streamOptions.onError,
       onReady: streamOptions.onReady,
       onClosed: streamOptions.onClosed,
+      context: streamOptions.context,
     }));
   }
 
@@ -54,13 +59,20 @@ export class CaptureModule implements CapturePort {
   private connect(): void {
     if (!this.active) return;
     const generation = ++this.generation;
+    const streamBaseOffsetMs = this.audioTimelineMs;
     this.recoveryScheduled = false;
     let stream: CaptureAsrStream | null = null;
     stream = this.createAsr({
+      context: this.options.asrContext?.(),
       onResult: (result) => {
         if (generation !== this.generation) return;
         if (!this.active && !this.endWaiter) return;
-        if (result.isFinal) this.options.onFinal(result); else this.options.onPartial(result);
+        const timelineResult: StreamingAsrResult = {
+          ...result,
+          ...(typeof result.startTimeMs === 'number' ? { startTimeMs: streamBaseOffsetMs + result.startTimeMs } : {}),
+          ...(typeof result.endTimeMs === 'number' ? { endTimeMs: streamBaseOffsetMs + result.endTimeMs } : {}),
+        };
+        if (result.isFinal) this.options.onFinal(timelineResult); else this.options.onPartial(timelineResult);
       },
       onError: (error) => {
         if (generation !== this.generation) return;
@@ -120,9 +132,11 @@ export class CaptureModule implements CapturePort {
     });
   }
 
-  pushAudio(pcm: Uint8Array, _sampleRate: number, _channels = 1): void {
+  pushAudio(pcm: Uint8Array, _sampleRate: number, _channels = 1, track: AudioTrack = 'asr'): void {
     if (!this.active || pcm.byteLength === 0) return;
-    this.options.onAudio?.(pcm, _sampleRate, _channels);
+    this.options.onAudio?.(pcm, _sampleRate, _channels, track);
+    if (track === 'source') return;
+    this.audioTimelineMs += pcm.byteLength / Math.max(1, _sampleRate * _channels * 2) * 1_000;
     this.stream?.sendAudio(Buffer.from(pcm));
   }
 

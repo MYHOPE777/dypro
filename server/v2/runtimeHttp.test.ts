@@ -2,9 +2,10 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
 import type { V2ServerFrame } from '../../src/shared/v2Protocol';
+import { hashPassword } from '../auth';
 import { createV2Http } from './http';
 import { createRuntime, type V2Runtime } from './runtime';
 
@@ -30,6 +31,41 @@ class Inbox {
 describe('v2 HTTP/WebSocket runtime', () => {
   const cleanups: Array<() => Promise<void> | void> = [];
   afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
+
+  it('resumes background delivery whenever no session is live or ending', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-runtime-background-'));
+    const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });
+    cleanups.push(async () => { await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+    const first = runtime.getOrCreateSession({ sessionId: 'live-background-a' });
+    const second = runtime.getOrCreateSession({ sessionId: 'live-background-b' });
+
+    await first.dispatch({ type: 'start' });
+    await second.dispatch({ type: 'start' });
+    expect(runtime.scheduler.snapshot().background.paused).toBe(true);
+    await first.dispatch({ type: 'pause' });
+    expect(runtime.scheduler.snapshot().background.paused).toBe(true);
+    await second.dispatch({ type: 'pause' });
+    expect(runtime.scheduler.snapshot().background.paused).toBe(false);
+  });
+
+  it('archives original-rate and 16k ASR audio as separate assets', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-runtime-audio-'));
+    const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });
+    cleanups.push(async () => { await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+    const session = runtime.getOrCreateSession({ sessionId: 'live-dual-audio' });
+
+    await session.dispatch({ type: 'start' });
+    await session.dispatch({ type: 'audio', track: 'source', pcm: new Uint8Array(9_600), sampleRate: 48_000, channels: 1 });
+    await session.dispatch({ type: 'audio', track: 'asr', pcm: new Uint8Array(3_200), sampleRate: 16_000, channels: 1 });
+    await session.dispatch({ type: 'end' });
+    await vi.waitFor(() => expect(runtime.store.listAudioAssets(session.id)).toHaveLength(2));
+
+    expect(runtime.store.listAudioAssets(session.id).map((asset) => [asset.encoding, asset.sampleRate, asset.durationMs])).toEqual([
+      ['pcm_s16le_source', 48_000, 100],
+      ['pcm_s16le_asr', 16_000, 100],
+    ]);
+    expect(runtime.getReview(session.id)?.summary).toMatchObject({ audioBytes: 9_600, audioDurationMs: 100 });
+  });
 
   it('broadcasts ordered events and enforces a single capture owner', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'dypro-runtime-'));
@@ -109,5 +145,41 @@ describe('v2 HTTP/WebSocket runtime', () => {
     expect(error.type === 'error' && error.message).toContain('主播屏地址已失效');
     expect(runtime.listSessions('room-default')).toHaveLength(1);
     display.close();
+  });
+
+  it('requires signed operator identity and keeps review actions reviewer-only', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-auth-runtime-'));
+    const env = {
+      V2_DB_PATH: join(directory, 'app.sqlite'),
+      V2_AUDIO_DIR: join(directory, 'audio'),
+      AUTH_TOKEN_SECRET: 'this-is-a-runtime-test-secret-with-32-characters',
+      ALLOW_INSECURE_AUTH: 'true',
+      AUTH_USERS_JSON: JSON.stringify([
+        { actorId: 'owner', displayName: '审核人', passwordHash: hashPassword('review-pass'), role: 'reviewer', roomIds: [] },
+        { actorId: 'operator-1', displayName: '场控一号', passwordHash: hashPassword('operator-pass'), role: 'operator', roomIds: ['room-default'] },
+      ]),
+    };
+    const runtime = createRuntime({ rootDir: directory, env });
+    const http = createV2Http(runtime, { clientDir: join(directory, 'missing-client') });
+    await new Promise<void>((resolve) => http.server.listen(0, '127.0.0.1', resolve));
+    const port = (http.server.address() as AddressInfo).port;
+    cleanups.push(async () => { await new Promise<void>((resolve) => http.server.close(() => resolve())); await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+
+    const loginResponse = await fetch(`http://127.0.0.1:${port}/api/v2/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ actorId: 'operator-1', password: 'operator-pass' }),
+    });
+    const login = await loginResponse.json() as { token: string };
+    expect(loginResponse.status).toBe(200);
+
+    const sessionsResponse = await fetch(`http://127.0.0.1:${port}/api/v2/sessions?roomId=room-default`, { headers: { Authorization: `Bearer ${login.token}` } });
+    expect(sessionsResponse.status).toBe(403);
+
+    const operator = new WebSocket(`ws://127.0.0.1:${port}/ws/v2`);
+    await new Promise<void>((resolve) => operator.once('open', resolve));
+    const inbox = new Inbox(operator);
+    operator.send(JSON.stringify({ requestId: 'join-authenticated', command: { type: 'session.join', roomId: 'room-default', role: 'operator', token: login.token } }));
+    const ready = await inbox.until((frame) => frame.type === 'ready');
+    expect(ready.type).toBe('ready');
+    operator.close();
   });
 });

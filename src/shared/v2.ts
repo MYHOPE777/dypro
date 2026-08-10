@@ -7,6 +7,7 @@ import type {
   SpeakerLabel,
   TranscriptSegment,
 } from './types';
+import type { AudioTrack } from './v2Audio';
 
 /** The only lifecycle states a v2 live session can expose. */
 export type LiveLifecycle = 'idle' | 'live' | 'paused' | 'ending' | 'ended';
@@ -50,7 +51,7 @@ export type LiveCommand =
   | { type: 'demo_transcript'; text: string; isFinal?: boolean }
   | { type: 'transcript_correct'; segmentId: string; text: string }
   | { type: 'assign_speaker'; segmentId: string; speaker: SpeakerLabel; speakerId?: string }
-  | { type: 'audio'; pcm: Uint8Array; sampleRate: number; channels?: number };
+  | { type: 'audio'; pcm: Uint8Array; sampleRate: number; channels?: number; track?: AudioTrack };
 
 export type LiveEventType =
   | 'session.created'

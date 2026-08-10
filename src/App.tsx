@@ -33,9 +33,12 @@ import { LiveSessionClient } from './clients/liveSessionClient';
 import { SessionReviewClient } from './clients/sessionReviewClient';
 import { CatalogClient } from './clients/catalogClient';
 import { DisplayLinkClient, type DisplayLink } from './clients/displayLinkClient';
+import { AuthClient } from './clients/authClient';
+import { V2_AUTH_REQUIRED_EVENT } from './clients/authHeaders';
 import { DEFAULT_PRODUCT, PRODUCTS } from './shared/products';
 import type { ComplianceResult, ComplianceRule, CoachPurpose, PresenterPhrase, PresenterProfile, Product, TranscriptSegment } from './shared/types';
 import type { LiveCommand, LiveSessionSnapshot, SessionReview, SessionSummary } from './shared/v2';
+import type { AudioTrack } from './shared/v2Audio';
 
 const EMPTY: LiveSessionSnapshot = {
   sessionId: '', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '默认主播', lifecycle: 'idle',
@@ -84,11 +87,33 @@ function useLive(role: 'operator' | 'display') {
   }, [role]);
 
   const send = useCallback((command: LiveCommand) => clientRef.current?.send(command) ?? false, []);
-  const sendAudio = useCallback((pcm: ArrayBuffer | Uint8Array) => clientRef.current?.sendAudio(pcm) ?? false, []);
+  const sendAudio = useCallback((pcm: ArrayBuffer | Uint8Array, sampleRate?: number, track?: AudioTrack, channels?: number) => clientRef.current?.sendAudio(pcm, sampleRate, track, channels) ?? false, []);
   return { snapshot, products, status, connected, send, sendAudio };
 }
 
-function useMicrophone(sendAudio: (pcm: ArrayBuffer | Uint8Array) => boolean) {
+function pcm16(samples: Float32Array): Uint8Array<ArrayBuffer> {
+  const pcm = new Int16Array(samples.length);
+  for (let index = 0; index < samples.length; index += 1) pcm[index] = Math.max(-1, Math.min(1, samples[index])) * 0x7fff;
+  const bytes = new Uint8Array(pcm.byteLength);
+  bytes.set(new Uint8Array(pcm.buffer));
+  return bytes;
+}
+
+function resample(samples: Float32Array, inputRate: number, outputRate: number): Float32Array {
+  if (inputRate === outputRate) return samples.slice();
+  const ratio = inputRate / outputRate;
+  const output = new Float32Array(Math.max(1, Math.round(samples.length / ratio)));
+  for (let index = 0; index < output.length; index += 1) {
+    const position = index * ratio;
+    const left = Math.floor(position);
+    const right = Math.min(samples.length - 1, left + 1);
+    const weight = position - left;
+    output[index] = samples[left] * (1 - weight) + samples[right] * weight;
+  }
+  return output;
+}
+
+function useMicrophone(sendAudio: (pcm: ArrayBuffer | Uint8Array, sampleRate?: number, track?: AudioTrack, channels?: number) => boolean) {
   const [capturing, setCapturing] = useState(false);
   const [error, setError] = useState('');
   const streamRef = useRef<MediaStream | null>(null);
@@ -111,14 +136,14 @@ function useMicrophone(sendAudio: (pcm: ArrayBuffer | Uint8Array) => boolean) {
     setError('');
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
-      const context = new AudioContext({ sampleRate: 16_000 });
+      const context = new AudioContext();
       const source = context.createMediaStreamSource(stream);
       const processor = context.createScriptProcessor(4096, 1, 1);
       processor.onaudioprocess = (event) => {
         const samples = event.inputBuffer.getChannelData(0);
-        const pcm = new Int16Array(samples.length);
-        for (let index = 0; index < samples.length; index += 1) pcm[index] = Math.max(-1, Math.min(1, samples[index])) * 0x7fff;
-        sendAudio(pcm.buffer);
+        const sourceRate = event.inputBuffer.sampleRate || context.sampleRate;
+        sendAudio(pcm16(samples), sourceRate, 'source', 1);
+        sendAudio(pcm16(resample(samples, sourceRate, 16_000)), 16_000, 'asr', 1);
       };
       source.connect(processor);
       processor.connect(context.destination);
@@ -200,7 +225,7 @@ function ProductRail({ snapshot, products, send, openHistory, openLibrary }: { s
   </aside>;
 }
 
-function LiveControls({ snapshot, connected, status, send, sendAudio }: { snapshot: LiveSessionSnapshot; connected: boolean; status: string; send: (command: LiveCommand) => boolean; sendAudio: (pcm: ArrayBuffer | Uint8Array) => boolean }) {
+function LiveControls({ snapshot, connected, status, send, sendAudio }: { snapshot: LiveSessionSnapshot; connected: boolean; status: string; send: (command: LiveCommand) => boolean; sendAudio: (pcm: ArrayBuffer | Uint8Array, sampleRate?: number, track?: AudioTrack, channels?: number) => boolean }) {
   const microphone = useMicrophone(sendAudio);
   const begin = async () => { await microphone.start(); send({ type: snapshot.lifecycle === 'paused' ? 'resume' : 'start' }); };
   const pause = () => { microphone.stop(); send({ type: 'pause' }); };
@@ -352,11 +377,29 @@ function ReviewWorkspace({ roomId, onClose }: { roomId: string; onClose: () => v
       <main>{review ? <>
         <div className="v2-review-summary"><div><strong>{review.summary.presenterName}</strong><span>内容版本 {review.summary.contentRevision}</span></div><div><span className={`v2-delivery ${review.delivery}`}>{review.delivery === 'synced' ? '已同步' : review.delivery === 'failed' ? '上传失败' : review.approval === 'approved' ? '已人工确认' : '等待人工确认'}</span><button type="button" onClick={deliver} disabled={busy || review.summary.lifecycle !== 'ended' || note !== review.summary.note}><Database size={14} />{review.delivery === 'failed' ? '重新上传' : '确认并上传'}</button></div></div>
         <div className="v2-review-note"><textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录本场表现、待改话术和下一场安排" /><button type="button" disabled={busy || note === review.summary.note} onClick={saveNote}><Save size={13} />保存备注</button></div>
-        {review.audioPath && <audio controls preload="metadata" src={client.audioUrl(selected)} />}
+        {review.audioPath && <SessionAudio client={client} sessionId={selected} />}
         <section className="v2-review-transcripts"><header><span>转录与说话人</span><small>主播 / 其他人可逐段纠正</small></header>{review.transcripts.map((segment) => <article key={segment.id}><time>{formatTime(segment.timestamp)}</time><button type="button" className="v2-speaker-button" onClick={() => void assignSpeaker(segment)} disabled={busy}><SpeakerBadge segment={segment} /></button>{editing?.segmentId === segment.id ? <div className="v2-review-edit"><textarea value={editing.text} onChange={(event) => setEditing({ ...editing, text: event.target.value })} /><button type="button" onClick={() => void saveTranscript()} disabled={busy}><Save size={13} /></button><button type="button" onClick={() => setEditing(null)}><X size={13} /></button></div> : <><p>{segment.text}</p><button type="button" title="纠正文本" onClick={() => setEditing({ segmentId: segment.id, text: segment.text })}><Pencil size={13} /></button></>}</article>)}</section>
       </> : <div className="v2-empty">选择一场直播开始复核</div>}</main></div>
     {message && <div className="v2-review-message">{message}</div>}
   </section></div>;
+}
+
+function SessionAudio({ client, sessionId }: { client: SessionReviewClient; sessionId: string }) {
+  const [src, setSrc] = useState('');
+  const [error, setError] = useState('');
+  useEffect(() => {
+    let active = true;
+    let objectUrl = '';
+    setSrc('');
+    setError('');
+    void client.loadAudioUrl(sessionId).then((url) => {
+      objectUrl = url;
+      if (active) setSrc(url); else URL.revokeObjectURL(url);
+    }).catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : String(cause)); });
+    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [client, sessionId]);
+  if (error) return <div className="v2-review-message">{error}</div>;
+  return src ? <audio controls preload="metadata" src={src} /> : <div className="v2-empty">正在读取本地音频</div>;
 }
 
 function OperatorApp() {
@@ -378,6 +421,32 @@ function DisplayApp() {
   return <div className="v2-display"><header><div className="v2-brand"><span><MonitorUp size={18} /></span><div><strong>主播提示屏</strong><small>{live.snapshot.product.name}</small></div></div><div className="v2-live-state"><i className={live.snapshot.lifecycle === 'live' ? 'live' : ''} /><span>{lifecycleText(live.snapshot.lifecycle)}</span></div></header><main><section className="v2-display-transcript"><header><span>流式话术转录</span><SpeakerBadge segment={live.snapshot.transcriptHistory.at(-1) ?? { id: 'partial', text: '', isFinal: false, timestamp: Date.now(), offsetMs: null, startOffsetMs: null, endOffsetMs: null, speaker: 'host' }} /></header><p>{currentTranscript}</p></section><CoachBoard snapshot={live.snapshot} display /><RiskPanel snapshot={live.snapshot} display /></main><footer><span>{live.status}</span><strong>{live.snapshot.product.name} · {live.snapshot.product.price}</strong></footer></div>;
 }
 
+function LoginScreen({ onLoggedIn }: { onLoggedIn: () => void }) {
+  const client = useMemo(() => new AuthClient(), []);
+  const [actorId, setActorId] = useState('');
+  const [password, setPassword] = useState('');
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true); setMessage('');
+    try { await client.login(actorId, password); onLoggedIn(); } catch (cause) { setMessage(cause instanceof Error ? cause.message : String(cause)); } finally { setBusy(false); }
+  };
+  return <main className="v2-login"><form onSubmit={(event) => void submit(event)}><div className="v2-brand"><span><MonitorUp size={20} /></span><div><strong>直播中控</strong><small>多人协作模式</small></div></div><h1>登录直播中控</h1><label>账号<input autoFocus autoComplete="username" value={actorId} onChange={(event) => setActorId(event.target.value)} /></label><label>密码<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>{message && <p>{message}</p>}<button className="primary" type="submit" disabled={busy || !actorId.trim() || !password}>{busy ? '正在登录' : '登录'}</button></form></main>;
+}
+
+function OperatorGate() {
+  const [loginRequired, setLoginRequired] = useState(false);
+  const [generation, setGeneration] = useState(0);
+  useEffect(() => {
+    const requireLogin = () => setLoginRequired(true);
+    window.addEventListener(V2_AUTH_REQUIRED_EVENT, requireLogin);
+    return () => window.removeEventListener(V2_AUTH_REQUIRED_EVENT, requireLogin);
+  }, []);
+  if (loginRequired) return <LoginScreen onLoggedIn={() => { setLoginRequired(false); setGeneration((value) => value + 1); }} />;
+  return <OperatorApp key={generation} />;
+}
+
 export default function App() {
-  return window.location.pathname.startsWith('/screen/') ? <DisplayApp /> : <OperatorApp />;
+  return window.location.pathname.startsWith('/screen/') ? <DisplayApp /> : <OperatorGate />;
 }

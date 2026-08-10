@@ -91,7 +91,7 @@ export function getStreamingAsrConfig(env: NodeJS.ProcessEnv = process.env): Str
   if (!apiKey && !(appKey && accessKey)) return null;
   return {
     ...(apiKey ? { apiKey } : { appKey, accessKey }),
-    resourceId: env.X_API_RESOURCE_ID?.trim() || 'volc.bigasr.sauc.duration',
+    resourceId: env.X_API_RESOURCE_ID?.trim() || 'volc.seedasr.sauc.duration',
     endpoint: env.SPEECH_ENDPOINT?.trim() || DEFAULT_ENDPOINT,
     hotwordTableId: optional(env.BOOSTING_TABLE_ID),
     hotwordTableName: optional(env.BOOSTING_TABLE_NAME),

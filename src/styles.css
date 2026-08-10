@@ -250,6 +250,15 @@ button { cursor: pointer; }
 .v2-inline-form { display: grid; grid-template-columns: 1fr 32px; gap: 5px; }.v2-inline-form button { min-height: 32px; padding: 0; }
 .v2-library-list { display: grid; align-content: start; gap: 7px; max-height: 510px; overflow: auto; }.v2-library-list article { position: relative; display: grid; gap: 7px; padding: 11px 76px 11px 11px; border: 1px solid #303a34; border-radius: 5px; background: #202622; }.v2-library-list article > div { display: flex; align-items: center; gap: 7px; }.v2-library-list article span { padding: 3px 5px; border-radius: 3px; color: #172011; background: #c9e78e; font-size: 8px; }.v2-library-list article span.blocked { background: #ef8a76; }.v2-library-list article span.warning { background: #efb06c; }.v2-library-list article span.draft { color: #a7b2aa; background: #333b37; }.v2-library-list article strong { font-size: 10px; }.v2-library-list article p { margin: 0; color: #bcc4be; font-size: 10px; line-height: 1.5; }.v2-library-list article small { color: #77837b; font-size: 8px; }.v2-library-list article > button { position: absolute; top: 10px; right: 10px; min-height: 27px; padding: 0 7px; color: #a9c597; background: #263028; font-size: 8px; }
 
+.v2-login { min-height: 100vh; display: grid; place-items: center; padding: 20px; background: #111413; }
+.v2-login form { width: min(360px, 100%); display: grid; gap: 14px; padding: 24px; border: 1px solid #39423e; border-radius: 8px; background: #191e1b; box-shadow: 0 24px 80px rgb(0 0 0 / 35%); }
+.v2-login h1 { margin: 8px 0 2px; font-size: 18px; letter-spacing: 0; }
+.v2-login label { display: grid; gap: 6px; color: #919d95; font-size: 10px; }
+.v2-login input { min-width: 0; height: 38px; border: 1px solid #3e4943; border-radius: 5px; color: #eef1ef; background: #202622; padding: 0 10px; font: inherit; outline: none; }
+.v2-login input:focus { border-color: #829b73; }
+.v2-login p { margin: 0; color: #ef9b87; font-size: 10px; }
+.v2-login button { min-height: 38px; border-color: #c9e78e; color: #172011; background: #c9e78e; font-weight: 700; }
+
 @media (max-width: 1100px) {
   .v2-operator-grid { grid-template-columns: 205px minmax(420px, 1fr) 265px; }
   .v2-main { padding-left: 22px; padding-right: 22px; }

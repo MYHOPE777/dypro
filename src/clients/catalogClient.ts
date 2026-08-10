@@ -1,4 +1,5 @@
 import type { ComplianceRule, CoachPurpose, PresenterPhrase, PresenterProfile, RuleAuditEntry } from '../shared/types';
+import { authenticatedHeaders } from './authHeaders';
 
 export class CatalogClient {
   constructor(private readonly actorId = 'local-operator') {}
@@ -12,7 +13,7 @@ export class CatalogClient {
   async updatePhrase(phraseId: string, input: Partial<Pick<PresenterPhrase, 'text' | 'purpose' | 'status'>>): Promise<PresenterPhrase> { return this.request(`/api/v2/phrases/${encodeURIComponent(phraseId)}`, { method: 'PATCH', body: JSON.stringify(input) }); }
 
   private async request<T>(url: string, init: RequestInit = {}): Promise<T> {
-    const headers = new Headers(init.headers); headers.set('X-Actor-Id', this.actorId); if (init.body) headers.set('Content-Type', 'application/json');
+    const headers = authenticatedHeaders(init.headers, this.actorId); if (init.body) headers.set('Content-Type', 'application/json');
     const response = await fetch(url, { ...init, headers }); const body = await response.json().catch(() => ({})) as T & { message?: string };
     if (!response.ok) throw new Error(body.message ?? '请求失败'); return body as T;
   }

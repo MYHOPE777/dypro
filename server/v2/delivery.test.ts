@@ -1,13 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_PRODUCT } from '../../src/shared/products';
+import type { TranscriptSegment } from '../../src/shared/types';
 import { BoundedScheduler } from './scheduler';
 import { SessionReviewModule } from './sessionReview';
 import { SqliteFactStore } from './store';
-import { DurableDelivery, type DeliveryGateway } from './delivery';
+import { deliveryGatewaysFromEnv, DurableDelivery, type DeliveryGateway } from './delivery';
 import { PresenterModule } from './presenters';
 import { RuleModule } from './rules';
 
 describe('DurableDelivery', () => {
+  it('keeps cloud delivery as an explicit adapter port in v0.3', () => {
+    expect(deliveryGatewaysFromEnv({ DATABASE_DELIVERY_URL: 'https://example.invalid/upload' })).toEqual([]);
+  });
   it('delivers only an approved current revision and pauses during live capture', async () => {
     const store = new SqliteFactStore({ filename: ':memory:' });
     store.createSession({ sessionId: 'delivery-session', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '主播', product: DEFAULT_PRODUCT, lineup: [DEFAULT_PRODUCT] });
@@ -36,6 +40,32 @@ describe('DurableDelivery', () => {
     const worker = new DurableDelivery(store, new BoundedScheduler({ modelGlobal: 1, modelPerSession: 1, background: 1 }), []);
     expect(await worker.flushOnce()).toBe(0);
     expect(store.listDeliveryJobs('queued')).toHaveLength(1);
+    store.close();
+  });
+
+  it('does not mark an obsolete revision synced when it is edited during upload', async () => {
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    store.createSession({ sessionId: 'delivery-race', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '主播', product: DEFAULT_PRODUCT, lineup: [DEFAULT_PRODUCT] });
+    const segment: TranscriptSegment = { id: 'segment-1', text: '原始文本', isFinal: true, timestamp: 10, offsetMs: 10, startOffsetMs: 0, endOffsetMs: 10, speaker: 'host' };
+    store.appendSessionEvent('delivery-race', { type: 'transcript.final', occurredAt: 10, payload: { segment: JSON.stringify(segment) } });
+    store.appendSessionEvent('delivery-race', { type: 'lifecycle.changed', occurredAt: 20, payload: { lifecycle: 'ended' } });
+    const review = new SessionReviewModule(store);
+    review.approveDelivery('delivery-race', 'reviewer');
+    let finishUpload!: () => void;
+    const uploadStarted = new Promise<void>((resolve) => { finishUpload = resolve; });
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+    const gateway: DeliveryGateway = { configured: true, deliver: async () => { signalStarted(); await uploadStarted; } };
+    const worker = new DurableDelivery(store, new BoundedScheduler({ modelGlobal: 1, modelPerSession: 1, background: 1 }), [gateway]);
+
+    const flushing = worker.flushOnce();
+    await started;
+    review.correctTranscript('delivery-race', 'segment-1', '人工纠正文本', 'reviewer');
+    finishUpload();
+    await flushing;
+
+    expect(store.getDeliveryJob('delivery-race:0')?.status).toBe('superseded');
+    expect(review.getReview('delivery-race')).toMatchObject({ approval: 'approval_required', delivery: 'superseded', approvedRevision: null });
     store.close();
   });
 

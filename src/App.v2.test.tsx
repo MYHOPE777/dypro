@@ -72,6 +72,15 @@ describe('v2 operator view', () => {
     expect(frame.command).not.toHaveProperty('sessionId');
   });
 
+  it('shows the operator login when the server requires a signed identity', async () => {
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ type: 'error', requestId: 'join', message: '请先登录控制台' });
+
+    expect(await screen.findByRole('heading', { name: '登录直播中控' })).toBeTruthy();
+  });
+
   it('loads a folded presenter link and QR code only after the operator opens it', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

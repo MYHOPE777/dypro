@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import type { ComplianceResult, ComplianceRule, CoachSuggestion, LiveRoom, PresenterPhrase, PresenterProfile, Product, RiskProfile, RuleAuditEntry, SessionStats, TranscriptSegment } from '../../src/shared/types';
+import type { ComplianceResult, ComplianceRule, CoachSuggestion, LiveRoom, PresenterPhrase, PresenterProfile, Product, RiskProfile, RuleAuditEntry, SessionStats, SpeechCorrectionEntry, TranscriptSegment } from '../../src/shared/types';
 import type { DeliveryJob, DeliveryStatus, LiveEvent, LiveEventType, LiveSessionSnapshot, LiveLifecycle, ResourceDeliveryJob, ResourceDeliveryType, ReviewApproval, ReviewTranscript, SessionReview, SessionSummary } from '../../src/shared/v2';
 
 export type SessionCreation = {
@@ -253,6 +253,10 @@ function emptyStats(): SessionStats {
   return { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 };
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
 export class SqliteFactStore {
   readonly filename: string;
   readonly audioRoot: string;
@@ -387,6 +391,28 @@ export class SqliteFactStore {
     this.db.prepare('INSERT INTO audio_assets (id, session_id, path, encoding, sample_rate, channels, byte_length, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET byte_length=excluded.byte_length, duration_ms=excluded.duration_ms').run(input.id ?? `audio-${randomUUID()}`, input.sessionId, input.path, input.encoding ?? 'pcm_s16le', input.sampleRate ?? 16_000, input.channels ?? 1, input.byteLength, input.durationMs, now);
   }
 
+  listAudioAssets(sessionId: string): Array<{ id: string; path: string; encoding: string; sampleRate: number; channels: number; byteLength: number; durationMs: number }> {
+    return this.db.prepare("SELECT * FROM audio_assets WHERE session_id = ? ORDER BY CASE WHEN encoding = 'pcm_s16le_source' THEN 0 ELSE 1 END, created_at DESC").all(sessionId).map((row) => ({
+      id: stringValue(row.id), path: stringValue(row.path), encoding: stringValue(row.encoding), sampleRate: numberValue(row.sample_rate), channels: numberValue(row.channels), byteLength: numberValue(row.byte_length), durationMs: numberValue(row.duration_ms),
+    }));
+  }
+
+  listSpeechCorrections(roomId: string): SpeechCorrectionEntry[] {
+    return this.db.prepare('SELECT correction_json FROM speech_corrections WHERE room_id = ? ORDER BY updated_at DESC').all(roomId).map((row) => parseJson<SpeechCorrectionEntry>(row.correction_json, {} as SpeechCorrectionEntry));
+  }
+
+  applySpeechCorrections(roomId: string, text: string): { text: string; applied: SpeechCorrectionEntry[] } {
+    const applied = this.listSpeechCorrections(roomId).filter((entry) => entry.enabled && text.includes(entry.wrongText)).sort((left, right) => right.wrongText.length - left.wrongText.length || right.updatedAt - left.updatedAt);
+    if (applied.length === 0) return { text, applied: [] };
+    const replacements = new Map(applied.map((entry) => [entry.wrongText, entry.correctText]));
+    const pattern = new RegExp(applied.map((entry) => escapeRegExp(entry.wrongText)).join('|'), 'gu');
+    return { text: text.replace(pattern, (match) => replacements.get(match) ?? match), applied };
+  }
+
+  speechCorrectionHotwords(roomId: string): string[] {
+    return [...new Set(this.listSpeechCorrections(roomId).filter((entry) => entry.enabled).map((entry) => entry.correctText))].slice(0, 20);
+  }
+
   getOrCreateDisplayLink(sessionId: string, now = Date.now(), ttlMs = 12 * 60 * 60 * 1_000): { alias: string; sessionId: string; expiresAt: number } {
     const existing = this.db.prepare('SELECT * FROM display_links WHERE session_id = ? AND expires_at > ?').get(sessionId, now);
     if (existing) return { alias: stringValue(existing.alias), sessionId, expiresAt: numberValue(existing.expires_at) };
@@ -491,11 +517,11 @@ export class SqliteFactStore {
     if (!summary) return null;
     const rows = this.db.prepare('SELECT segment_json, revision, original_text, note FROM transcript_projections WHERE session_id = ? ORDER BY json_extract(segment_json, \'$.timestamp\')').all(sessionId);
     const review = this.db.prepare('SELECT * FROM session_reviews WHERE session_id = ?').get(sessionId);
-    const audio = this.db.prepare('SELECT path FROM audio_assets WHERE session_id = ? ORDER BY created_at DESC LIMIT 1').get(sessionId);
+    const audio = this.listAudioAssets(sessionId)[0];
     return {
       summary,
       transcripts: rows.map((row) => ({ ...parseJson<TranscriptSegment>(row.segment_json, {} as TranscriptSegment), revision: numberValue(row.revision), originalText: stringValue(row.original_text), note: stringValue(row.note) })),
-      audioPath: audio ? stringValue(audio.path) : null,
+      audioPath: audio?.path ?? null,
       approval: (stringValue(review?.approval, 'approval_required') as ReviewApproval),
       delivery: (stringValue(review?.delivery, 'not_queued') as DeliveryStatus),
       approvedRevision: review?.approved_revision === null || review?.approved_revision === undefined ? null : numberValue(review.approved_revision),
@@ -547,7 +573,7 @@ export class SqliteFactStore {
     return numberValue(row.content_revision);
   }
 
-  editReviewTranscript(sessionId: string, segmentId: string, segment: TranscriptSegment, actorId: string, kind = 'transcript.corrected', now = Date.now()): { contentRevision: number; segment: TranscriptSegment } {
+  editReviewTranscript(sessionId: string, segmentId: string, segment: TranscriptSegment, actorId: string, kind = 'transcript.corrected', now = Date.now(), correction?: { roomId: string; wrongText: string; correctText: string }): { contentRevision: number; segment: TranscriptSegment } {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const session = this.getSessionStatement.get(sessionId);
@@ -559,6 +585,7 @@ export class SqliteFactStore {
       this.db.prepare('UPDATE transcript_projections SET revision = ?, segment_json = ?, original_text = ?, note = ? WHERE session_id = ? AND segment_id = ?').run(revision, json(segment), stringValue(previousRow.original_text, previous.text), stringValue(previousRow.note), sessionId, segmentId);
       this.db.prepare('UPDATE live_sessions SET transcript_json = ?, content_revision = ?, updated_at = ? WHERE id = ?').run(json(this.transcriptsForSession(sessionId)), contentRevision, now, sessionId);
       this.revokeReviewInside(sessionId, now);
+      if (correction) this.recordSpeechCorrectionInside(correction.roomId, { ...correction, actorId, sessionId, segmentId }, now);
       this.db.prepare('INSERT INTO review_edits (id, session_id, segment_id, kind, before_json, after_json, content_revision, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(`edit-${randomUUID()}`, sessionId, segmentId, kind, json(previous), json(segment), contentRevision, actorId, now);
       this.db.exec('COMMIT');
       return { contentRevision, segment };
@@ -566,6 +593,19 @@ export class SqliteFactStore {
       this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  private recordSpeechCorrectionInside(roomId: string, input: { wrongText: string; correctText: string; actorId: string; sessionId: string; segmentId: string }, now: number): void {
+    const wrongText = input.wrongText.trim();
+    const correctText = input.correctText.trim();
+    if (!wrongText || !correctText || wrongText === correctText || wrongText.length > 80 || correctText.length > 80) return;
+    const existing = this.listSpeechCorrections(roomId).find((entry) => entry.wrongText === wrongText);
+    const entry: SpeechCorrectionEntry = existing ? {
+      ...existing, correctText, enabled: true, confirmations: existing.confirmations + 1, updatedAt: now, lastSessionId: input.sessionId, lastSegmentId: input.segmentId,
+    } : {
+      id: `speech-correction-${randomUUID()}`, roomId, wrongText, correctText, enabled: true, confirmations: 1, createdBy: input.actorId, createdAt: now, updatedAt: now, lastSessionId: input.sessionId, lastSegmentId: input.segmentId,
+    };
+    this.db.prepare('INSERT INTO speech_corrections (id, room_id, correction_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET correction_json=excluded.correction_json, updated_at=excluded.updated_at').run(entry.id, roomId, json(entry), now);
   }
 
   editReviewNote(sessionId: string, note: string, actorId: string, now = Date.now()): number {
@@ -681,6 +721,35 @@ export class SqliteFactStore {
     if (!job) throw new Error('上传任务不存在');
     this.updateReview(job.sessionId, { delivery: status }, now);
     return job;
+  }
+
+  settleDeliveryJob(idempotencyKey: string, outcome: 'synced' | 'failed', error?: string | null, now = Date.now()): DeliveryJob {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db.prepare('SELECT * FROM delivery_jobs WHERE idempotency_key = ?').get(idempotencyKey);
+      if (!row) throw new Error('上传任务不存在');
+      const sessionId = stringValue(row.session_id);
+      const revision = numberValue(row.content_revision);
+      const session = this.getSessionStatement.get(sessionId);
+      const review = this.db.prepare('SELECT * FROM session_reviews WHERE session_id = ?').get(sessionId);
+      const remainsCurrent = stringValue(row.status) === 'uploading'
+        && session
+        && review
+        && numberValue(session.content_revision) === revision
+        && stringValue(review.approval) === 'approved'
+        && numberValue(review.approved_revision, -1) === revision;
+      if (remainsCurrent) {
+        this.db.prepare('UPDATE delivery_jobs SET status = ?, attempt_count = attempt_count + CASE WHEN ? = \'failed\' THEN 1 ELSE 0 END, last_error = ?, updated_at = ? WHERE idempotency_key = ?').run(outcome, outcome, error ?? null, now, idempotencyKey);
+        this.db.prepare('UPDATE session_reviews SET delivery = ?, updated_at = ? WHERE session_id = ?').run(outcome, now, sessionId);
+      } else if (stringValue(row.status) === 'uploading') {
+        this.db.prepare("UPDATE delivery_jobs SET status = 'superseded', last_error = NULL, updated_at = ? WHERE idempotency_key = ?").run(now, idempotencyKey);
+      }
+      this.db.exec('COMMIT');
+      return this.getDeliveryJob(idempotencyKey)!;
+    } catch (cause) {
+      this.db.exec('ROLLBACK');
+      throw cause;
+    }
   }
 
   private appendInsideTransaction(sessionId: string, draft: SessionEventDraft): LiveEvent {
@@ -854,12 +923,12 @@ export class SqliteFactStore {
   private summaryFromRow(row: SqlRow): SessionSummary {
     const snapshot = this.snapshotFromRow(row);
     const review = this.db.prepare('SELECT * FROM session_reviews WHERE session_id = ?').get(snapshot.sessionId);
-    const audio = this.db.prepare('SELECT COALESCE(SUM(byte_length), 0) AS bytes, COALESCE(SUM(duration_ms), 0) AS duration FROM audio_assets WHERE session_id = ?').get(snapshot.sessionId);
+    const audio = this.listAudioAssets(snapshot.sessionId)[0];
     return {
       sessionId: snapshot.sessionId, tenantId: snapshot.tenantId, roomId: snapshot.roomId, presenterId: snapshot.presenterId, presenterName: snapshot.presenterName,
       lifecycle: snapshot.lifecycle, createdAt: snapshot.createdAt, endedAt: row.ended_at === null || row.ended_at === undefined ? null : numberValue(row.ended_at), contentRevision: snapshot.contentRevision,
       approval: stringValue(review?.approval, 'approval_required') as ReviewApproval, delivery: stringValue(review?.delivery, 'not_queued') as DeliveryStatus,
-      transcriptCount: snapshot.transcriptHistory.length, audioDurationMs: numberValue(audio?.duration), audioBytes: numberValue(audio?.bytes), note: stringValue(review?.note),
+      transcriptCount: snapshot.transcriptHistory.length, audioDurationMs: audio?.durationMs ?? 0, audioBytes: audio?.byteLength ?? 0, note: stringValue(review?.note),
     };
   }
 

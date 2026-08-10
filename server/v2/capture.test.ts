@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { StreamingAsrResult } from '../providers/doubaoStreamingAsr';
 import { CaptureModule, type CaptureAsrFactory, type CaptureAsrStream } from './capture';
 
-type Controls = { onResult: (result: { text: string; isFinal: boolean }) => void; onError: (error: Error) => void; onReady: () => void; onClosed: () => void };
+type Controls = { onResult: (result: StreamingAsrResult) => void; onError: (error: Error) => void; onReady: () => void; onClosed: () => void };
 
 describe('CaptureModule', () => {
   afterEach(() => vi.useRealTimers());
@@ -40,6 +41,49 @@ describe('CaptureModule', () => {
     await vi.runAllTimersAsync();
     expect(controls).toHaveLength(1);
     expect(errors[0]).toContain('quota exceeded');
+  });
+
+  it('keeps ASR timestamps monotonic across reconnects and pauses', async () => {
+    vi.useFakeTimers();
+    const controls: Controls[] = [];
+    const results: StreamingAsrResult[] = [];
+    const factory: CaptureAsrFactory = (options) => {
+      controls.push(options);
+      return { connect: () => options.onReady(), sendAudio: () => undefined, finish: () => options.onClosed(), close: () => undefined };
+    };
+    const capture = new CaptureModule({ onPartial: () => undefined, onFinal: (result) => results.push(result), onError: () => undefined, createAsr: factory });
+
+    capture.start();
+    capture.pushAudio(new Uint8Array(3_200), 16_000, 1);
+    controls[0].onResult({ text: '第一段', isFinal: true, startTimeMs: 0, endTimeMs: 100 });
+    controls[0].onError(new Error('连接已断开'));
+    await vi.advanceTimersByTimeAsync(250);
+    capture.pushAudio(new Uint8Array(1_600), 16_000, 1);
+    controls[1].onResult({ text: '第二段', isFinal: true, startTimeMs: 0, endTimeMs: 50 });
+    capture.pause();
+    capture.resume();
+    capture.pushAudio(new Uint8Array(1_600), 16_000, 1);
+    controls[2].onResult({ text: '第三段', isFinal: true, startTimeMs: 0, endTimeMs: 50 });
+
+    expect(results.map((result) => [result.startTimeMs, result.endTimeMs])).toEqual([[0, 100], [100, 150], [150, 200]]);
+  });
+
+  it('refreshes learned ASR context whenever a stream connects', async () => {
+    vi.useFakeTimers();
+    const contexts: Array<string | undefined> = [];
+    let currentContext = '第一版纠错词';
+    const factory: CaptureAsrFactory = (options) => {
+      contexts.push(options.context);
+      return { connect: () => options.onReady(), sendAudio: () => undefined, finish: () => options.onClosed(), close: () => undefined };
+    };
+    const capture = new CaptureModule({ onPartial: () => undefined, onFinal: () => undefined, onError: () => undefined, createAsr: factory, asrContext: () => currentContext });
+
+    capture.start();
+    currentContext = '第二版纠错词';
+    capture.pause();
+    capture.resume();
+
+    expect(contexts).toEqual(['第一版纠错词', '第二版纠错词']);
   });
 
   it('pauses after recoverable disconnect attempts are exhausted', async () => {

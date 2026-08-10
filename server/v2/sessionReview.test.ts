@@ -31,6 +31,22 @@ describe('SessionReviewModule', () => {
     store.close();
   });
 
+  it('learns a reusable room correction from historical transcript edits', () => {
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    store.createSession({ sessionId: 'correction-session', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '主播', product: DEFAULT_PRODUCT, lineup: [DEFAULT_PRODUCT] });
+    store.appendSessionEvent('correction-session', { type: 'transcript.final', occurredAt: 10, payload: { segment: JSON.stringify({ ...transcript, text: '请检查蓝牙卖克风' }) } });
+    store.appendSessionEvent('correction-session', { type: 'lifecycle.changed', occurredAt: 20, payload: { lifecycle: 'ended' } });
+    const review = new SessionReviewModule(store);
+
+    review.correctTranscript('correction-session', 'segment-1', '请检查蓝牙麦克风', 'reviewer');
+
+    expect(store.listSpeechCorrections('room-default')).toEqual([
+      expect.objectContaining({ wrongText: '蓝牙卖克风', correctText: '蓝牙麦克风', confirmations: 1, enabled: true }),
+    ]);
+    expect(store.applySpeechCorrections('room-default', '现在使用蓝牙卖克风直播').text).toBe('现在使用蓝牙麦克风直播');
+    store.close();
+  });
+
   it('persists speaker assignment and notes as review edits', () => {
     const store = new SqliteFactStore({ filename: ':memory:' });
     store.createSession({ sessionId: 'review-session-2', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '主播', product: DEFAULT_PRODUCT, lineup: [DEFAULT_PRODUCT] });
