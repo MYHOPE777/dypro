@@ -155,10 +155,10 @@ export async function requestArk(
         // Fast 需要单独开通且只支持指定模型；不可用时按官方降级语义重试常规在线推理。
         return requestArk({ ...config, serviceTier: 'auto' }, systemPrompt, userPrompt, maxTokens, useKnowledgeSearch);
       }
-      throw new Error(`豆包接口返回 ${response.status}${code ? ` (${code})` : ''}${requestId ? `（Request ID ${requestId}）` : ''}`);
+      throw new Error(`火山方舟 Responses API 返回 ${response.status}${code ? ` (${code})` : ''}${requestId ? `（Request ID ${requestId}）` : ''}`);
     }
     const content = outputText(body);
-    if (!content) throw new Error('豆包返回为空');
+    if (!content) throw new Error('火山方舟 Responses API 返回为空');
     if (knowledgeSearchEnabled) {
       knowledgeSearchLastError = undefined;
       knowledgeSearchLastSuccessAt = Date.now();

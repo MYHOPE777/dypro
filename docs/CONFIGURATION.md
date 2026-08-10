@@ -111,11 +111,11 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 | --- | --- | --- | --- |
 | `X_API_KEY` | 字符串 | 新版控制台豆包大模型流式语音识别必填 | 豆包语音新版控制台的 App Key，对应 WebSocket 请求头 `X-Api-Key`。不要放入前端。 |
 | `X_API_APP_KEY` | 字符串 | 旧版控制台可选 | 旧版控制台的 APP ID，对应官方请求头 `X-Api-App-Key`。仅当 `X_API_KEY` 留空时使用。 |
-| `X_API_ACCESS_KEY` | 字符串 | 旧版控制台可选 | 旧版控制台的 Access Token，对应官方请求头 `X-Api-Access-Key`。仅当 `X_API_KEY` 留空时使用；旧版页面里的 Secret Key 不直接发送到 SAUC WebSocket。 |
+| `X_API_ACCESS_KEY` | 字符串 | 旧版控制台可选 | 旧版控制台的 Access Token，对应官方请求头 `X-Api-Access-Key`。仅当 `X_API_KEY` 留空时使用；旧版页面里的 Secret Key 不直接发送到“双向流式模式（优化版本）”WebSocket 接口。 |
 | `X_API_RESOURCE_ID` | 字符串，默认 `volc.bigasr.sauc.duration` | 否/按账号 | 对应官方请求头 `X-Api-Resource-Id`。豆包流式语音识别模型 1.0：小时版 `volc.bigasr.sauc.duration`、并发版 `volc.bigasr.sauc.concurrent`；模型 2.0：小时版 `volc.seedasr.sauc.duration`、并发版 `volc.seedasr.sauc.concurrent`。必须使用控制台实际开通的值。 |
 | `SPEECH_ENDPOINT` | URL，默认 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async` | 否 | 豆包大模型流式语音识别（ASR）的“双向流式模式（优化版本）”WebSocket 地址。除非账号文档要求，否则不要改成 HTTP 地址。 |
-| `BOOSTING_TABLE_ID` / `BOOSTING_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `corpus.boosting_table_id` / `boosting_table_name`。每个流式语音识别请求只使用一张热词表，ID 优先。 |
-| `CORRECT_TABLE_ID` / `CORRECT_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `corpus.correct_table_id` / `correct_table_name`。每个流式语音识别请求只使用一张替换词表，ID 优先。 |
+| `BOOSTING_TABLE_ID` / `BOOSTING_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `request.corpus.boosting_table_id` / `request.corpus.boosting_table_name`。每个流式语音识别请求只使用一张热词表，ID 优先。 |
+| `CORRECT_TABLE_ID` / `CORRECT_TABLE_NAME` | 字符串，二选一 | 否 | 官方 `request.corpus.correct_table_id` / `request.corpus.correct_table_name`。每个流式语音识别请求只使用一张替换词表，ID 优先。 |
 | `END_WINDOW_SIZE` | 正整数毫秒，默认 `800` | 否 | 官方 `request.end_window_size`，二遍模式的 VAD 强制判停时间，最小 200。 |
 
 服务端握手请求头还会自动生成同一 UUID 的 `X-Api-Connect-Id` 和 `X-Api-Request-Id`，不需要配置。响应中的 `X-Tt-Logid` 会被保留到连接状态/错误信息，用于火山侧排障。连接流程为：
@@ -133,7 +133,7 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 
 转录修正可以同时生成当前直播间的长期“错误词 → 正确词”记录。后续识别结果会在合规判断前按启用词条自动修正，正确词还会写入下一条 ASR 连接的官方 `request.corpus.context`；误学词条可在停播复核中停用，历史记录不会删除。
 
-### 2.4 豆包大模型
+### 2.4 火山方舟 Responses API（豆包大模型）
 
 | 参数 | 类型/默认值 | 是否必填 | 说明 |
 | --- | --- | --- | --- |
