@@ -59,6 +59,7 @@ export class LiveSessionClient {
       } else if (frame.type === 'event') {
         if (!this.snapshotValue || frame.event.sequence <= this.snapshotValue.latestSequence) return;
         this.snapshotValue = frame.snapshot;
+        if (frame.event.type === 'lineup.updated') this.products.splice(0, this.products.length, ...frame.snapshot.lineup);
         this.notify(frame.snapshot, frame.event);
       } else if (frame.type === 'error') {
         if (this.options.role === 'operator' && /请先登录|登录已过期|登录凭证/iu.test(frame.message)) {

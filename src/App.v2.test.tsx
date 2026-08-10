@@ -59,6 +59,51 @@ describe('v2 operator view', () => {
     });
   });
 
+  it('keeps the microphone input device entry visible in the operator controls', async () => {
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ type: 'ready', requestId: 'join', sessionId: 'live-client-test', products: PRODUCTS, snapshot: snapshot() });
+
+    expect(await screen.findByRole('button', { name: /选择输入设备/u })).toBeTruthy();
+  });
+
+  it('starts capture with the microphone selected by the operator', async () => {
+    const getUserMedia = vi.fn().mockResolvedValue({
+      getTracks: () => [{ stop: vi.fn() }],
+      getAudioTracks: () => [{ getSettings: () => ({ deviceId: 'mic-presenter' }) }],
+    });
+    vi.stubGlobal('navigator', {
+      mediaDevices: {
+        getUserMedia,
+        enumerateDevices: vi.fn().mockResolvedValue([
+          { kind: 'audioinput', deviceId: 'mic-default', label: 'MacBook 麦克风', groupId: '', toJSON: () => ({}) },
+          { kind: 'audioinput', deviceId: 'mic-presenter', label: '主播领夹麦', groupId: '', toJSON: () => ({}) },
+        ]),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      },
+    });
+    vi.stubGlobal('AudioContext', class {
+      readonly destination = {};
+      readonly sampleRate = 48_000;
+      createMediaStreamSource() { return { connect: vi.fn() }; }
+      createScriptProcessor() { return { connect: vi.fn(), disconnect: vi.fn(), onaudioprocess: null }; }
+      close() { return Promise.resolve(); }
+    });
+
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ type: 'ready', requestId: 'join', sessionId: 'live-client-test', products: PRODUCTS, snapshot: { ...snapshot(), lifecycle: 'idle' } });
+
+    fireEvent.click(await screen.findByRole('button', { name: /选择输入设备/u }));
+    fireEvent.change(await screen.findByLabelText('收音设备'), { target: { value: 'mic-presenter' } });
+    fireEvent.click(screen.getByRole('button', { name: '开始收音' }));
+
+    await waitFor(() => expect(getUserMedia).toHaveBeenCalledWith({ audio: expect.objectContaining({ deviceId: { exact: 'mic-presenter' } }) }));
+  });
+
   it('joins a presenter screen by alias without reusing a stale local session', () => {
     localStorage.setItem('v2-live-session', 'live-stale-session');
     window.history.replaceState(null, '', '/screen/ABCD1234');
@@ -124,5 +169,28 @@ describe('v2 operator view', () => {
 
     const frame = JSON.parse(socket.sent.at(-1) as string) as { command: { type: string; presenterId?: string } };
     expect(frame.command).toEqual({ type: 'select_presenter', presenterId: 'presenter-xiaotang' });
+  });
+
+  it('edits product details in the current live room', async () => {
+    const fetchMock = vi.fn().mockImplementation(async (input: string, init?: RequestInit) => {
+      if (input.endsWith('/rules')) return { ok: true, json: async () => ({ rules: [], audits: [] }) };
+      if (input.endsWith('/presenters')) return { ok: true, json: async () => [] };
+      if (input.endsWith('/products') && !init?.method) return { ok: true, json: async () => PRODUCTS };
+      if (input.includes('/products/serum') && init?.method === 'PUT') return { ok: true, json: async () => JSON.parse(init.body as string) };
+      throw new Error(`unexpected request: ${input}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ type: 'ready', requestId: 'join', sessionId: 'live-client-test', products: PRODUCTS, snapshot: snapshot() });
+    fireEvent.click(await screen.findByRole('button', { name: '资料管理' }));
+    fireEvent.click(await screen.findByRole('button', { name: '商品资料' }));
+    fireEvent.click(await screen.findByRole('button', { name: `编辑 ${PRODUCTS[0].name}` }));
+    fireEvent.change(screen.getByLabelText('商品名称'), { target: { value: '直播间实时更新精华' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存并同步本场' }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v2/rooms/room-default/products/serum', expect.objectContaining({ method: 'PUT' })));
   });
 });

@@ -25,7 +25,7 @@ export type AsrTranscript = { text: string; isFinal: boolean; startTimeMs?: numb
 export type LiveSessionOptions = {
   store: SqliteFactStore;
   scheduler: BoundedScheduler;
-  products: Product[];
+  products: Product[] | (() => Product[]);
   session: SessionCreation;
   capture: CapturePort;
   analyzer?: ReviewAnalyzer;
@@ -58,7 +58,7 @@ export class LiveSession {
   readonly id: string;
   private readonly store: SqliteFactStore;
   private readonly scheduler: BoundedScheduler;
-  private readonly products: Product[];
+  private readonly products: () => Product[];
   private readonly capture: CapturePort;
   private readonly now: () => number;
   private readonly endingDrainTimeoutMs: number;
@@ -79,7 +79,7 @@ export class LiveSession {
   constructor(options: LiveSessionOptions) {
     this.store = options.store;
     this.scheduler = options.scheduler;
-    this.products = options.products;
+    this.products = typeof options.products === 'function' ? options.products : () => options.products as Product[];
     this.capture = options.capture;
     this.now = options.now ?? Date.now;
     this.endingDrainTimeoutMs = options.endingDrainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
@@ -208,15 +208,18 @@ export class LiveSession {
   }
 
   private selectProduct(productId: string, source: 'operator' | 'speech'): void {
-    const product = this.snapshotValue.lineup.find((candidate) => candidate.id === productId) ?? this.products.find((candidate) => candidate.id === productId);
+    const product = this.snapshotValue.lineup.find((candidate) => candidate.id === productId) ?? this.products().find((candidate) => candidate.id === productId);
     if (!product || this.snapshotValue.product.id === product.id) return;
     this.productRevision += 1;
     this.commit('product.selected', { product: JSON.stringify(product), source });
   }
 
   private setLineup(productIds: string[]): void {
-    const lineup = productIds.map((id) => this.products.find((product) => product.id === id)).filter((product): product is Product => Boolean(product));
+    const products = this.products();
+    const lineup = productIds.map((id) => products.find((product) => product.id === id)).filter((product): product is Product => Boolean(product));
     if (lineup.length === 0) return;
+    const refreshedActiveProduct = lineup.find((product) => product.id === this.snapshotValue.product.id);
+    if (!refreshedActiveProduct || JSON.stringify(refreshedActiveProduct) !== JSON.stringify(this.snapshotValue.product)) this.productRevision += 1;
     this.commit('lineup.updated', { lineup: JSON.stringify(lineup) });
     if (!lineup.some((product) => product.id === this.snapshotValue.product.id)) this.selectProduct(lineup[0].id, 'operator');
   }

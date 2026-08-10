@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
 import type { V2ServerFrame } from '../../src/shared/v2Protocol';
+import { PRODUCTS } from '../../src/shared/products';
 import { hashPassword } from '../auth';
 import { createV2Http } from './http';
 import { createRuntime, type V2Runtime } from './runtime';
@@ -68,6 +69,74 @@ describe('v2 HTTP/WebSocket runtime', () => {
     await restored!.dispatch({ type: 'demo_transcript', text: '这句话包含私有风险词' });
 
     expect(restored?.snapshot().latestCompliance).toMatchObject({ source: 'custom-rule', risk: 'blocked', title: '命中私有规则' });
+  });
+
+  it('keeps product details isolated per live room through the public API', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-room-products-'));
+    const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });
+    runtime.getOrCreateSession({ sessionId: 'live-room-a-products', roomId: 'room-store-a' });
+    runtime.getOrCreateSession({ sessionId: 'live-room-b-products', roomId: 'room-store-b' });
+    const http = createV2Http(runtime, { clientDir: join(directory, 'missing-client') });
+    await new Promise<void>((resolve) => http.server.listen(0, '127.0.0.1', resolve));
+    const port = (http.server.address() as AddressInfo).port;
+    cleanups.push(async () => { await new Promise<void>((resolve) => http.server.close(() => resolve())); await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+    const base = PRODUCTS[0];
+
+    const save = (roomId: string, name: string, price: string) => fetch(`http://127.0.0.1:${port}/api/v2/rooms/${roomId}/products/${base.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...base, name, price }),
+    });
+    expect((await save('room-store-a', 'A 店专属精华', '¥99')).status).toBe(200);
+    expect((await save('room-store-b', 'B 店专属精华', '¥139')).status).toBe(200);
+
+    const roomA = await (await fetch(`http://127.0.0.1:${port}/api/v2/rooms/room-store-a/products`)).json() as typeof PRODUCTS;
+    const roomB = await (await fetch(`http://127.0.0.1:${port}/api/v2/rooms/room-store-b/products`)).json() as typeof PRODUCTS;
+    expect(roomA.find((product) => product.id === base.id)).toMatchObject({ name: 'A 店专属精华', price: '¥99' });
+    expect(roomB.find((product) => product.id === base.id)).toMatchObject({ name: 'B 店专属精华', price: '¥139' });
+
+    const operator = new WebSocket(`ws://127.0.0.1:${port}/ws/v2`);
+    await new Promise<void>((resolve) => operator.once('open', resolve));
+    const inbox = new Inbox(operator);
+    operator.send(JSON.stringify({ requestId: 'join-room-products', command: { type: 'session.join', sessionId: 'live-room-a-products', roomId: 'room-store-a', role: 'operator' } }));
+    const ready = await inbox.until((frame) => frame.type === 'ready');
+    expect(ready.type === 'ready' && ready.products.find((product) => product.id === base.id)?.name).toBe('A 店专属精华');
+    operator.close();
+  });
+
+  it('broadcasts live product edits and retains the selected product in session history', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-live-product-edit-'));
+    const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });
+    const session = runtime.getOrCreateSession({ sessionId: 'live-product-edit', roomId: 'room-product-live' });
+    const http = createV2Http(runtime, { clientDir: join(directory, 'missing-client') });
+    await new Promise<void>((resolve) => http.server.listen(0, '127.0.0.1', resolve));
+    const port = (http.server.address() as AddressInfo).port;
+    cleanups.push(async () => { await new Promise<void>((resolve) => http.server.close(() => resolve())); await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+    const operator = new WebSocket(`ws://127.0.0.1:${port}/ws/v2`);
+    await new Promise<void>((resolve) => operator.once('open', resolve));
+    const inbox = new Inbox(operator);
+    operator.send(JSON.stringify({ requestId: 'join-live-product', command: { type: 'session.join', sessionId: session.id, roomId: 'room-product-live', role: 'operator' } }));
+    const ready = await inbox.until((frame) => frame.type === 'ready');
+    if (ready.type !== 'ready') throw new Error('missing ready frame');
+    operator.send(JSON.stringify({ requestId: 'start-live-product', command: { type: 'start' } }));
+    await inbox.until((frame) => frame.type === 'event' && frame.event.type === 'lifecycle.changed');
+
+    const edited = { ...PRODUCTS[0], name: '直播中更新的精华', price: '¥109' };
+    const updateResponse = await fetch(`http://127.0.0.1:${port}/api/v2/rooms/room-product-live/products/${edited.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(edited),
+    });
+    expect(updateResponse.status).toBe(200);
+    const lineupUpdate = await inbox.until((frame) => frame.type === 'event' && frame.event.type === 'lineup.updated');
+    expect(lineupUpdate.type === 'event' && lineupUpdate.snapshot.product).toMatchObject({ id: edited.id, name: '直播中更新的精华', price: '¥109' });
+
+    operator.send(JSON.stringify({ requestId: 'select-live-product', command: { type: 'select_product', productId: 'headphones' } }));
+    const selection = await inbox.until((frame) => frame.type === 'event' && frame.event.type === 'product.selected');
+    expect(selection.type === 'event' && selection.snapshot.product.id).toBe('headphones');
+    operator.send(JSON.stringify({ requestId: 'end-live-product', command: { type: 'end' } }));
+    await inbox.until((frame) => frame.type === 'event' && frame.event.type === 'session.ended');
+
+    const history = await (await fetch(`http://127.0.0.1:${port}/api/v2/sessions/${session.id}`)).json() as { roomId: string; product: { id: string }; lineup: Array<{ name: string }> };
+    expect(history).toMatchObject({ roomId: 'room-product-live', product: { id: 'headphones' } });
+    expect(history.lineup.some((product) => product.name === '直播中更新的精华')).toBe(true);
+    operator.close();
   });
 
   it('archives original-rate and 16k ASR audio as separate assets', async () => {

@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS room_products (
   room_id TEXT NOT NULL,
   product_id TEXT NOT NULL,
   position INTEGER NOT NULL,
+  product_json TEXT,
   PRIMARY KEY (room_id, product_id)
 );
 CREATE TABLE IF NOT EXISTS presenters (
@@ -270,6 +271,9 @@ export class SqliteFactStore {
     mkdirSync(this.audioRoot, { recursive: true });
     this.db = new DatabaseSync(this.filename);
     this.db.exec(SCHEMA);
+    const roomProductColumns = this.db.prepare('PRAGMA table_info(room_products)').all().map((row) => stringValue(row.name));
+    if (!roomProductColumns.includes('product_json')) this.db.exec('ALTER TABLE room_products ADD COLUMN product_json TEXT');
+    this.db.exec('UPDATE room_products SET product_json = (SELECT products.product_json FROM products WHERE products.id = room_products.product_id) WHERE product_json IS NULL');
     this.getSessionStatement = this.db.prepare('SELECT * FROM live_sessions WHERE id = ?');
   }
 
@@ -308,7 +312,15 @@ export class SqliteFactStore {
   upsertProduct(tenantId: string, product: Product, roomId?: string): void {
     const now = product.updatedAt || Date.now();
     this.db.prepare('INSERT INTO products (id, tenant_id, product_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET product_json=excluded.product_json, updated_at=excluded.updated_at').run(product.id, tenantId, json(product), now);
-    if (roomId) this.db.prepare('INSERT INTO room_products (room_id, product_id, position) VALUES (?, ?, ?) ON CONFLICT(room_id, product_id) DO UPDATE SET position=excluded.position').run(roomId, product.id, 0);
+    if (roomId) this.db.prepare(`
+      INSERT INTO room_products (room_id, product_id, position, product_json)
+      VALUES (?, ?, COALESCE((SELECT MAX(position) + 1 FROM room_products WHERE room_id = ?), 0), ?)
+      ON CONFLICT(room_id, product_id) DO UPDATE SET product_json=excluded.product_json
+    `).run(roomId, product.id, roomId, json(product));
+  }
+
+  removeRoomProduct(roomId: string, productId: string): void {
+    this.db.prepare('DELETE FROM room_products WHERE room_id = ? AND product_id = ?').run(roomId, productId);
   }
 
   listRooms(): LiveRoom[] {
@@ -318,7 +330,7 @@ export class SqliteFactStore {
 
   listProducts(tenantId = 'tenant-local', roomId?: string): Product[] {
     const rows = roomId
-      ? this.db.prepare('SELECT p.product_json FROM products p JOIN room_products rp ON rp.product_id = p.id WHERE p.tenant_id = ? AND rp.room_id = ? ORDER BY rp.position, p.id').all(tenantId, roomId)
+      ? this.db.prepare('SELECT COALESCE(rp.product_json, p.product_json) AS product_json FROM products p JOIN room_products rp ON rp.product_id = p.id WHERE p.tenant_id = ? AND rp.room_id = ? ORDER BY rp.position, p.id').all(tenantId, roomId)
       : this.db.prepare('SELECT product_json FROM products WHERE tenant_id = ? ORDER BY id').all(tenantId);
     return rows.map((row) => parseJson<Product>(row.product_json, {} as Product));
   }
@@ -813,7 +825,10 @@ export class SqliteFactStore {
       }
       case 'lineup.updated': {
         const lineup = parseJson<Product[]>(payload.lineup, []);
-        if (lineup.length) snapshot.lineup = lineup;
+        if (lineup.length) {
+          snapshot.lineup = lineup;
+          snapshot.product = lineup.find((product) => product.id === snapshot.product.id) ?? snapshot.product;
+        }
         break;
       }
       case 'risk_profile.changed':

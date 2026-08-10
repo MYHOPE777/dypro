@@ -1,9 +1,12 @@
-import type { ComplianceRule, CoachPurpose, PresenterPhrase, PresenterProfile, RuleAuditEntry } from '../shared/types';
+import type { ComplianceRule, CoachPurpose, PresenterPhrase, PresenterProfile, Product, RuleAuditEntry } from '../shared/types';
 import { authenticatedHeaders } from './authHeaders';
 
 export class CatalogClient {
   constructor(private readonly actorId = 'local-operator') {}
   async rules(roomId: string): Promise<{ rules: ComplianceRule[]; audits: RuleAuditEntry[] }> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/rules`); }
+  async products(roomId: string): Promise<Product[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/products`); }
+  async saveProduct(roomId: string, product: Product): Promise<Product> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/products/${encodeURIComponent(product.id)}`, { method: 'PUT', body: JSON.stringify(product) }); }
+  async removeProduct(roomId: string, productId: string): Promise<Product[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/products/${encodeURIComponent(productId)}`, { method: 'DELETE' }); }
   async createRule(roomId: string, input: { name: string; pattern: string; risk: 'warning' | 'blocked'; title: string; reason: string; alternative: string; policyRef: string }): Promise<ComplianceRule> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/rules`, { method: 'POST', body: JSON.stringify(input) }); }
   async setRuleEnabled(rule: ComplianceRule, enabled: boolean): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }); }
   async presenters(roomId: string): Promise<PresenterProfile[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/presenters`); }

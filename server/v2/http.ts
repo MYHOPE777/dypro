@@ -6,7 +6,7 @@ import express, { type Request, type Response } from 'express';
 import cors from 'cors';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { LiveCommand } from '../../src/shared/v2';
-import type { CoachPurpose } from '../../src/shared/types';
+import type { CoachPurpose, Product } from '../../src/shared/types';
 import type { V2ClientCommand, V2ClientFrame, V2JoinCommand, V2ServerFrame } from '../../src/shared/v2Protocol';
 import { decodeAudioFrame } from '../../src/shared/v2Audio';
 import { createRuntime, type V2Runtime } from './runtime';
@@ -38,6 +38,39 @@ function bodyString(value: unknown, name: string): string {
 
 function coachPurpose(value: unknown): CoachPurpose | undefined {
   return typeof value === 'string' && ['塑品', '憋单', '逼单', '转化', '互动', '留人', '答疑'].includes(value) ? value as CoachPurpose : undefined;
+}
+
+function productText(value: unknown, name: string, maximum: number): string {
+  const text = bodyString(value, name);
+  if (text.length > maximum) throw new Error(`${name}不能超过 ${maximum} 个字符`);
+  return text;
+}
+
+function productTextList(value: unknown, name: string, maximumItems = 20): string[] {
+  if (!Array.isArray(value) || value.length > maximumItems || value.some((item) => typeof item !== 'string' || !item.trim() || item.trim().length > 200)) throw new Error(`${name}格式无效`);
+  return value.map((item) => (item as string).trim());
+}
+
+function productInput(productId: string, value: unknown): Product {
+  if (!/^[a-zA-Z0-9_-]{1,96}$/u.test(productId) || !value || typeof value !== 'object') throw new Error('商品资料格式无效');
+  const product = value as Record<string, unknown>;
+  const stock = product.stock === null ? null : typeof product.stock === 'number' && Number.isInteger(product.stock) && product.stock >= 0 ? product.stock : null;
+  return {
+    id: productId,
+    name: productText(product.name, '商品名称', 120),
+    category: productText(product.category, '商品分类', 80),
+    price: productText(product.price, '商品价格', 40),
+    stock,
+    sku: productText(product.sku, '商品编码', 96),
+    description: productText(product.description, '商品描述', 1_000),
+    sellingPoints: productTextList(product.sellingPoints, '商品卖点'),
+    compliantPhrases: productTextList(product.compliantPhrases, '参考话术'),
+    image: typeof product.image === 'string' && product.image.trim().length <= 500 ? product.image.trim() : '/products/serum.svg',
+    accent: typeof product.accent === 'string' && product.accent.trim().length <= 64 ? product.accent.trim() : '#8da57d',
+    source: 'manual',
+    ...(typeof product.sourceText === 'string' && product.sourceText.trim() ? { sourceText: product.sourceText.trim().slice(0, 4_000) } : {}),
+    updatedAt: Date.now(),
+  };
 }
 
 function routeParam(request: Request, name: string): string {
@@ -110,7 +143,13 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
     response.json(runtime.listRooms().filter((room) => current.role === 'reviewer' || current.roomIds.includes(room.id) || room.ownerActorId === current.actorId));
   });
   app.get('/api/v2/rooms/:roomId/products', (request, response) => {
-    try { runtime.authorization.assert(identity(request), routeParam(request, 'roomId'), 'view'); response.json(runtime.products); } catch (error) { jsonError(response, error, 403); }
+    try { const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'view'); response.json(runtime.listProducts(roomId)); } catch (error) { jsonError(response, error, 403); }
+  });
+  app.put('/api/v2/rooms/:roomId/products/:productId', async (request, response) => {
+    try { const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'control'); response.json(await runtime.upsertProduct(roomId, productInput(routeParam(request, 'productId'), request.body))); } catch (error) { jsonError(response, error); }
+  });
+  app.delete('/api/v2/rooms/:roomId/products/:productId', async (request, response) => {
+    try { const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'control'); response.json(await runtime.removeProduct(roomId, routeParam(request, 'productId'))); } catch (error) { jsonError(response, error); }
   });
   app.get('/api/v2/rooms/:roomId/rules', (request, response) => {
     try { const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'view'); response.json({ rules: runtime.rules.list(roomId), audits: runtime.rules.audits(roomId) }); } catch (error) { jsonError(response, error, 403); }
@@ -254,7 +293,7 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
           });
           sockets.set(socket, { sessionId: session.id, roomId: session.snapshot().roomId, identity: joinIdentity, role: command.role, unsubscribe, sequence: session.snapshot().latestSequence });
           joined = true;
-          send(socket, { type: 'ready', requestId: frame.requestId, sessionId: session.id, products: runtime.products, snapshot: session.snapshot() });
+          send(socket, { type: 'ready', requestId: frame.requestId, sessionId: session.id, products: runtime.listProducts(session.snapshot().roomId), snapshot: session.snapshot() });
           return;
         }
         if (!isLiveCommand(command)) throw new Error('无效的直播命令');

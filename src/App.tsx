@@ -24,6 +24,7 @@ import {
   Send,
   ShieldAlert,
   Sparkles,
+  Trash2,
   UserRound,
   UsersRound,
   X,
@@ -116,11 +117,13 @@ function resample(samples: Float32Array, inputRate: number, outputRate: number):
 function useMicrophone(sendAudio: (pcm: ArrayBuffer | Uint8Array, sampleRate?: number, track?: AudioTrack, channels?: number) => boolean) {
   const [capturing, setCapturing] = useState(false);
   const [error, setError] = useState('');
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+  const [deviceId, setDeviceId] = useState('');
   const streamRef = useRef<MediaStream | null>(null);
   const contextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
 
-  const stop = useCallback(() => {
+  const stopCapture = useCallback(() => {
     processorRef.current?.disconnect();
     contextRef.current?.close().catch(() => undefined);
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -130,12 +133,37 @@ function useMicrophone(sendAudio: (pcm: ArrayBuffer | Uint8Array, sampleRate?: n
     setCapturing(false);
   }, []);
 
-  useEffect(() => stop, [stop]);
+  const refreshDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const inputs = (await navigator.mediaDevices.enumerateDevices()).filter((device) => device.kind === 'audioinput');
+      setDevices(inputs);
+      setDeviceId((current) => current && inputs.some((device) => device.deviceId === current) ? current : inputs[0]?.deviceId ?? '');
+    } catch {
+      // Device enumeration may be blocked until microphone permission is granted.
+    }
+  }, []);
 
-  const start = useCallback(async () => {
+  useEffect(() => {
+    void refreshDevices();
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices?.addEventListener) return () => stopCapture();
+    mediaDevices.addEventListener('devicechange', refreshDevices);
+    return () => { mediaDevices.removeEventListener('devicechange', refreshDevices); stopCapture(); };
+  }, [refreshDevices, stopCapture]);
+
+  const start = useCallback(async (requestedDeviceId = deviceId): Promise<boolean> => {
     setError('');
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('当前浏览器不支持麦克风收音');
+      stopCapture();
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+        echoCancellation: false,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+        ...(requestedDeviceId ? { deviceId: { exact: requestedDeviceId } } : {}),
+      } });
       const context = new AudioContext();
       const source = context.createMediaStreamSource(stream);
       const processor = context.createScriptProcessor(4096, 1, 1);
@@ -151,13 +179,23 @@ function useMicrophone(sendAudio: (pcm: ArrayBuffer | Uint8Array, sampleRate?: n
       contextRef.current = context;
       processorRef.current = processor;
       setCapturing(true);
+      const activeDeviceId = stream.getAudioTracks()[0]?.getSettings().deviceId;
+      if (activeDeviceId) setDeviceId(activeDeviceId);
+      void refreshDevices();
+      return true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '无法使用麦克风');
-      stop();
+      stopCapture();
+      return false;
     }
-  }, [sendAudio, stop]);
+  }, [deviceId, refreshDevices, sendAudio, stopCapture]);
 
-  return { capturing, error, start, stop };
+  const selectDevice = useCallback(async (nextDeviceId: string) => {
+    setDeviceId(nextDeviceId);
+    if (capturing) await start(nextDeviceId);
+  }, [capturing, start]);
+
+  return { capturing, error, devices, deviceId, start, stop: stopCapture, refreshDevices, selectDevice };
 }
 
 function formatTime(timestamp: number): string {
@@ -227,11 +265,17 @@ function ProductRail({ snapshot, products, send, openHistory, openLibrary }: { s
 
 function LiveControls({ snapshot, connected, status, send, sendAudio }: { snapshot: LiveSessionSnapshot; connected: boolean; status: string; send: (command: LiveCommand) => boolean; sendAudio: (pcm: ArrayBuffer | Uint8Array, sampleRate?: number, track?: AudioTrack, channels?: number) => boolean }) {
   const microphone = useMicrophone(sendAudio);
-  const begin = async () => { await microphone.start(); send({ type: snapshot.lifecycle === 'paused' ? 'resume' : 'start' }); };
+  const [devicePickerOpen, setDevicePickerOpen] = useState(false);
+  const selectedDevice = microphone.devices.find((device) => device.deviceId === microphone.deviceId);
+  const begin = async () => { if (await microphone.start()) send({ type: snapshot.lifecycle === 'paused' ? 'resume' : 'start' }); };
   const pause = () => { microphone.stop(); send({ type: 'pause' }); };
   const end = () => { microphone.stop(); send({ type: 'end' }); };
   return <div className="v2-live-controls">
     <div className={`v2-connection ${connected ? 'online' : ''}`}><i />{status}</div>
+    <div className="v2-device-picker">
+      <button type="button" className="device" aria-label={`选择输入设备${selectedDevice?.label ? `，当前 ${selectedDevice.label}` : ''}`} aria-expanded={devicePickerOpen} onClick={() => { setDevicePickerOpen((open) => !open); void microphone.refreshDevices(); }}><Mic size={14} /><span><strong>选择输入设备</strong><small>{selectedDevice?.label || (microphone.deviceId ? '已选择麦克风' : '系统默认麦克风')}</small></span><ChevronDown size={13} /></button>
+      {devicePickerOpen && <div className="v2-device-menu"><label htmlFor="v2-audio-input">收音设备</label><select id="v2-audio-input" value={microphone.deviceId} onChange={(event) => void microphone.selectDevice(event.target.value)}><option value="">系统默认麦克风</option>{microphone.devices.map((device, index) => <option value={device.deviceId} key={device.deviceId}>{device.label || `麦克风 ${index + 1}`}</option>)}</select><button type="button" onClick={() => void microphone.refreshDevices()}><RefreshCw size={12} />刷新设备</button></div>}
+    </div>
     {(snapshot.lifecycle === 'idle' || snapshot.lifecycle === 'paused') && <button type="button" className="primary" onClick={() => void begin()} disabled={!connected}><Mic size={15} />{snapshot.lifecycle === 'paused' ? '继续收音' : '开始收音'}</button>}
     {snapshot.lifecycle === 'live' && <button type="button" onClick={pause}><Pause size={15} />暂停</button>}
     {snapshot.lifecycle !== 'idle' && snapshot.lifecycle !== 'ended' && <button type="button" className="danger" onClick={end}><CircleStop size={15} />结束本场</button>}
@@ -298,6 +342,73 @@ function DisplayLinkPanel({ sessionId }: { sessionId: string }) {
   </details>;
 }
 
+function blankProduct(): Product {
+  return {
+    id: `product-${Date.now().toString(36)}`,
+    name: '',
+    category: '其他',
+    price: '¥0',
+    stock: null,
+    sku: `SKU-${Date.now().toString(36).toUpperCase()}`,
+    description: '',
+    sellingPoints: [],
+    image: '/products/serum.svg',
+    accent: '#8da57d',
+    compliantPhrases: [],
+    source: 'manual',
+    updatedAt: Date.now(),
+  };
+}
+
+function ProductCatalogEditor({ roomId, activeProductId, products }: { roomId: string; activeProductId: string; products: Product[] }) {
+  const client = useMemo(() => new CatalogClient(), []);
+  const [items, setItems] = useState(products);
+  const [draft, setDraft] = useState<Product | null>(null);
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => {
+    try { setItems(await client.products(roomId)); } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+  }, [client, roomId]);
+  useEffect(() => { setItems(products); }, [products]);
+  useEffect(() => { void load(); }, [load]);
+
+  const updateDraft = <K extends keyof Product>(key: K, value: Product[K]) => setDraft((current) => current ? { ...current, [key]: value } : current);
+  const save = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!draft) return;
+    setBusy(true); setMessage('');
+    try {
+      const saved = await client.saveProduct(roomId, { ...draft, updatedAt: Date.now() });
+      setItems((current) => current.some((product) => product.id === saved.id) ? current.map((product) => product.id === saved.id ? saved : product) : [...current, saved]);
+      setDraft(null);
+      setMessage('商品资料已同步到当前直播间和本场页面');
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } finally { setBusy(false); }
+  };
+  const remove = async (product: Product) => {
+    if (typeof window.confirm === 'function' && !window.confirm(`确定从当前直播间移除“${product.name}”吗？`)) return;
+    setBusy(true); setMessage('');
+    try { setItems(await client.removeProduct(roomId, product.id)); if (draft?.id === product.id) setDraft(null); } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } finally { setBusy(false); }
+  };
+
+  return <div className="v2-product-manager">
+    <section className="v2-product-catalog">
+      <header><div><strong>当前直播间商品</strong><small>{items.length} 个 · 修改后实时同步本场</small></div><button type="button" aria-label="新增商品" onClick={() => setDraft(blankProduct())}><Plus size={14} /></button></header>
+      <div>{items.map((product) => <article className={product.id === activeProductId ? 'active' : ''} key={product.id}><img src={product.image} alt="" /><div><strong>{product.name}</strong><small>{product.category} · {product.price} · {product.sku}</small><p>{product.description}</p></div><div className="v2-product-actions"><button type="button" aria-label={`编辑 ${product.name}`} onClick={() => setDraft(structuredClone(product))}><Pencil size={13} /></button><button type="button" aria-label={`移除 ${product.name}`} disabled={busy || items.length <= 1} onClick={() => void remove(product)}><Trash2 size={13} /></button></div></article>)}</div>
+    </section>
+    <section className="v2-product-editor-panel">
+      {draft ? <form onSubmit={(event) => void save(event)}>
+        <header><div><strong>{items.some((product) => product.id === draft.id) ? '编辑商品资料' : '新增直播间商品'}</strong><small>{draft.id}</small></div><button type="button" aria-label="关闭商品编辑" onClick={() => setDraft(null)}><X size={14} /></button></header>
+        <div className="v2-product-fields"><label>商品名称<input value={draft.name} onChange={(event) => updateDraft('name', event.target.value)} required /></label><label>商品分类<input value={draft.category} onChange={(event) => updateDraft('category', event.target.value)} required /></label><label>实时价格<input value={draft.price} onChange={(event) => updateDraft('price', event.target.value)} required /></label><label>商品编码<input value={draft.sku} onChange={(event) => updateDraft('sku', event.target.value)} required /></label></div>
+        <label>商品描述<textarea value={draft.description} onChange={(event) => updateDraft('description', event.target.value)} required /></label>
+        <label>核心卖点<textarea value={draft.sellingPoints.join('\n')} onChange={(event) => updateDraft('sellingPoints', event.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} placeholder="每行一个卖点" required /></label>
+        <label>对应商品参考话术<textarea value={draft.compliantPhrases.join('\n')} onChange={(event) => updateDraft('compliantPhrases', event.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} placeholder="每行一段，可直接给主播参考" required /></label>
+        <button type="submit" disabled={busy || !draft.name.trim() || !draft.description.trim() || !draft.sellingPoints.length || !draft.compliantPhrases.length}><Save size={13} />保存并同步本场</button>
+      </form> : <div className="v2-product-editor-empty"><Package size={24} /><strong>选择商品开始调整</strong><span>开播中修改会同步到中控台、主播屏和本场历史</span></div>}
+    </section>
+    {message && <div className="v2-product-message">{message}</div>}
+  </div>;
+}
+
 function LibraryWorkspace({ snapshot, products, send, onClose }: { snapshot: LiveSessionSnapshot; products: Product[]; send: (command: LiveCommand) => boolean; onClose: () => void }) {
   const client = useMemo(() => new CatalogClient(), []);
   const [tab, setTab] = useState<'products' | 'rules' | 'phrases'>('phrases');
@@ -331,7 +442,7 @@ function LibraryWorkspace({ snapshot, products, send, onClose }: { snapshot: Liv
   return <div className="v2-modal"><section className="v2-review-workspace v2-library-workspace">
     <header><div><BookOpen size={19} /><span><strong>资料管理</strong><small>商品、风险规则与主播专属话术均保存在本机</small></span></div><button type="button" title="关闭" onClick={onClose}><X size={17} /></button></header>
     <nav>{(['phrases', 'rules', 'products'] as const).map((item) => <button type="button" key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item === 'phrases' ? '主播话术' : item === 'rules' ? '风险规则' : '商品资料'}</button>)}</nav>
-    <main>{tab === 'products' && <div className="v2-library-products">{products.map((product) => <article key={product.id}><img src={product.image} alt="" /><div><strong>{product.name}</strong><small>{product.category} · {product.price} · {product.sku}</small><p>{product.description}</p></div></article>)}</div>}
+    <main>{tab === 'products' && <ProductCatalogEditor roomId={snapshot.roomId} activeProductId={snapshot.product.id} products={products} />}
       {tab === 'rules' && <div className="v2-library-columns"><section><header><span>新增高置信规则</span></header><input value={ruleDraft.pattern} onChange={(event) => setRuleDraft({ ...ruleDraft, pattern: event.target.value })} placeholder="风险词或明确短语" /><input value={ruleDraft.title} onChange={(event) => setRuleDraft({ ...ruleDraft, title: event.target.value })} placeholder="提醒标题" /><textarea value={ruleDraft.alternative} onChange={(event) => setRuleDraft({ ...ruleDraft, alternative: event.target.value })} placeholder="主播可直接替换的安全表达" /><button type="button" disabled={busy || !ruleDraft.pattern || !ruleDraft.title || !ruleDraft.alternative} onClick={addRule}><Plus size={13} />保存规则</button></section><section className="v2-library-list">{rules.map((rule) => <article key={rule.id}><div><span className={rule.risk}>{rule.risk === 'blocked' ? '高风险' : '提醒'}</span><strong>{rule.name}</strong></div><p>{rule.pattern}</p><small>{rule.origin === 'learned' ? `自动沉淀 · 证据 ${rule.evidenceCount ?? 1} 次` : `人工规则 · v${rule.version}`}</small><button type="button" onClick={() => void run(() => client.setRuleEnabled(rule, !rule.enabled))}>{rule.enabled ? '停用' : '启用'}</button></article>)}</section></div>}
       {tab === 'phrases' && <div className="v2-library-columns"><section><header><span>主播档案</span></header><select value={presenterId} onChange={(event) => setPresenterId(event.target.value)}>{presenters.map((presenter) => <option value={presenter.id} key={presenter.id}>{presenter.name}</option>)}</select><button type="button" disabled={!presenterId || presenterId === snapshot.presenterId} onClick={() => send({ type: 'select_presenter', presenterId })}><UserRound size={13} />{presenterId === snapshot.presenterId ? '本场当前主播' : '设为本场主播'}</button><div className="v2-inline-form"><input value={newPresenter} onChange={(event) => setNewPresenter(event.target.value)} placeholder="新增主播名称" /><button type="button" disabled={!newPresenter.trim() || busy} onClick={addPresenter}><Plus size={13} /></button></div><select value={purpose} onChange={(event) => setPurpose(event.target.value as CoachPurpose)}><option>塑品</option><option>憋单</option><option>逼单</option><option>转化</option><option>互动</option><option>留人</option><option>答疑</option></select><textarea value={phraseDraft} onChange={(event) => setPhraseDraft(event.target.value)} placeholder="录入头部直播间话术，或保存下一场参考表达" /><button type="button" disabled={busy || !presenterId || !phraseDraft.trim()} onClick={addPhrase}><Save size={13} />保存话术</button></section><section className="v2-library-list">{phrases.map((phrase) => <article key={phrase.id}><div><span className={phrase.status}>{phrase.status === 'reference' ? '下一场参考' : phrase.source === 'session' ? '下播归档' : '草稿'}</span><strong>{phrase.purpose ?? '通用'}</strong></div><p>{phrase.text}</p><small>{phrase.source === 'session' ? '来自历史直播' : phrase.source === 'manual' ? '人工录入' : '豆包改写'} · v{phrase.version}</small><button type="button" onClick={() => void run(() => client.updatePhrase(phrase.id, { status: phrase.status === 'reference' ? 'draft' : 'reference' }))}>{phrase.status === 'reference' ? '取消参考' : '选为参考'}</button></article>)}</section></div>}
     </main>{message && <div className="v2-review-message">{message}</div>}

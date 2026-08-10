@@ -73,6 +73,32 @@ describe('LiveSession', () => {
     store.close();
   });
 
+  it('does not let a delayed model result overwrite an edited active product', async () => {
+    let resolveModel!: (value: ComplianceResult) => void;
+    const analyzer: ReviewAnalyzer = { analyze: () => new Promise((resolve) => { resolveModel = resolve; }) };
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    let products = PRODUCTS;
+    const session = new LiveSession({
+      store,
+      scheduler: new BoundedScheduler({ modelGlobal: 4, modelPerSession: 2, background: 1 }),
+      products: () => products,
+      capture: new FakeCapture(),
+      analyzer,
+      session: { sessionId: 'session-product-edit', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '测试主播', product: DEFAULT_PRODUCT, lineup: PRODUCTS },
+    });
+    await session.dispatch({ type: 'start' });
+    await session.dispatch({ type: 'demo_transcript', text: '正在按旧商品资料分析', isFinal: true });
+    products = PRODUCTS.map((product) => product.id === DEFAULT_PRODUCT.id ? { ...product, description: '直播中刚刚更新的商品资料', updatedAt: product.updatedAt + 1 } : product);
+    await session.dispatch({ type: 'set_lineup', productIds: products.map((product) => product.id) });
+
+    resolveModel(result('serum', 'blocked'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(session.snapshot().product.description).toBe('直播中刚刚更新的商品资料');
+    expect(session.snapshot().latestCompliance?.risk).not.toBe('blocked');
+    store.close();
+  });
+
   it('drops a delayed semantic result after a newer transcript arrives', async () => {
     const pending: Array<(value: ComplianceResult) => void> = [];
     const analyzer: ReviewAnalyzer = { analyze: () => new Promise((resolve) => pending.push(resolve)) };

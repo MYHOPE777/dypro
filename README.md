@@ -29,6 +29,7 @@ npm run dev
 - `SessionReviewModule` 独立处理历史纠错、说话人、备注和人工确认。
 - SQLite/WAL 保存事件、投影、规则、话术、纠错词、音频索引和 durable delivery jobs。
 - 控制台与主播屏通过 `/ws/v2` 接收带递增 `sequence` 的事件，断线后自动补最新快照。
+- 商品目录按直播间隔离；直播中调整商品资料会同步到中控台、主播屏和本场事件历史，不会改写其他直播间或已结束场次。
 
 本地数据：
 
@@ -96,6 +97,7 @@ npm run test:e2e
 - `GET /api/v2/health`
 - `POST /api/v2/auth/login`
 - `/api/v2/rooms/*`
+- `GET/PUT/DELETE /api/v2/rooms/:roomId/products/*`
 - `/api/v2/sessions/*`
 - `GET /api/v2/sessions/:id/audio`
 - `WS /ws/v2`
