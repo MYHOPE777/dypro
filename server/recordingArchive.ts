@@ -6,6 +6,7 @@ export type RecordingArchive = {
   sessionId: string;
   timeline: SessionTimelineExport;
   assets: Array<{ assetId: string; path: string; byteLength: number; sampleRate: number }>;
+  approval: { actorId: string; approvedAt: number };
 };
 
 export type ArchiveStatus = {
@@ -13,6 +14,7 @@ export type ArchiveStatus = {
   available: boolean;
   label: string;
   detail: string;
+  awaitingApproval: number;
   pending: number;
   failed: number;
   succeeded: number;
@@ -26,8 +28,8 @@ export interface RecordingArchiveUploader {
 }
 
 export interface RecordingArchiveQueue {
-  enqueue(sessionId: string): boolean;
-  resync?(sessionId: string): boolean;
+  stage(sessionId: string): boolean;
+  approve(sessionId: string, actorId: string): boolean;
   pause?(sessionId: string): void;
 }
 
@@ -37,10 +39,11 @@ export interface RecordingArchiveSource {
   getSourceAudioPath(sessionId: string, trackIndex?: number): string | null;
 }
 
-type ArchiveTask = { sessionId: string; status: 'pending' | 'succeeded' | 'failed'; attempts: number; createdAt: number; updatedAt: number; nextAttemptAt: number; lastError?: string };
-type ArchiveFile = { schemaVersion: 1; tasks: ArchiveTask[] };
+type ArchiveTask = { sessionId: string; status: 'approval-required' | 'pending' | 'succeeded' | 'failed'; attempts: number; createdAt: number; updatedAt: number; nextAttemptAt: number; approvedAt?: number; approvedBy?: string; lastError?: string };
+type ArchiveFile = { schemaVersion: 2; tasks: ArchiveTask[] };
+type LegacyArchiveFile = { schemaVersion: 1; tasks: Array<Omit<ArchiveTask, 'status'> & { status: 'pending' | 'succeeded' | 'failed' }> };
 
-const emptyStatus = (): ArchiveStatus => ({ configured: false, available: true, label: 'TOS 归档待配置', detail: '收音期间只保留本地文件；停止收音后才会进入上传队列。', pending: 0, failed: 0, succeeded: 0, lastArchivedAt: null });
+const emptyStatus = (): ArchiveStatus => ({ configured: false, available: true, label: '场次上传待配置', detail: '音频和文案先保存在本机，人工确认后才会上传。', awaitingApproval: 0, pending: 0, failed: 0, succeeded: 0, lastArchivedAt: null });
 
 export class DisabledRecordingArchiveUploader implements RecordingArchiveUploader {
   upload(): Promise<void> { return Promise.resolve(); }
@@ -59,10 +62,8 @@ function readHttpConfig(env: NodeJS.ProcessEnv): HttpArchiveConfig | null {
 }
 
 /**
- * Upload gateway adapter. The gateway is responsible for writing to TOS and
- * should accept one JSON manifest followed by streamed PUTs to its returned
- * asset URLs. Keeping this protocol explicit avoids guessing an undocumented
- * TOS API and keeps the live process independent from TOS availability.
+ * The approved-session gateway writes structured content to the business
+ * database and knowledge base, then returns object-storage upload URLs.
  */
 export class HttpRecordingArchiveUploader implements RecordingArchiveUploader {
   private lastError: string | undefined;
@@ -78,14 +79,14 @@ export class HttpRecordingArchiveUploader implements RecordingArchiveUploader {
       const manifestResponse = await fetch(this.config.url, {
         method: 'POST',
         headers: { Authorization: `Bearer ${this.config.apiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: archive.sessionId, timeline: archive.timeline, assets: archive.assets.map(({ assetId, byteLength, sampleRate }) => ({ assetId, byteLength, sampleRate })) }),
+        body: JSON.stringify({ sessionId: archive.sessionId, timeline: archive.timeline, approval: archive.approval, destinations: ['database', 'knowledge-base', 'object-storage'], assets: archive.assets.map(({ assetId, byteLength, sampleRate }) => ({ assetId, byteLength, sampleRate })) }),
         signal: requestSignal,
       });
-      if (!manifestResponse.ok) throw new Error(`TOS 归档网关返回 ${manifestResponse.status}`);
+      if (!manifestResponse.ok) throw new Error(`场次上传网关返回 ${manifestResponse.status}`);
       const body = await manifestResponse.json() as { uploadUrls?: Record<string, string> };
       for (const asset of archive.assets) {
         const uploadUrl = body.uploadUrls?.[asset.assetId];
-        if (!uploadUrl) throw new Error(`TOS 归档网关未返回 ${asset.assetId} 上传地址`);
+        if (!uploadUrl) throw new Error(`场次上传网关未返回 ${asset.assetId} 上传地址`);
         if (!existsSync(asset.path)) throw new Error(`归档文件不存在：${asset.assetId}`);
         const uploadController = new AbortController();
         const uploadTimer = setTimeout(() => uploadController.abort(), this.config.timeoutMs);
@@ -100,7 +101,7 @@ export class HttpRecordingArchiveUploader implements RecordingArchiveUploader {
       this.lastError = undefined;
       this.lastArchivedAt = Date.now();
     } catch (error) {
-      this.lastError = error instanceof Error ? error.message : String(error);
+      if (!signal?.aborted) this.lastError = error instanceof Error ? error.message : String(error);
       throw error;
     } finally {
       clearTimeout(timer);
@@ -108,7 +109,7 @@ export class HttpRecordingArchiveUploader implements RecordingArchiveUploader {
   }
 
   status() {
-    return { configured: true, available: !this.lastError, label: this.lastError ? 'TOS 归档异常，后台将重试' : 'TOS 归档已配置，停止收音后上传', detail: this.lastArchivedAt ? `最近归档 ${new Date(this.lastArchivedAt).toLocaleString('zh-CN', { hour12: false })}` : '实时收音不会占用 TOS 上传带宽。', ...(this.lastError ? { lastError: this.lastError } : {}) };
+    return { configured: true, available: !this.lastError, label: this.lastError ? '场次上传异常，后台将重试' : '人工确认上传已配置', detail: this.lastArchivedAt ? `最近上传 ${new Date(this.lastArchivedAt).toLocaleString('zh-CN', { hour12: false })}` : '未确认的场次只保存在本机。', ...(this.lastError ? { lastError: this.lastError } : {}) };
   }
 }
 
@@ -126,6 +127,7 @@ export class FileRecordingArchiveQueue {
   private flushing = false;
   private readonly activeUploads = new Map<string, AbortController>();
   private readonly pausedSessions = new Set<string>();
+  private readonly changedSessions = new Set<string>();
 
   constructor(source: RecordingArchiveSource, uploader: RecordingArchiveUploader, filePath = path.resolve(process.cwd(), '.data/archive/queue.json'), canArchive: (sessionId: string) => boolean = () => true) {
     this.source = source;
@@ -135,30 +137,46 @@ export class FileRecordingArchiveQueue {
     this.data = this.readFile();
   }
 
-  enqueue(sessionId: string): boolean {
-    if (this.data.tasks.some((task) => task.sessionId === sessionId && task.status !== 'succeeded')) return false;
+  stage(sessionId: string): boolean {
+    if (this.activeUploads.has(sessionId)) {
+      this.changedSessions.add(sessionId);
+      this.pause(sessionId);
+    }
     const now = Date.now();
-    this.data.tasks.push({ sessionId, status: 'pending', attempts: 0, createdAt: now, updatedAt: now, nextAttemptAt: now });
+    const existing = [...this.data.tasks].reverse().find((task) => task.sessionId === sessionId);
+    if (existing) {
+      existing.status = 'approval-required';
+      existing.attempts = 0;
+      existing.updatedAt = now;
+      existing.nextAttemptAt = now;
+      existing.approvedAt = undefined;
+      existing.approvedBy = undefined;
+      existing.lastError = undefined;
+    } else {
+      this.data.tasks.push({ sessionId, status: 'approval-required', attempts: 0, createdAt: now, updatedAt: now, nextAttemptAt: now });
+    }
     this.writeFile();
     return true;
   }
 
-  resync(sessionId: string): boolean {
-    const existing = [...this.data.tasks].reverse().find((task) => task.sessionId === sessionId && task.status !== 'succeeded');
-    if (existing) {
-      const now = Date.now();
-      existing.status = 'pending';
-      existing.updatedAt = now;
-      existing.nextAttemptAt = now;
-      existing.lastError = undefined;
-      this.writeFile();
-      return true;
-    }
-    return this.enqueue(sessionId);
+  approve(sessionId: string, actorId: string): boolean {
+    const task = [...this.data.tasks].reverse().find((candidate) => candidate.sessionId === sessionId);
+    if (!task) this.stage(sessionId);
+    const target = [...this.data.tasks].reverse().find((candidate) => candidate.sessionId === sessionId)!;
+    if (target.status === 'pending' || this.activeUploads.has(sessionId)) return false;
+    const now = Date.now();
+    target.status = 'pending';
+    target.attempts = 0;
+    target.updatedAt = now;
+    target.nextAttemptAt = now;
+    target.approvedAt = now;
+    target.approvedBy = actorId;
+    target.lastError = undefined;
+    this.writeFile();
+    return true;
   }
 
   sessionStatus(sessionId: string): SessionArchiveSync {
-    if (!this.uploader.status().configured) return { state: 'local-only', updatedAt: null };
     const task = [...this.data.tasks].reverse().find((candidate) => candidate.sessionId === sessionId);
     if (!task) return { state: 'local-only', updatedAt: null };
     return {
@@ -178,7 +196,7 @@ export class FileRecordingArchiveQueue {
   async flush(now = Date.now()): Promise<void> {
     if (this.flushing || !this.uploader.status().configured) return;
     this.flushing = true;
-    const task = this.data.tasks.find((candidate) => candidate.status !== 'succeeded' && candidate.nextAttemptAt <= now && this.canArchive(candidate.sessionId));
+    const task = this.data.tasks.find((candidate) => (candidate.status === 'pending' || candidate.status === 'failed') && candidate.nextAttemptAt <= now && this.canArchive(candidate.sessionId));
     if (!task) {
       this.flushing = false;
       return;
@@ -188,6 +206,7 @@ export class FileRecordingArchiveQueue {
     try {
       const timeline = this.source.exportSession(task.sessionId);
       if (!timeline) throw new Error('时间线尚未写入，稍后重试');
+      if (!task.approvedAt || !task.approvedBy) throw new Error('场次尚未人工确认上传');
       const assets: RecordingArchive['assets'] = [];
       if (timeline.audio) {
         const audioPath = this.source.getAudioPath(task.sessionId);
@@ -198,8 +217,15 @@ export class FileRecordingArchiveQueue {
         if (audioPath) assets.push({ assetId: audio.assetId, path: audioPath, byteLength: audio.byteLength, sampleRate: audio.sampleRate });
       }
       if (!this.canArchive(task.sessionId)) return;
-      await this.uploader.upload({ sessionId: task.sessionId, timeline, assets }, uploadController.signal);
-      if (this.pausedSessions.has(task.sessionId)) {
+      await this.uploader.upload({ sessionId: task.sessionId, timeline, assets, approval: { actorId: task.approvedBy, approvedAt: task.approvedAt } }, uploadController.signal);
+      if (this.changedSessions.has(task.sessionId)) {
+        task.status = 'approval-required';
+        task.nextAttemptAt = Date.now();
+        task.updatedAt = Date.now();
+        task.approvedAt = undefined;
+        task.approvedBy = undefined;
+        task.lastError = undefined;
+      } else if (this.pausedSessions.has(task.sessionId)) {
         task.status = 'pending';
         task.nextAttemptAt = Date.now();
         task.updatedAt = Date.now();
@@ -210,7 +236,14 @@ export class FileRecordingArchiveQueue {
         task.lastError = undefined;
       }
     } catch (error) {
-      if (this.pausedSessions.has(task.sessionId)) {
+      if (this.changedSessions.has(task.sessionId)) {
+        task.status = 'approval-required';
+        task.nextAttemptAt = Date.now();
+        task.updatedAt = Date.now();
+        task.approvedAt = undefined;
+        task.approvedBy = undefined;
+        task.lastError = undefined;
+      } else if (this.pausedSessions.has(task.sessionId)) {
         task.status = 'pending';
         task.nextAttemptAt = Date.now();
         task.updatedAt = Date.now();
@@ -225,6 +258,7 @@ export class FileRecordingArchiveQueue {
     } finally {
       this.activeUploads.delete(task.sessionId);
       this.pausedSessions.delete(task.sessionId);
+      this.changedSessions.delete(task.sessionId);
       this.writeFile();
       this.flushing = false;
     }
@@ -232,30 +266,46 @@ export class FileRecordingArchiveQueue {
 
   status(): ArchiveStatus {
     const base = this.uploader.status();
+    const awaitingApproval = this.data.tasks.filter((task) => task.status === 'approval-required').length;
     const pending = this.data.tasks.filter((task) => task.status === 'pending').length;
     const failed = this.data.tasks.filter((task) => task.status === 'failed').length;
     const succeededTasks = this.data.tasks.filter((task) => task.status === 'succeeded');
     const latestFailure = this.data.tasks.find((task) => task.status === 'failed' && task.lastError)?.lastError;
-    return { ...base, pending, failed, succeeded: succeededTasks.length, lastArchivedAt: succeededTasks.reduce<number | null>((latest, task) => Math.max(latest ?? 0, task.updatedAt), null), ...(latestFailure ? { lastError: latestFailure } : {}) };
+    return { ...base, awaitingApproval, pending, failed, succeeded: succeededTasks.length, lastArchivedAt: succeededTasks.reduce<number | null>((latest, task) => Math.max(latest ?? 0, task.updatedAt), null), ...(latestFailure ? { lastError: latestFailure } : {}) };
   }
 
   tasks(): ArchiveTask[] { return structuredClone(this.data.tasks); }
 
   private readFile(): ArchiveFile {
-    if (!existsSync(this.filePath)) return { schemaVersion: 1, tasks: [] };
+    if (!existsSync(this.filePath)) return { schemaVersion: 2, tasks: [] };
     try {
-      const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as ArchiveFile;
-      if (parsed.schemaVersion === 1 && Array.isArray(parsed.tasks)) return parsed;
+      const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as ArchiveFile | LegacyArchiveFile;
+      if (!Array.isArray(parsed.tasks)) throw new Error('invalid archive queue');
+      if (parsed.schemaVersion === 2) return parsed;
+      if (parsed.schemaVersion === 1) {
+        const migrated: ArchiveFile = {
+          schemaVersion: 2,
+          tasks: parsed.tasks.map((task) => task.status === 'succeeded'
+            ? { ...task, status: 'succeeded' }
+            : { ...task, status: 'approval-required', attempts: 0, nextAttemptAt: Date.now(), lastError: undefined, approvedAt: undefined, approvedBy: undefined }),
+        };
+        this.writeData(migrated);
+        return migrated;
+      }
     } catch {
       // Keep local recording usable when an old queue is incomplete.
     }
-    return { schemaVersion: 1, tasks: [] };
+    return { schemaVersion: 2, tasks: [] };
   }
 
   private writeFile(): void {
+    this.writeData(this.data);
+  }
+
+  private writeData(data: ArchiveFile): void {
     mkdirSync(path.dirname(this.filePath), { recursive: true });
     const temporaryPath = `${this.filePath}.tmp`;
-    writeFileSync(temporaryPath, `${JSON.stringify(this.data, null, 2)}\n`, 'utf8');
+    writeFileSync(temporaryPath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
     renameSync(temporaryPath, this.filePath);
   }
 }

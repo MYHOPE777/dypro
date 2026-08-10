@@ -143,35 +143,35 @@ describe('LiveSession', () => {
     expect(session.state.isListening).toBe(false);
   });
 
-  it('keeps capture local and enqueues the archive only after stopping', async () => {
-    const enqueue = vi.fn();
-    const session = new LiveSession('archive-session', { archiveQueue: { enqueue } });
+  it('keeps capture local and stages the archive for approval only after stopping', async () => {
+    const stage = vi.fn();
+    const session = new LiveSession('archive-session', { archiveQueue: { stage, approve: vi.fn() } });
 
     session.startListening();
     session.ingestAudio(Buffer.from([0, 0]));
-    expect(enqueue).not.toHaveBeenCalled();
+    expect(stage).not.toHaveBeenCalled();
     session.stopListening();
     await new Promise((resolve) => setImmediate(resolve));
-    expect(enqueue).toHaveBeenCalledOnce();
-    expect(enqueue).toHaveBeenCalledWith('archive-session');
+    expect(stage).toHaveBeenCalledOnce();
+    expect(stage).toHaveBeenCalledWith('archive-session');
   });
 
   it('pauses and resumes one live session without archiving until it ends', async () => {
-    const enqueue = vi.fn();
-    const session = new LiveSession('lifecycle-session', { archiveQueue: { enqueue } });
+    const stage = vi.fn();
+    const session = new LiveSession('lifecycle-session', { archiveQueue: { stage, approve: vi.fn() } });
 
     session.startListening();
     expect(session.state).toMatchObject({ isListening: true, captureState: 'live' });
     session.pauseListening();
     expect(session.state).toMatchObject({ isListening: false, captureState: 'paused' });
-    expect(enqueue).not.toHaveBeenCalled();
+    expect(stage).not.toHaveBeenCalled();
 
     session.resumeListening();
     expect(session.state).toMatchObject({ isListening: true, captureState: 'live' });
     session.endLive();
     await new Promise((resolve) => setImmediate(resolve));
     expect(session.state).toMatchObject({ isListening: false, captureState: 'ended' });
-    expect(enqueue).toHaveBeenCalledOnce();
+    expect(stage).toHaveBeenCalledOnce();
   });
 
   it('archives host speech to the selected presenter library when the live ends', async () => {

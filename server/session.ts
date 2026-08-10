@@ -402,7 +402,7 @@ export class LiveSession {
     this.recordCaptureBoundary('capture.ended', occurredAt);
     this.audioWriteQueue = this.audioWriteQueue.then(() => {
       this.timelineStore?.finalizeSession(this.id);
-      this.archiveQueue?.enqueue(this.id);
+      this.archiveQueue?.stage(this.id);
     });
     void this.audioWriteQueue.catch((error: unknown) => this.status(`音频切片合成失败：${error instanceof Error ? error.message : String(error)}`, 'error'));
     this.archivePresenterPhrases();
@@ -673,7 +673,7 @@ export class LiveSession {
     this.broadcast({ type: 'state.snapshot', state: this.state });
     if (this.stateValue.captureState === 'ended' || this.historicalEdit) {
       this.timelineStore?.refreshTranscriptSnapshot(this.id);
-      this.archiveQueue?.resync?.(this.id);
+      this.archiveQueue?.stage(this.id);
     } else {
       this.enqueueCompliance(corrected);
     }
@@ -713,7 +713,7 @@ export class LiveSession {
     this.broadcast({ type: 'state.snapshot', state: this.state });
     if (!this.stateValue.isListening) {
       this.timelineStore?.refreshTranscriptSnapshot(this.id);
-      this.archiveQueue?.resync?.(this.id);
+      this.archiveQueue?.stage(this.id);
     }
     return annotated;
   }

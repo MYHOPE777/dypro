@@ -766,9 +766,10 @@ function deriveTextDifference(originalText: string, correctedText: string): { wr
 
 function syncCaption(summary?: SessionHistorySummary): string {
   if (!summary || summary.sync.state === 'local-only') return '仅保存在本机';
-  if (summary.sync.state === 'pending') return '等待后台同步';
-  if (summary.sync.state === 'failed') return '同步失败，将自动重试';
-  return '已同步到云端';
+  if (summary.sync.state === 'approval-required') return '待复核确认上传';
+  if (summary.sync.state === 'pending') return '已确认，正在上传';
+  if (summary.sync.state === 'failed') return '上传失败，将自动重试';
+  return '已上传知识库和数据库';
 }
 
 function SessionReviewModal({ state, access, onClose }: { state: SessionState; access: OperatorAccess; onClose: () => void }) {
@@ -784,7 +785,7 @@ function SessionReviewModal({ state, access, onClose }: { state: SessionState; a
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef('');
   const selectedSummary = history.find((session) => session.sessionId === selectedSessionId);
-  const selectedEditable = selectedSummary?.captureState !== 'live';
+  const selectedEditable = selectedSummary?.captureState === 'ended';
 
   const loadHistory = useCallback(async () => {
     const response = await fetch(`/api/rooms/${state.roomId}/sessions`, { headers: accessHeaders(access.actorId, access.token) });
@@ -832,6 +833,8 @@ function SessionReviewModal({ state, access, onClose }: { state: SessionState; a
   useEffect(() => {
     if (!selectedSessionId) return;
     void loadDetails().catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error)));
+    const settleTimer = window.setTimeout(() => { void Promise.all([loadDetails(), loadHistory()]).catch(() => undefined); }, 2_500);
+    return () => window.clearTimeout(settleTimer);
   }, [loadDetails, selectedSessionId]);
   useEffect(() => { setNoteDraft(selectedSummary?.note ?? ''); }, [selectedSummary?.note, selectedSessionId]);
 
@@ -862,7 +865,7 @@ function SessionReviewModal({ state, access, onClose }: { state: SessionState; a
       const learned = editing.learn && editing.wrongText && editing.correctText;
       setEditing(null);
       await refreshSelected();
-      setMessage(learned ? '已保存到本机，并加入长期纠错词库；后台同步已排队' : '转录已保存到本机，后台同步已排队');
+      setMessage(learned ? '已保存到本机，并加入长期纠错词库；复核后可确认上传' : '转录已保存到本机；复核后可确认上传');
     } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
     finally { setBusy(false); }
   };
@@ -876,7 +879,7 @@ function SessionReviewModal({ state, access, onClose }: { state: SessionState; a
       const result = await response.json() as SessionHistorySummary & { message?: string };
       if (!response.ok) throw new Error(result.message ?? '场次备注保存失败');
       await refreshSelected();
-      setMessage(result.sync.state === 'local-only' ? '备注已保存到本机；云端同步尚未配置' : '备注已保存到本机，后台同步已排队');
+      setMessage('备注已保存到本机；复核后可确认上传');
     } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
     finally { setBusy(false); }
   };
@@ -922,15 +925,33 @@ function SessionReviewModal({ state, access, onClose }: { state: SessionState; a
       URL.revokeObjectURL(url);
     } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
   };
+  const approveArchive = async () => {
+    if (!selectedSessionId || !selectedEditable || !selectedSummary) return;
+    if (noteDraft !== selectedSummary.note) {
+      setMessage('备注有未保存的修改，请先保存备注再确认上传');
+      return;
+    }
+    setBusy(true); setMessage('');
+    try {
+      const response = await fetch(`/api/session/${selectedSessionId}/archive`, {
+        method: 'POST', headers: accessHeaders(access.actorId, access.token, true), body: '{}',
+      });
+      const result = await response.json() as SessionHistorySummary & { message?: string };
+      if (!response.ok) throw new Error(result.message ?? '确认上传失败');
+      await loadHistory();
+      setMessage('已人工确认，正在后台上传知识库和数据库；可以直接开始下一场直播');
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+    finally { setBusy(false); }
+  };
   const startNewSession = () => {
     localStorage.removeItem('live-session');
     window.location.assign(`/?room=${encodeURIComponent(state.roomId)}`);
   };
 
   return <div className="modal-backdrop" role="presentation"><section className="review-modal history-modal" role="dialog" aria-modal="true" aria-label="直播记录">
-    <header className="review-head"><div><span className="section-kicker">直播记录 <span>SESSION HISTORY</span></span><h2>音频、文案与复盘</h2><p>下播先保存到本机，修改后由后台同步；无需处理完上一场再开播</p></div><div className="review-head-actions"><button type="button" className="new-session-button" onClick={startNewSession}><Plus size={15} />新开一场直播</button><button type="button" className="modal-close" onClick={onClose} title="关闭">×</button></div></header>
-    <div className="history-layout"><aside className="history-sidebar"><div className="pane-head"><div><strong>历史场次</strong><span>{history.length} 场保存在本机</span></div><button type="button" title="刷新" onClick={() => void loadHistory()}><RefreshCw size={14} /></button></div><div className="history-session-list">{history.map((session) => <button type="button" className={`history-session ${session.sessionId === selectedSessionId ? 'selected' : ''}`} key={session.sessionId} onClick={() => setSelectedSessionId(session.sessionId)}><span><strong>{new Date(session.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}</strong><em>{session.presenterName}</em></span><small>{session.productNames.join('、') || '未记录商品'} · {session.transcriptCount} 条</small>{session.note && <p>{session.note}</p>}<span className={`history-sync ${session.sync.state}`}>{session.sync.state === 'synced' ? <Cloud size={11} /> : session.sync.state === 'local-only' ? <HardDrive size={11} /> : <CloudOff size={11} />}{syncCaption(session)}</span></button>)}</div>{history.length === 0 && <div className="review-empty">还没有可复核的直播记录</div>}</aside>
-      <section className="history-detail">{selectedSummary ? <><div className="history-summary"><div><strong>{new Date(selectedSummary.createdAt).toLocaleString('zh-CN', { hour12: false })}</strong><span>{selectedSummary.presenterName} · {selectedSummary.productNames.join('、') || '未记录商品'}</span></div><div><span className={`history-sync ${selectedSummary.sync.state}`}>{selectedSummary.sync.state === 'synced' ? <Cloud size={12} /> : <HardDrive size={12} />}{syncCaption(selectedSummary)}</span><button type="button" className="icon-button quiet" onClick={() => void downloadTranscript()} title="下载本地文案"><Download size={15} /></button></div></div><div className="session-note-editor"><label htmlFor="session-note">本场备注</label><textarea id="session-note" value={noteDraft} disabled={!selectedEditable} onChange={(event) => setNoteDraft(event.target.value)} placeholder="记录商品节奏、主播状态、待改话术或下一场安排" maxLength={1_000} /><button type="button" disabled={busy || !selectedEditable || noteDraft === selectedSummary.note} onClick={() => void saveNote()}><Save size={13} />保存备注</button></div><div className="review-audio"><div><FileAudio size={18} /><span><strong>本场识别音频</strong><small>{timeline?.audio ? `${Math.round(timeline.audio.durationMs / 1000)} 秒 · ${Math.round(timeline.audio.byteLength / 1024)} KB · 已保存在本机` : '本场暂无完整音频'}</small></span></div>{audioUrl ? <audio ref={audioRef} controls preload="metadata" src={audioUrl} /> : <span className="review-audio-empty">暂无音频</span>}</div><div className="review-grid"><section className="review-transcripts"><div className="pane-head"><div><strong>时间戳转录</strong><span>可回听、纠错并沉淀为下一场的长期纠错词</span></div></div><div className="review-transcript-list">{transcripts.map((segment) => <div className={`review-transcript-row ${segment.compliance?.risk ?? ''}`} key={segment.id}><button type="button" className="segment-play" onClick={() => playSegment(segment)} disabled={!audioUrl} title="播放对应音频"><Play size={13} fill="currentColor" /></button><time><span>{formatReplayOffset(segment.offsetMs)}</span><small>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour12: false })}</small><SpeakerTag speaker={segment.speaker} speakerId={segment.speakerId} speakerSource={segment.speakerSource} onClick={selectedEditable ? () => void setSpeaker(segment) : undefined} /></time><div className="review-transcript-copy">{editing?.segment.id === segment.id ? <form onSubmit={(event) => { event.preventDefault(); void saveCorrection(); }}><textarea value={editing.text} onChange={(event) => updateDraft(event.target.value)} autoFocus /><div className="correction-pair"><label>错误词<input value={editing.wrongText} onChange={(event) => setEditing({ ...editing, wrongText: event.target.value, pairTouched: true })} placeholder="自动提取" /></label><span>→</span><label>正确词<input value={editing.correctText} onChange={(event) => setEditing({ ...editing, correctText: event.target.value, pairTouched: true })} placeholder="自动提取" /></label></div><label className="learn-toggle"><input type="checkbox" checked={editing.learn} onChange={(event) => setEditing({ ...editing, learn: event.target.checked })} />加入当前直播间长期纠错词库</label><div className="review-edit-actions"><button type="submit" disabled={busy || !editing.text.trim()}><Save size={13} />保存纠错</button><button type="button" onClick={() => setEditing(null)}>取消</button></div></form> : <><p>{transcriptMarkup(segment.text, segment.compliance)}</p><div><span>{segment.revisions > 0 ? `已修正 ${segment.revisions} 次` : '原始转录'}</span><button type="button" title="纠正这句转录" disabled={!selectedEditable} onClick={() => beginEdit(segment)}><Pencil size={13} /></button></div></>}</div></div>)}</div>{transcripts.length === 0 && <div className="review-empty">本场还没有最终转录</div>}</section><aside className="correction-library"><div className="pane-head"><div><strong>长期纠错词库</strong><span>下一场自动修正并加入识别上下文</span></div></div><div className="correction-list">{corrections.map((correction) => <div className={`correction-row ${correction.enabled ? '' : 'disabled'}`} key={correction.id}><div><strong>{correction.wrongText}</strong><span>→</span><strong>{correction.correctText}</strong></div><small>确认 {correction.confirmations} 次 · {correction.enabled ? '已生效' : '已停用'}</small><button type="button" disabled={busy} onClick={() => void setCorrectionEnabled(correction)}>{correction.enabled ? '停用' : '重新启用'}</button></div>)}</div>{corrections.length === 0 && <div className="review-empty">修正转录后可沉淀主播专属词库</div>}</aside></div></> : <div className="review-empty history-empty"><History size={20} />选择一场直播查看音频与文案</div>}</section></div>
+    <header className="review-head"><div><span className="section-kicker">直播记录 <span>SESSION HISTORY</span></span><h2>音频、文案与复盘</h2><p>下播先保存到本机，复核确认后再上传；无需处理完上一场再开播</p></div><div className="review-head-actions"><button type="button" className="new-session-button" onClick={startNewSession}><Plus size={15} />新开一场直播</button><button type="button" className="modal-close" onClick={onClose} title="关闭">×</button></div></header>
+    <div className="history-layout"><aside className="history-sidebar"><div className="pane-head"><div><strong>历史场次</strong><span>{history.length} 场保存在本机</span></div><button type="button" title="刷新" onClick={() => void loadHistory()}><RefreshCw size={14} /></button></div><div className="history-session-list">{history.map((session) => <button type="button" className={`history-session ${session.sessionId === selectedSessionId ? 'selected' : ''}`} key={session.sessionId} onClick={() => setSelectedSessionId(session.sessionId)}><span><strong>{new Date(session.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}</strong><em>{session.presenterName}</em></span><small>{session.productNames.join('、') || '未记录商品'} · {session.transcriptCount} 条</small>{session.note && <p>{session.note}</p>}<span className={`history-sync ${session.sync.state}`}>{session.sync.state === 'synced' ? <Cloud size={11} /> : session.sync.state === 'failed' ? <CloudOff size={11} /> : <HardDrive size={11} />}{syncCaption(session)}</span></button>)}</div>{history.length === 0 && <div className="review-empty">还没有可复核的直播记录</div>}</aside>
+      <section className="history-detail">{selectedSummary ? <><div className="history-summary"><div><strong>{new Date(selectedSummary.createdAt).toLocaleString('zh-CN', { hour12: false })}</strong><span>{selectedSummary.presenterName} · {selectedSummary.productNames.join('、') || '未记录商品'}</span></div><div><span className={`history-sync ${selectedSummary.sync.state}`}>{selectedSummary.sync.state === 'synced' ? <Cloud size={12} /> : selectedSummary.sync.state === 'failed' ? <CloudOff size={12} /> : <HardDrive size={12} />}{syncCaption(selectedSummary)}</span>{(selectedSummary.sync.state === 'local-only' || selectedSummary.sync.state === 'approval-required' || selectedSummary.sync.state === 'failed') && <button type="button" className="archive-confirm-button" disabled={busy || !selectedEditable || noteDraft !== selectedSummary.note} onClick={() => void approveArchive()} title={noteDraft !== selectedSummary.note ? '请先保存备注' : '确认后上传知识库和数据库'}><Database size={14} />{selectedSummary.sync.state === 'failed' ? '重新上传' : '确认上传'}</button>}<button type="button" className="icon-button quiet" onClick={() => void downloadTranscript()} title="下载本地文案"><Download size={15} /></button></div></div><div className="session-note-editor"><label htmlFor="session-note">本场备注</label><textarea id="session-note" value={noteDraft} disabled={!selectedEditable} onChange={(event) => setNoteDraft(event.target.value)} placeholder="记录商品节奏、主播状态、待改话术或下一场安排" maxLength={1_000} /><button type="button" disabled={busy || !selectedEditable || noteDraft === selectedSummary.note} onClick={() => void saveNote()}><Save size={13} />保存备注</button></div><div className="review-audio"><div><FileAudio size={18} /><span><strong>本场识别音频</strong><small>{timeline?.audio ? `${Math.round(timeline.audio.durationMs / 1000)} 秒 · ${Math.round(timeline.audio.byteLength / 1024)} KB · 已保存在本机` : '本场暂无完整音频'}</small></span></div>{audioUrl ? <audio ref={audioRef} controls preload="metadata" src={audioUrl} /> : <span className="review-audio-empty">暂无音频</span>}</div><div className="review-grid"><section className="review-transcripts"><div className="pane-head"><div><strong>时间戳转录</strong><span>可回听、纠错并沉淀为下一场的长期纠错词</span></div></div><div className="review-transcript-list">{transcripts.map((segment) => <div className={`review-transcript-row ${segment.compliance?.risk ?? ''}`} key={segment.id}><button type="button" className="segment-play" onClick={() => playSegment(segment)} disabled={!audioUrl} title="播放对应音频"><Play size={13} fill="currentColor" /></button><time><span>{formatReplayOffset(segment.offsetMs)}</span><small>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour12: false })}</small><SpeakerTag speaker={segment.speaker} speakerId={segment.speakerId} speakerSource={segment.speakerSource} onClick={selectedEditable ? () => void setSpeaker(segment) : undefined} /></time><div className="review-transcript-copy">{editing?.segment.id === segment.id ? <form onSubmit={(event) => { event.preventDefault(); void saveCorrection(); }}><textarea value={editing.text} onChange={(event) => updateDraft(event.target.value)} autoFocus /><div className="correction-pair"><label>错误词<input value={editing.wrongText} onChange={(event) => setEditing({ ...editing, wrongText: event.target.value, pairTouched: true })} placeholder="自动提取" /></label><span>→</span><label>正确词<input value={editing.correctText} onChange={(event) => setEditing({ ...editing, correctText: event.target.value, pairTouched: true })} placeholder="自动提取" /></label></div><label className="learn-toggle"><input type="checkbox" checked={editing.learn} onChange={(event) => setEditing({ ...editing, learn: event.target.checked })} />加入当前直播间长期纠错词库</label><div className="review-edit-actions"><button type="submit" disabled={busy || !editing.text.trim()}><Save size={13} />保存纠错</button><button type="button" onClick={() => setEditing(null)}>取消</button></div></form> : <><p>{transcriptMarkup(segment.text, segment.compliance)}</p><div><span>{segment.revisions > 0 ? `已修正 ${segment.revisions} 次` : '原始转录'}</span><button type="button" title="纠正这句转录" disabled={!selectedEditable} onClick={() => beginEdit(segment)}><Pencil size={13} /></button></div></>}</div></div>)}</div>{transcripts.length === 0 && <div className="review-empty">本场还没有最终转录</div>}</section><aside className="correction-library"><div className="pane-head"><div><strong>长期纠错词库</strong><span>下一场自动修正并加入识别上下文</span></div></div><div className="correction-list">{corrections.map((correction) => <div className={`correction-row ${correction.enabled ? '' : 'disabled'}`} key={correction.id}><div><strong>{correction.wrongText}</strong><span>→</span><strong>{correction.correctText}</strong></div><small>确认 {correction.confirmations} 次 · {correction.enabled ? '已生效' : '已停用'}</small><button type="button" disabled={busy} onClick={() => void setCorrectionEnabled(correction)}>{correction.enabled ? '停用' : '重新启用'}</button></div>)}</div>{corrections.length === 0 && <div className="review-empty">修正转录后可沉淀主播专属词库</div>}</aside></div></> : <div className="review-empty history-empty"><History size={20} />选择一场直播查看音频与文案</div>}</section></div>
     {message && <div className="review-message">{message}</div>}
   </section></div>;
 }
@@ -955,7 +976,7 @@ function speakerCaption(speaker: SpeakerLabel = 'host', speakerId?: string, sour
 function SpeakerTag({ speaker = 'host', speakerId, speakerSource, onClick }: { speaker?: SpeakerLabel; speakerId?: string; speakerSource?: SpeakerSource; onClick?: () => void }) {
   const isOther = speaker === 'other';
   const automatic = speakerSource === 'automatic';
-  return <button type="button" className={`speaker-tag ${isOther ? 'other' : 'host'} ${automatic ? 'automatic' : ''} speaker-${speakerLetter(speakerId).toLowerCase()}`} onClick={onClick} title={automatic ? '点击确认这位发言人身份' : '点击切换说话人身份'}><>{isOther || automatic ? <UsersRound size={11} /> : <UserRound size={11} />}</>{speakerCaption(speaker, speakerId, speakerSource)}</button>;
+  return <button type="button" className={`speaker-tag ${isOther ? 'other' : 'host'} ${automatic ? 'automatic' : ''} speaker-${speakerLetter(speakerId).toLowerCase()}`} onClick={onClick} disabled={!onClick} title={automatic ? '点击确认这位发言人身份' : onClick ? '点击切换说话人身份' : undefined}><>{isOther || automatic ? <UsersRound size={11} /> : <UserRound size={11} />}</>{speakerCaption(speaker, speakerId, speakerSource)}</button>;
 }
 
 function toggleSpeaker(segment: Pick<TranscriptSegment, 'speaker' | 'speakerSource'>): SpeakerLabel {

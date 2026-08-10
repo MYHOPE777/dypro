@@ -62,7 +62,7 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 | `RULE_LEARNING_MIN_CONFIDENCE` | 0.8-1，默认 `0.93` | 否 | 仅豆包明确标记为词级规则且达到此置信度时，自动生成待审核候选；句级和上下文语义永不自动发布为硬规则。 |
 | `SESSION_IDLE_TTL_MS` | 毫秒，默认 `1800000` | 否 | 最后一个页面断开后保留会话的时间，最小按 60 秒处理。超时后只清理内存会话，已写入的本地时间线不删除。 |
 | `DISPLAY_LINK_REGISTRY_PATH` | 路径，默认 `.data/display-links/registry.json` | 否 | 保存临时主播屏短地址及过期时间，使服务重启后未过期的主播屏继续连接原会话。 |
-| `ARCHIVE_QUEUE_PATH` | 路径，默认 `.data/archive/queue.json` | 否 | 停播后 TOS 归档队列。失败任务带指数退避，服务重启后可继续。 |
+| `ARCHIVE_QUEUE_PATH` | 路径，默认 `.data/archive/queue.json` | 否 | 场次人工确认上传队列。未确认场次只保存在本机；已确认但上传失败的任务会在重启后继续重试。 |
 
 相对路径按启动服务时的项目根目录解析。生产环境建议改为绝对路径，并确保运行账号有读写权限。音频与规则数据属于直播业务数据，建议放在受限磁盘并纳入备份。
 
@@ -222,9 +222,9 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 
 网关应按资源 `id + version + action` 幂等处理，再写入火山数据库或知识库。失败任务采用指数退避并在服务重启后继续；云端故障不会阻塞直播。知识库适合保存语义案例和主播参考素材，已发布词级规则仍应保留在本地/业务数据库快路径。
 
-### 2.7 场次文案与音频异步归档
+### 2.7 场次文案与音频人工确认上传
 
-直播处理链路始终先把时间线、最终文案和音频保存到本地。停止收音后，服务端再把会话 manifest POST 到归档网关；网关应把文案、备注和时间线写入业务数据库，并返回音频对象存储的预签名 URL。数据库或对象存储不可用时，任务保留在本地队列并后台重试，不阻塞下一场直播。
+直播处理链路始终先把时间线、最终文案和音频保存到本地。停止收音后不会自动上传；操作人员在直播记录中完成文案纠错、说话人标记和备注后，点击“确认上传”，服务端才把会话 manifest POST 到归档网关。网关应把文案、备注和时间线写入业务数据库与知识库，并返回音频对象存储的预签名 URL。确认后若云端暂时不可用，任务保留在本地队列并后台重试，不阻塞下一场直播。
 
 | 参数 | 类型/默认值 | 是否必填 | 说明 |
 | --- | --- | --- | --- |
@@ -235,7 +235,7 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 | `TOS_ARCHIVE_TIMEOUT_MS` | 毫秒，默认 `10000` | 否 | manifest 和每个音频 PUT 的超时。 |
 | `ARCHIVE_QUEUE_PATH` | 路径 | 否 | 本地归档队列位置，见 2.1。 |
 
-`SESSION_ARCHIVE_GATEWAY_*` 优先于旧的 `TOS_ARCHIVE_GATEWAY_*`，旧配置继续兼容。历史场次备注或转录被修改后，同一 `sessionId` 会重新进入同步队列；网关应按 `sessionId` 幂等更新数据库记录。
+`SESSION_ARCHIVE_GATEWAY_*` 优先于旧的 `TOS_ARCHIVE_GATEWAY_*`，旧配置继续兼容。历史场次备注、转录或说话人标记被修改后，同一 `sessionId` 会回到“待确认”状态，必须再次人工确认才会上传。网关应按 `sessionId` 幂等更新数据库与知识库记录。服务升级前遗留的未完成自动上传任务会迁移为“待确认”，不会在重启后自行上传。
 
 manifest 请求体：
 
@@ -243,6 +243,8 @@ manifest 请求体：
 {
   "sessionId": "live-abc123",
   "timeline": {"schemaVersion": 1, "timezone": "Asia/Shanghai", "events": []},
+  "approval": {"actorId": "operator-1", "approvedAt": 1770000000000},
+  "destinations": ["database", "knowledge-base", "object-storage"],
   "assets": [
     {"assetId": "asr", "byteLength": 32000, "sampleRate": 16000},
     {"assetId": "source-0", "byteLength": 96000, "sampleRate": 48000}

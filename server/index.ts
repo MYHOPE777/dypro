@@ -275,8 +275,10 @@ const requirePhraseAccess: express.RequestHandler = (request, response, next) =>
 };
 
 function persistedSessionRoomId(sessionId: string): string | null {
-  const roomId = timelineStore.exportSession(sessionId)?.events.find((event) => event.type === 'session.created')?.payload.roomId;
-  return typeof roomId === 'string' ? roomId : null;
+  const timeline = timelineStore.exportSession(sessionId);
+  if (!timeline) return null;
+  const roomId = timeline.events.find((event) => event.type === 'session.created')?.payload.roomId;
+  return typeof roomId === 'string' ? roomId : 'room-default';
 }
 
 function editableSession(sessionId: string, actorId: string): LiveSession | null {
@@ -299,6 +301,13 @@ function historySummary(summary: SessionHistorySummary): SessionHistorySummary {
     ...(active ? { captureState: active.state.captureState, updatedAt: Math.max(summary.updatedAt, active.state.lastEventAt) } : {}),
     sync: recordingArchiveQueue.sessionStatus(summary.sessionId),
   };
+}
+
+function isEndedSession(sessionId: string): boolean {
+  const active = sessions.get(sessionId);
+  if (active) return active.state.captureState === 'ended';
+  const roomId = persistedSessionRoomId(sessionId);
+  return Boolean(roomId && timelineStore.listSessions(roomId).find((candidate) => candidate.sessionId === sessionId)?.captureState === 'ended');
 }
 
 const requireSessionAccess: express.RequestHandler = (request, response, next) => {
@@ -364,7 +373,7 @@ app.get('/api/readiness', (_request, response) => {
     auth: { configured: authService.configured, label: authService.configured ? '多人身份已保护' : '仅限本机控制' },
     storage: { configured: databaseConfigured && objectStorageConfigured, label: databaseConfigured && objectStorageConfigured ? '数据库 + 对象存储已配置' : '本地文件存储（生产存储待配置）' },
     database: { configured: databaseConfigured, label: databaseConfigured ? '业务数据库参数已填写' : '业务数据库待配置' },
-    objectStorage: { configured: objectStorageConfigured, label: objectStorageConfigured ? 'TOS 原始音频归档已配置' : 'TOS 原始音频归档待配置', status: archiveStatus },
+    objectStorage: { configured: objectStorageConfigured, label: objectStorageConfigured ? '人工确认上传服务已配置' : '人工确认上传服务待配置', status: archiveStatus },
     redis: { configured: redisConfigured, label: redisConfigured ? 'Redis 会话协调已配置' : 'Redis 会话协调待配置' },
     knowledge,
     ruleSync: { ...ruleSync, label: ruleSync.configured ? '规则库后台同步已配置' : '规则库本地优先，云端同步待配置' },
@@ -676,10 +685,10 @@ app.patch('/api/session/:id/note', requireOperator, requireSessionAccess, (reque
   const note = request.body.note.trim();
   if (note.length > 1_000) return response.status(400).json({ message: '场次备注不能超过 1000 个字符' });
   const sessionId = routeParam(request, 'id');
-  if (sessions.get(sessionId)?.state.isListening) return response.status(409).json({ message: '直播收音中，请下播后再修改场次备注' });
+  if (!isEndedSession(sessionId)) return response.status(409).json({ message: '请结束本场直播后再修改场次备注' });
   try {
     timelineStore.updateSessionNote(sessionId, note, actorFromRequest(request));
-    recordingArchiveQueue.resync(sessionId);
+    recordingArchiveQueue.stage(sessionId);
     const roomId = persistedSessionRoomId(sessionId);
     const summary = roomId ? timelineStore.listSessions(roomId).find((candidate) => candidate.sessionId === sessionId) : undefined;
     return summary ? response.json(historySummary(summary)) : response.status(404).json({ message: '直播记录不存在' });
@@ -688,7 +697,20 @@ app.patch('/api/session/:id/note', requireOperator, requireSessionAccess, (reque
   }
 });
 
+app.post('/api/session/:id/archive', requireOperator, requireSessionAccess, (request, response) => {
+  const sessionId = routeParam(request, 'id');
+  if (!isEndedSession(sessionId)) return response.status(409).json({ message: '请结束本场直播后再确认上传' });
+  if (!timelineStore.exportSession(sessionId)) return response.status(404).json({ message: '直播记录不存在' });
+  if (!recordingArchiveQueue.status().configured) return response.status(503).json({ message: '知识库和数据库上传服务尚未配置' });
+  recordingArchiveQueue.approve(sessionId, actorFromRequest(request));
+  void recordingArchiveQueue.flush();
+  const roomId = persistedSessionRoomId(sessionId);
+  const summary = roomId ? timelineStore.listSessions(roomId).find((candidate) => candidate.sessionId === sessionId) : undefined;
+  return summary ? response.status(202).json(historySummary(summary)) : response.status(404).json({ message: '直播记录不存在' });
+});
+
 app.patch('/api/session/:id/transcripts/:segmentId', requireOperator, requireSessionAccess, (request, response) => {
+  if (!isEndedSession(routeParam(request, 'id'))) return response.status(409).json({ message: '请结束本场直播后再修改转录' });
   const text = typeof request.body?.text === 'string' ? request.body.text.trim() : '';
   const speaker = request.body?.speaker === 'host' || request.body?.speaker === 'other' ? request.body.speaker : undefined;
   const speakerId = typeof request.body?.speakerId === 'string' && /^speaker-[1-4]$/u.test(request.body.speakerId) ? request.body.speakerId : undefined;

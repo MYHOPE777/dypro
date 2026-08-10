@@ -109,7 +109,7 @@ export type SessionTimelineExport = {
   events: TimelineEvent[];
 };
 
-export type SessionArchiveSyncState = 'local-only' | 'pending' | 'failed' | 'synced';
+export type SessionArchiveSyncState = 'local-only' | 'approval-required' | 'pending' | 'failed' | 'synced';
 
 export type SessionArchiveSync = {
   state: SessionArchiveSyncState;
