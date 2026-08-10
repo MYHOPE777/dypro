@@ -2,6 +2,7 @@ export type RiskLevel = 'safe' | 'warning' | 'blocked';
 export type RiskProfile = 'strict' | 'balanced' | 'optimized';
 export type CaptureState = 'idle' | 'live' | 'paused' | 'ended';
 export type SpeakerLabel = 'host' | 'other';
+export type SpeakerSource = 'default' | 'automatic' | 'manual';
 export type CoachPurpose = '塑品' | '憋单' | '逼单' | '转化' | '互动' | '留人' | '答疑';
 
 export type LiveRoom = {
@@ -42,10 +43,16 @@ export type TranscriptSegment = {
   startOffsetMs: number | null;
   endOffsetMs: number | null;
   speaker?: SpeakerLabel;
+  /** Stable candidate id (speaker-1, speaker-2...) for mixed-room grouping. */
+  speakerId?: string;
+  /** Whether the label was inferred from audio or confirmed by the operator. */
+  speakerSource?: SpeakerSource;
+  speakerConfidence?: number;
 };
 
 export type TimelineEventType =
   | 'session.created'
+  | 'session.note.updated'
   | 'capture.started'
   | 'capture.resumed'
   | 'capture.paused'
@@ -100,6 +107,34 @@ export type SessionTimelineExport = {
   audio: TimelineAudioAsset | null;
   sourceAudio: TimelineAudioAsset[];
   events: TimelineEvent[];
+};
+
+export type SessionArchiveSyncState = 'local-only' | 'pending' | 'failed' | 'synced';
+
+export type SessionArchiveSync = {
+  state: SessionArchiveSyncState;
+  updatedAt: number | null;
+  lastError?: string;
+};
+
+export type SessionHistorySummary = {
+  sessionId: string;
+  roomId: string;
+  presenterId: string;
+  presenterName: string;
+  createdAt: number;
+  recordingStartedAt: number | null;
+  endedAt: number | null;
+  updatedAt: number;
+  captureState: CaptureState;
+  note: string;
+  transcriptCount: number;
+  correctionCount: number;
+  productNames: string[];
+  hasAudio: boolean;
+  audioDurationMs: number;
+  audioByteLength: number;
+  sync: SessionArchiveSync;
 };
 
 export type ComplianceResult = {
@@ -187,7 +222,7 @@ export type ClientMessage =
   | { type: 'risk.profile'; profile: RiskProfile }
   | { type: 'presenter.select'; presenterId: string }
   | { type: 'transcript.correct'; segmentId: string; text: string; learn?: boolean; wrongText?: string; correctText?: string }
-  | { type: 'transcript.speaker'; segmentId: string; speaker: SpeakerLabel }
+  | { type: 'transcript.speaker'; segmentId: string; speaker: SpeakerLabel; speakerId?: string }
   | { type: 'audio'; data: string }
   | { type: 'audio.raw'; data: string; sampleRate: number }
   | { type: 'demo.transcript'; text: string };

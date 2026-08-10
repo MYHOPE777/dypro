@@ -1,6 +1,6 @@
 import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import type { SessionTimelineExport } from '../src/shared/types';
+import type { SessionArchiveSync, SessionTimelineExport } from '../src/shared/types';
 
 export type RecordingArchive = {
   sessionId: string;
@@ -27,6 +27,7 @@ export interface RecordingArchiveUploader {
 
 export interface RecordingArchiveQueue {
   enqueue(sessionId: string): boolean;
+  resync?(sessionId: string): boolean;
   pause?(sessionId: string): void;
 }
 
@@ -49,8 +50,8 @@ export class DisabledRecordingArchiveUploader implements RecordingArchiveUploade
 type HttpArchiveConfig = { url: string; apiKey: string; timeoutMs: number };
 
 function readHttpConfig(env: NodeJS.ProcessEnv): HttpArchiveConfig | null {
-  const url = env.TOS_ARCHIVE_GATEWAY_URL?.trim();
-  const apiKey = env.TOS_ARCHIVE_GATEWAY_KEY?.trim();
+  const url = env.SESSION_ARCHIVE_GATEWAY_URL?.trim() || env.TOS_ARCHIVE_GATEWAY_URL?.trim();
+  const apiKey = env.SESSION_ARCHIVE_GATEWAY_KEY?.trim() || env.TOS_ARCHIVE_GATEWAY_KEY?.trim();
   if (!url || !apiKey) return null;
   try { new URL(url); } catch { return null; }
   const timeout = Number(env.TOS_ARCHIVE_TIMEOUT_MS ?? 10_000);
@@ -140,6 +141,31 @@ export class FileRecordingArchiveQueue {
     this.data.tasks.push({ sessionId, status: 'pending', attempts: 0, createdAt: now, updatedAt: now, nextAttemptAt: now });
     this.writeFile();
     return true;
+  }
+
+  resync(sessionId: string): boolean {
+    const existing = [...this.data.tasks].reverse().find((task) => task.sessionId === sessionId && task.status !== 'succeeded');
+    if (existing) {
+      const now = Date.now();
+      existing.status = 'pending';
+      existing.updatedAt = now;
+      existing.nextAttemptAt = now;
+      existing.lastError = undefined;
+      this.writeFile();
+      return true;
+    }
+    return this.enqueue(sessionId);
+  }
+
+  sessionStatus(sessionId: string): SessionArchiveSync {
+    if (!this.uploader.status().configured) return { state: 'local-only', updatedAt: null };
+    const task = [...this.data.tasks].reverse().find((candidate) => candidate.sessionId === sessionId);
+    if (!task) return { state: 'local-only', updatedAt: null };
+    return {
+      state: task.status === 'succeeded' ? 'synced' : task.status,
+      updatedAt: task.updatedAt,
+      ...(task.lastError ? { lastError: task.lastError } : {}),
+    };
   }
 
   pause(sessionId: string): void {

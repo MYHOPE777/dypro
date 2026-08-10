@@ -73,6 +73,25 @@ describe('FileRecordingArchiveQueue', () => {
     expect(uploader.upload).toHaveBeenCalledTimes(2);
   });
 
+  it('queues an already archived session again after its note or transcript changes', async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'recording-archive-resync-'));
+    directories.push(directory);
+    const source: RecordingArchiveSource = { exportSession: () => ({ schemaVersion: 1, sessionId: 'live-test', timezone: 'Asia/Shanghai', createdAt: 1, recordingStartedAt: 2, audio: null, sourceAudio: [], events: [] }), getAudioPath: () => null, getSourceAudioPath: () => null };
+    const uploader: RecordingArchiveUploader = { upload: vi.fn().mockResolvedValue(undefined), status: () => ({ configured: true, available: true, label: 'ok', detail: 'ok' }) };
+    const queue = new FileRecordingArchiveQueue(source, uploader, path.join(directory, 'queue.json'));
+
+    queue.enqueue('live-test');
+    await queue.flush();
+    expect(queue.sessionStatus('live-test')).toMatchObject({ state: 'synced' });
+
+    expect(queue.resync('live-test')).toBe(true);
+    expect(queue.sessionStatus('live-test')).toMatchObject({ state: 'pending' });
+    await queue.flush();
+
+    expect(uploader.upload).toHaveBeenCalledTimes(2);
+    expect(queue.sessionStatus('live-test')).toMatchObject({ state: 'synced' });
+  });
+
   it('pauses an in-flight upload when capture resumes', async () => {
     const directory = mkdtempSync(path.join(tmpdir(), 'recording-archive-pause-'));
     directories.push(directory);

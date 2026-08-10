@@ -69,6 +69,54 @@ describe('session timeline export', () => {
     });
   });
 
+  it('writes an editable local transcript snapshot and lists the session in room history', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'live-history-'));
+    tempDirectories.push(directory);
+    const timelineStore = new FileTimelineStore(directory);
+    const sessionId = 'live-history-test';
+
+    timelineStore.appendEvent(sessionId, {
+      type: 'session.created',
+      occurredAt: 1_000,
+      offsetMs: null,
+      productId: 'serum',
+      payload: { roomId: 'room-history', presenterId: 'presenter-1', presenterName: '小唐', product: { name: '轻透精华' } },
+    });
+    timelineStore.appendEvent(sessionId, {
+      type: 'capture.started', occurredAt: 2_000, offsetMs: 0, productId: 'serum',
+    });
+    timelineStore.appendEvent(sessionId, {
+      type: 'transcript.final', occurredAt: 3_000, offsetMs: 1_000, productId: 'serum',
+      payload: { segmentId: 'segment-1', text: '这款精华特别厚重', speaker: 'host' },
+    });
+    timelineStore.appendEvent(sessionId, {
+      type: 'transcript.corrected', occurredAt: 4_000, offsetMs: 1_000, productId: 'serum',
+      payload: { segmentId: 'segment-1', correctedText: '这款精华质地清爽', actorId: 'owner' },
+    });
+    timelineStore.updateSessionNote(sessionId, '复盘时补充卖点，下一场减少绝对化表达。', 'owner', 5_000);
+    timelineStore.appendEvent(sessionId, {
+      type: 'capture.ended', occurredAt: 6_000, offsetMs: 4_000, productId: 'serum',
+    });
+    timelineStore.appendAudio(sessionId, Buffer.alloc(3_200));
+    timelineStore.finalizeSession(sessionId);
+
+    expect(timelineStore.readTranscript(sessionId)).toContain('主播\t这款精华质地清爽');
+    expect(timelineStore.readTranscript(sessionId)).toContain('备注：复盘时补充卖点，下一场减少绝对化表达。');
+    expect(timelineStore.listSessions('room-history')).toEqual([
+      expect.objectContaining({
+        sessionId,
+        presenterName: '小唐',
+        captureState: 'ended',
+        note: '复盘时补充卖点，下一场减少绝对化表达。',
+        transcriptCount: 1,
+        correctionCount: 1,
+        hasAudio: true,
+        audioDurationMs: 100,
+        productNames: ['轻透精华'],
+      }),
+    ]);
+  });
+
   it('wraps the original PCM in WAV without changing any captured sample bytes', () => {
     const directory = mkdtempSync(path.join(tmpdir(), 'live-audio-'));
     tempDirectories.push(directory);

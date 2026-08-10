@@ -11,6 +11,8 @@ import {
   FileAudio,
   ExternalLink,
   Headphones,
+  HardDrive,
+  History,
   Keyboard,
   LockKeyhole,
   LogOut,
@@ -27,6 +29,9 @@ import {
   Save,
   ShieldCheck,
   Sparkles,
+  Cloud,
+  CloudOff,
+  Download,
   Volume2,
   Wifi,
   UserRound,
@@ -37,7 +42,7 @@ import QRCode from 'qrcode';
 import { DEFAULT_PRODUCT } from './shared/products';
 import { complianceForLatestSegment, complianceForPrompt } from './compliance/currentCompliance';
 import { canSelectInputDevice, switchInputDevice } from './microphoneDevice';
-import type { ComplianceResult, ComplianceRule, CoachSuggestion, LiveRoom, Product, ProductImportResponse, PresenterPhrase, PresenterProfile, RuleAuditEntry, ServerMessage, SessionState, SessionTimelineExport, SpeakerLabel, SpeechCorrectionEntry, TimelineEvent, TranscriptSegment } from './shared/types';
+import type { ComplianceResult, ComplianceRule, CoachSuggestion, LiveRoom, Product, ProductImportResponse, PresenterPhrase, PresenterProfile, RuleAuditEntry, ServerMessage, SessionHistorySummary, SessionState, SessionTimelineExport, SpeakerLabel, SpeakerSource, SpeechCorrectionEntry, TimelineEvent, TranscriptSegment } from './shared/types';
 
 type Role = 'operator' | 'display';
 type AuthIdentity = { actorId: string; displayName: string; role: 'operator' | 'reviewer'; roomIds: string[] };
@@ -669,7 +674,7 @@ function MicPanel({ state, connected, captureDeniedVersion, send, onOpenReview }
     {state.captureState === 'idle' && <div className="mic-control-stack"><button type="button" className="test-control" onClick={() => microphone.capturing ? microphone.stop() : void microphone.start()} disabled={!connected}><Activity size={15} />{microphone.capturing ? '结束设备测试' : '检测并测试麦克风'}</button><button type="button" className="main-control start" onClick={() => void startLive()} disabled={!connected}><Radio size={16} />开始直播收音</button></div>}
     {state.captureState === 'live' && <div className="mic-control-stack horizontal"><button type="button" className="test-control" onClick={pauseLive} disabled={!connected}><Pause size={15} fill="currentColor" />暂停</button><button type="button" className="main-control stop" onClick={endLive} disabled={!connected}><CircleStop size={16} />结束直播</button></div>}
     {state.captureState === 'paused' && <div className="mic-control-stack horizontal"><button type="button" className="main-control start" onClick={() => void startLive(true)} disabled={!connected}><Play size={16} fill="currentColor" />继续收音</button><button type="button" className="main-control stop" onClick={endLive} disabled={!connected}><CircleStop size={16} />结束直播</button></div>}
-    {state.captureState === 'ended' && <button type="button" className="review-control" onClick={onOpenReview}><FileAudio size={16} />复核音频与转录</button>}
+    <button type="button" className="review-control" onClick={onOpenReview}><History size={16} />{state.captureState === 'ended' ? '复核本场与历史' : '查看历史直播记录'}</button>
     <span className="capture-note"><span className={`capture-dot ${state.isListening ? 'active' : ''}`} />{state.captureState === 'live' ? '流式语音识别中' : state.captureState === 'paused' ? '流式语音识别已暂停' : state.captureState === 'ended' ? '本地已归档' : microphone.capturing ? '本地设备测试' : '流式语音识别待命'}</span>
   </section>;
 }
@@ -683,6 +688,7 @@ type ReviewTranscript = TranscriptSegment & {
 
 function buildReviewTranscripts(events: TimelineEvent[]): ReviewTranscript[] {
   const transcripts = new Map<string, ReviewTranscript>();
+  const speakerBindings = new Map<string, SpeakerLabel>();
   for (const event of events) {
     if (event.type === 'transcript.final') {
       const segmentId = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
@@ -699,6 +705,9 @@ function buildReviewTranscripts(events: TimelineEvent[]): ReviewTranscript[] {
         startOffsetMs: typeof event.payload.startOffsetMs === 'number' ? event.payload.startOffsetMs : null,
         endOffsetMs: typeof event.payload.endOffsetMs === 'number' ? event.payload.endOffsetMs : event.offsetMs,
         speaker: event.payload.speaker === 'other' ? 'other' : 'host',
+        ...(typeof event.payload.speakerId === 'string' ? { speakerId: event.payload.speakerId } : {}),
+        ...(event.payload.speakerSource === 'automatic' || event.payload.speakerSource === 'manual' || event.payload.speakerSource === 'default' ? { speakerSource: event.payload.speakerSource } : {}),
+        ...(typeof event.payload.speakerConfidence === 'number' ? { speakerConfidence: event.payload.speakerConfidence } : {}),
         audioStartMs: audioStartSample === null ? null : Math.round((audioStartSample / 16_000) * 1_000),
         audioEndMs: audioEndSample === null ? null : Math.round((audioEndSample / 16_000) * 1_000),
         revisions: 0,
@@ -713,7 +722,16 @@ function buildReviewTranscripts(events: TimelineEvent[]): ReviewTranscript[] {
     if (event.type === 'transcript.annotated') {
       const segmentId = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
       const existing = transcripts.get(segmentId);
-      if (existing) transcripts.set(segmentId, { ...existing, speaker: event.payload.speaker === 'other' ? 'other' : 'host' });
+      const speaker = event.payload.speaker === 'other' ? 'other' : 'host';
+      const speakerId = typeof event.payload.speakerId === 'string' ? event.payload.speakerId : existing?.speakerId;
+      if (speakerId) speakerBindings.set(speakerId, speaker);
+      if (existing) transcripts.set(segmentId, {
+        ...existing,
+        speaker,
+        speakerSource: 'manual',
+        ...(speakerId ? { speakerId } : {}),
+        speakerConfidence: 1,
+      });
     }
     if (event.type === 'compliance.result') {
       const segmentId = typeof event.payload.transcriptSegmentId === 'string' ? event.payload.transcriptSegmentId : '';
@@ -727,7 +745,11 @@ function buildReviewTranscripts(events: TimelineEvent[]): ReviewTranscript[] {
       });
     }
   }
-  return [...transcripts.values()].sort((first, second) => first.timestamp - second.timestamp);
+  return [...transcripts.values()]
+    .map((segment) => segment.speakerId && speakerBindings.has(segment.speakerId)
+      ? { ...segment, speaker: speakerBindings.get(segment.speakerId)!, speakerSource: 'manual' as const, speakerConfidence: 1 }
+      : segment)
+    .sort((first, second) => first.timestamp - second.timestamp);
 }
 
 function deriveTextDifference(originalText: string, correctedText: string): { wrongText: string; correctText: string } | null {
@@ -742,95 +764,136 @@ function deriveTextDifference(originalText: string, correctedText: string): { wr
   return wrongText && correctText && wrongText !== correctText ? { wrongText, correctText } : null;
 }
 
+function syncCaption(summary?: SessionHistorySummary): string {
+  if (!summary || summary.sync.state === 'local-only') return '仅保存在本机';
+  if (summary.sync.state === 'pending') return '等待后台同步';
+  if (summary.sync.state === 'failed') return '同步失败，将自动重试';
+  return '已同步到云端';
+}
+
 function SessionReviewModal({ state, access, onClose }: { state: SessionState; access: OperatorAccess; onClose: () => void }) {
+  const [history, setHistory] = useState<SessionHistorySummary[]>([]);
+  const [selectedSessionId, setSelectedSessionId] = useState(state.captureState === 'ended' ? state.sessionId : '');
   const [timeline, setTimeline] = useState<SessionTimelineExport | null>(null);
   const [corrections, setCorrections] = useState<SpeechCorrectionEntry[]>([]);
   const [audioUrl, setAudioUrl] = useState('');
+  const [noteDraft, setNoteDraft] = useState('');
   const [editing, setEditing] = useState<{ segment: ReviewTranscript; text: string; wrongText: string; correctText: string; learn: boolean; pairTouched: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState('正在载入本场记录');
+  const [message, setMessage] = useState('正在载入直播记录');
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef('');
+  const selectedSummary = history.find((session) => session.sessionId === selectedSessionId);
+  const selectedEditable = selectedSummary?.captureState !== 'live';
 
-  const load = useCallback(async () => {
+  const loadHistory = useCallback(async () => {
+    const response = await fetch(`/api/rooms/${state.roomId}/sessions`, { headers: accessHeaders(access.actorId, access.token) });
+    if (!response.ok) throw new Error('历史直播记录读取失败');
+    const sessions = await response.json() as SessionHistorySummary[];
+    setHistory(sessions);
+    setSelectedSessionId((current) => {
+      if (current && sessions.some((session) => session.sessionId === current)) return current;
+      if (state.captureState === 'ended' && sessions.some((session) => session.sessionId === state.sessionId)) return state.sessionId;
+      return sessions.find((session) => session.sessionId !== state.sessionId && session.captureState !== 'live')?.sessionId ?? sessions[0]?.sessionId ?? '';
+    });
+  }, [access.actorId, access.token, state.captureState, state.roomId, state.sessionId]);
+
+  const loadDetails = useCallback(async () => {
+    if (!selectedSessionId) {
+      setTimeline(null);
+      return;
+    }
     const headers = accessHeaders(access.actorId, access.token);
     const [timelineResponse, correctionsResponse, audioResponse] = await Promise.all([
-      fetch(`/api/session/${state.sessionId}/timeline`, { headers }),
+      fetch(`/api/session/${selectedSessionId}/timeline`, { headers }),
       fetch(`/api/rooms/${state.roomId}/speech-corrections`, { headers }),
-      fetch(`/api/session/${state.sessionId}/audio.wav`, { headers }),
+      fetch(`/api/session/${selectedSessionId}/audio.wav`, { headers }),
     ]);
-    if (!timelineResponse.ok) throw new Error('本场时间线读取失败');
+    if (!timelineResponse.ok) throw new Error('场次时间线读取失败');
     if (!correctionsResponse.ok) throw new Error('长期纠错词库读取失败');
     setTimeline(await timelineResponse.json() as SessionTimelineExport);
     setCorrections(await correctionsResponse.json() as SpeechCorrectionEntry[]);
+    if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
+    audioUrlRef.current = '';
+    setAudioUrl('');
     if (audioResponse.ok) {
       const nextUrl = URL.createObjectURL(await audioResponse.blob());
-      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
       audioUrlRef.current = nextUrl;
       setAudioUrl(nextUrl);
     }
+    setEditing(null);
     setMessage(audioResponse.ok ? '' : '本场没有可播放的音频');
-  }, [access.actorId, access.token, state.roomId, state.sessionId]);
+  }, [access.actorId, access.token, selectedSessionId, state.roomId]);
 
   useEffect(() => {
-    void load().catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error)));
-    const settleTimer = window.setTimeout(() => { void load().catch(() => undefined); }, 2_500);
-    return () => {
-      window.clearTimeout(settleTimer);
-      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
-    };
-  }, [load]);
+    void loadHistory().catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error)));
+    return () => { if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current); };
+  }, [loadHistory]);
+  useEffect(() => {
+    if (!selectedSessionId) return;
+    void loadDetails().catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error)));
+  }, [loadDetails, selectedSessionId]);
+  useEffect(() => { setNoteDraft(selectedSummary?.note ?? ''); }, [selectedSummary?.note, selectedSessionId]);
 
+  const refreshSelected = async () => {
+    await Promise.all([loadDetails(), loadHistory()]);
+  };
   const transcripts = buildReviewTranscripts(timeline?.events ?? []);
-  const beginEdit = (segment: ReviewTranscript) => setEditing({ segment, text: segment.text, wrongText: '', correctText: '', learn: true, pairTouched: false });
+  const beginEdit = (segment: ReviewTranscript) => {
+    if (!selectedEditable) return;
+    setEditing({ segment, text: segment.text, wrongText: '', correctText: '', learn: true, pairTouched: false });
+  };
   const updateDraft = (text: string) => setEditing((current) => {
     if (!current) return null;
     const derived = deriveTextDifference(current.segment.text, text);
-    return {
-      ...current,
-      text,
-      ...(!current.pairTouched ? { wrongText: derived?.wrongText ?? '', correctText: derived?.correctText ?? '' } : {}),
-    };
+    return { ...current, text, ...(!current.pairTouched ? { wrongText: derived?.wrongText ?? '', correctText: derived?.correctText ?? '' } : {}) };
   });
   const saveCorrection = async () => {
-    if (!editing?.text.trim()) return;
-    setBusy(true);
-    setMessage('');
+    if (!editing?.text.trim() || !selectedSessionId) return;
+    setBusy(true); setMessage('');
     try {
-      const response = await fetch(`/api/session/${state.sessionId}/transcripts/${editing.segment.id}`, {
+      const response = await fetch(`/api/session/${selectedSessionId}/transcripts/${editing.segment.id}`, {
         method: 'PATCH',
         headers: accessHeaders(access.actorId, access.token, true),
         body: JSON.stringify({ text: editing.text.trim(), learn: editing.learn, wrongText: editing.wrongText.trim() || undefined, correctText: editing.correctText.trim() || undefined }),
       });
       const result = await response.json() as { message?: string };
       if (!response.ok) throw new Error(result.message ?? '转录纠错失败');
+      const learned = editing.learn && editing.wrongText && editing.correctText;
       setEditing(null);
-      await load();
-      setMessage(editing.learn && editing.wrongText && editing.correctText ? '转录已修正，并已加入直播间长期纠错词库' : '转录已修正');
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
+      await refreshSelected();
+      setMessage(learned ? '已保存到本机，并加入长期纠错词库；后台同步已排队' : '转录已保存到本机，后台同步已排队');
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+    finally { setBusy(false); }
+  };
+  const saveNote = async () => {
+    if (!selectedSessionId || !selectedEditable) return;
+    setBusy(true); setMessage('');
+    try {
+      const response = await fetch(`/api/session/${selectedSessionId}/note`, {
+        method: 'PATCH', headers: accessHeaders(access.actorId, access.token, true), body: JSON.stringify({ note: noteDraft }),
+      });
+      const result = await response.json() as SessionHistorySummary & { message?: string };
+      if (!response.ok) throw new Error(result.message ?? '场次备注保存失败');
+      await refreshSelected();
+      setMessage(result.sync.state === 'local-only' ? '备注已保存到本机；云端同步尚未配置' : '备注已保存到本机，后台同步已排队');
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+    finally { setBusy(false); }
   };
   const setSpeaker = async (segment: ReviewTranscript) => {
+    if (!selectedSessionId || !selectedEditable) return;
     setBusy(true);
     try {
-      const speaker = segment.speaker === 'other' ? 'host' : 'other';
-      const response = await fetch(`/api/session/${state.sessionId}/transcripts/${segment.id}`, {
-        method: 'PATCH',
-        headers: accessHeaders(access.actorId, access.token, true),
-        body: JSON.stringify({ speaker }),
+      const speaker = segment.speakerSource === 'automatic' ? 'host' : segment.speaker === 'other' ? 'host' : 'other';
+      const response = await fetch(`/api/session/${selectedSessionId}/transcripts/${segment.id}`, {
+        method: 'PATCH', headers: accessHeaders(access.actorId, access.token, true), body: JSON.stringify({ speaker, speakerId: segment.speakerId }),
       });
       const result = await response.json() as { message?: string };
       if (!response.ok) throw new Error(result.message ?? '说话人标记失败');
-      await load();
-      setMessage(`已标记为${speaker === 'other' ? '其他人' : '主播'}`);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
+      await refreshSelected();
+      setMessage(`已标记为${speaker === 'other' ? '其他人' : '主播'}，修改已保存到本机`);
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+    finally { setBusy(false); }
   };
   const setCorrectionEnabled = async (correction: SpeechCorrectionEntry) => {
     setBusy(true);
@@ -839,28 +902,35 @@ function SessionReviewModal({ state, access, onClose }: { state: SessionState; a
         method: 'POST', headers: accessHeaders(access.actorId, access.token, true), body: JSON.stringify({ enabled: !correction.enabled }),
       });
       if (!response.ok) throw new Error('纠错词状态更新失败');
-      await load();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
+      await loadDetails();
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+    finally { setBusy(false); }
   };
   const playSegment = (segment: ReviewTranscript) => {
     if (!audioRef.current) return;
     audioRef.current.currentTime = Math.max(0, (segment.audioStartMs ?? segment.startOffsetMs ?? segment.offsetMs ?? 0) / 1_000);
     void audioRef.current.play();
   };
+  const downloadTranscript = async () => {
+    if (!selectedSessionId) return;
+    try {
+      const response = await fetch(`/api/session/${selectedSessionId}/transcript.txt`, { headers: accessHeaders(access.actorId, access.token) });
+      if (!response.ok) throw new Error('本地文案下载失败');
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url; link.download = `${selectedSessionId}.transcript.txt`; link.click();
+      URL.revokeObjectURL(url);
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+  };
   const startNewSession = () => {
     localStorage.removeItem('live-session');
     window.location.assign(`/?room=${encodeURIComponent(state.roomId)}`);
   };
 
-  return <div className="modal-backdrop" role="presentation"><section className="review-modal" role="dialog" aria-modal="true" aria-label="停播复核">
-    <header className="review-head"><div><span className="section-kicker">停播复核 <span>SESSION REVIEW</span></span><h2>音频与转录校对</h2><p>{state.sessionId} · {transcripts.length} 条最终转录 · 长期纠错 {corrections.length} 条</p></div><div className="review-head-actions"><button type="button" className="new-session-button" onClick={startNewSession}><Plus size={15} />新开一场直播</button><button type="button" className="modal-close" onClick={onClose} title="关闭">×</button></div></header>
-    <div className="review-audio"><div><FileAudio size={18} /><span><strong>本场 16 kHz 识别音频</strong><small>{timeline?.audio ? `${Math.round(timeline.audio.durationMs / 1000)} 秒 · ${Math.round(timeline.audio.byteLength / 1024)} KB` : '等待音频信息'}</small></span></div>{audioUrl ? <audio ref={audioRef} controls preload="metadata" src={audioUrl} /> : <span className="review-audio-empty">暂无音频</span>}</div>
-    <div className="review-grid"><section className="review-transcripts"><div className="pane-head"><div><strong>时间戳转录</strong><span>点击播放按钮定位到对应音频</span></div></div><div className="review-transcript-list">{transcripts.map((segment) => <div className={`review-transcript-row ${segment.compliance?.risk ?? ''}`} key={segment.id}><button type="button" className="segment-play" onClick={() => playSegment(segment)} disabled={!audioUrl} title="播放对应音频"><Play size={13} fill="currentColor" /></button><time><span>{formatReplayOffset(segment.offsetMs)}</span><small>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour12: false })}</small><SpeakerTag speaker={segment.speaker} onClick={() => void setSpeaker(segment)} /></time><div className="review-transcript-copy">{editing?.segment.id === segment.id ? <form onSubmit={(event) => { event.preventDefault(); void saveCorrection(); }}><textarea value={editing.text} onChange={(event) => updateDraft(event.target.value)} autoFocus /><div className="correction-pair"><label>错误词<input value={editing.wrongText} onChange={(event) => setEditing({ ...editing, wrongText: event.target.value, pairTouched: true })} placeholder="自动提取" /></label><span>→</span><label>正确词<input value={editing.correctText} onChange={(event) => setEditing({ ...editing, correctText: event.target.value, pairTouched: true })} placeholder="自动提取" /></label></div><label className="learn-toggle"><input type="checkbox" checked={editing.learn} onChange={(event) => setEditing({ ...editing, learn: event.target.checked })} />加入当前直播间长期纠错词库</label><div className="review-edit-actions"><button type="submit" disabled={busy || !editing.text.trim()}><Save size={13} />保存纠错</button><button type="button" onClick={() => setEditing(null)}>取消</button></div></form> : <><p>{transcriptMarkup(segment.text, segment.compliance)}</p><div><span>{segment.revisions > 0 ? `已修正 ${segment.revisions} 次` : '原始转录'}</span><button type="button" title="纠正这句转录" onClick={() => beginEdit(segment)}><Pencil size={13} /></button></div></>}</div></div>)}</div>{transcripts.length === 0 && <div className="review-empty">本场还没有最终转录</div>}</section>
-      <aside className="correction-library"><div className="pane-head"><div><strong>长期纠错词库</strong><span>下一场自动修正并加入识别上下文</span></div></div><div className="correction-list">{corrections.map((correction) => <div className={`correction-row ${correction.enabled ? '' : 'disabled'}`} key={correction.id}><div><strong>{correction.wrongText}</strong><span>→</span><strong>{correction.correctText}</strong></div><small>确认 {correction.confirmations} 次 · {correction.enabled ? '已生效' : '已停用'}</small><button type="button" disabled={busy} onClick={() => void setCorrectionEnabled(correction)}>{correction.enabled ? '停用' : '重新启用'}</button></div>)}</div>{corrections.length === 0 && <div className="review-empty">修正转录后可沉淀主播专属词库</div>}</aside></div>
+  return <div className="modal-backdrop" role="presentation"><section className="review-modal history-modal" role="dialog" aria-modal="true" aria-label="直播记录">
+    <header className="review-head"><div><span className="section-kicker">直播记录 <span>SESSION HISTORY</span></span><h2>音频、文案与复盘</h2><p>下播先保存到本机，修改后由后台同步；无需处理完上一场再开播</p></div><div className="review-head-actions"><button type="button" className="new-session-button" onClick={startNewSession}><Plus size={15} />新开一场直播</button><button type="button" className="modal-close" onClick={onClose} title="关闭">×</button></div></header>
+    <div className="history-layout"><aside className="history-sidebar"><div className="pane-head"><div><strong>历史场次</strong><span>{history.length} 场保存在本机</span></div><button type="button" title="刷新" onClick={() => void loadHistory()}><RefreshCw size={14} /></button></div><div className="history-session-list">{history.map((session) => <button type="button" className={`history-session ${session.sessionId === selectedSessionId ? 'selected' : ''}`} key={session.sessionId} onClick={() => setSelectedSessionId(session.sessionId)}><span><strong>{new Date(session.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}</strong><em>{session.presenterName}</em></span><small>{session.productNames.join('、') || '未记录商品'} · {session.transcriptCount} 条</small>{session.note && <p>{session.note}</p>}<span className={`history-sync ${session.sync.state}`}>{session.sync.state === 'synced' ? <Cloud size={11} /> : session.sync.state === 'local-only' ? <HardDrive size={11} /> : <CloudOff size={11} />}{syncCaption(session)}</span></button>)}</div>{history.length === 0 && <div className="review-empty">还没有可复核的直播记录</div>}</aside>
+      <section className="history-detail">{selectedSummary ? <><div className="history-summary"><div><strong>{new Date(selectedSummary.createdAt).toLocaleString('zh-CN', { hour12: false })}</strong><span>{selectedSummary.presenterName} · {selectedSummary.productNames.join('、') || '未记录商品'}</span></div><div><span className={`history-sync ${selectedSummary.sync.state}`}>{selectedSummary.sync.state === 'synced' ? <Cloud size={12} /> : <HardDrive size={12} />}{syncCaption(selectedSummary)}</span><button type="button" className="icon-button quiet" onClick={() => void downloadTranscript()} title="下载本地文案"><Download size={15} /></button></div></div><div className="session-note-editor"><label htmlFor="session-note">本场备注</label><textarea id="session-note" value={noteDraft} disabled={!selectedEditable} onChange={(event) => setNoteDraft(event.target.value)} placeholder="记录商品节奏、主播状态、待改话术或下一场安排" maxLength={1_000} /><button type="button" disabled={busy || !selectedEditable || noteDraft === selectedSummary.note} onClick={() => void saveNote()}><Save size={13} />保存备注</button></div><div className="review-audio"><div><FileAudio size={18} /><span><strong>本场识别音频</strong><small>{timeline?.audio ? `${Math.round(timeline.audio.durationMs / 1000)} 秒 · ${Math.round(timeline.audio.byteLength / 1024)} KB · 已保存在本机` : '本场暂无完整音频'}</small></span></div>{audioUrl ? <audio ref={audioRef} controls preload="metadata" src={audioUrl} /> : <span className="review-audio-empty">暂无音频</span>}</div><div className="review-grid"><section className="review-transcripts"><div className="pane-head"><div><strong>时间戳转录</strong><span>可回听、纠错并沉淀为下一场的长期纠错词</span></div></div><div className="review-transcript-list">{transcripts.map((segment) => <div className={`review-transcript-row ${segment.compliance?.risk ?? ''}`} key={segment.id}><button type="button" className="segment-play" onClick={() => playSegment(segment)} disabled={!audioUrl} title="播放对应音频"><Play size={13} fill="currentColor" /></button><time><span>{formatReplayOffset(segment.offsetMs)}</span><small>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour12: false })}</small><SpeakerTag speaker={segment.speaker} speakerId={segment.speakerId} speakerSource={segment.speakerSource} onClick={selectedEditable ? () => void setSpeaker(segment) : undefined} /></time><div className="review-transcript-copy">{editing?.segment.id === segment.id ? <form onSubmit={(event) => { event.preventDefault(); void saveCorrection(); }}><textarea value={editing.text} onChange={(event) => updateDraft(event.target.value)} autoFocus /><div className="correction-pair"><label>错误词<input value={editing.wrongText} onChange={(event) => setEditing({ ...editing, wrongText: event.target.value, pairTouched: true })} placeholder="自动提取" /></label><span>→</span><label>正确词<input value={editing.correctText} onChange={(event) => setEditing({ ...editing, correctText: event.target.value, pairTouched: true })} placeholder="自动提取" /></label></div><label className="learn-toggle"><input type="checkbox" checked={editing.learn} onChange={(event) => setEditing({ ...editing, learn: event.target.checked })} />加入当前直播间长期纠错词库</label><div className="review-edit-actions"><button type="submit" disabled={busy || !editing.text.trim()}><Save size={13} />保存纠错</button><button type="button" onClick={() => setEditing(null)}>取消</button></div></form> : <><p>{transcriptMarkup(segment.text, segment.compliance)}</p><div><span>{segment.revisions > 0 ? `已修正 ${segment.revisions} 次` : '原始转录'}</span><button type="button" title="纠正这句转录" disabled={!selectedEditable} onClick={() => beginEdit(segment)}><Pencil size={13} /></button></div></>}</div></div>)}</div>{transcripts.length === 0 && <div className="review-empty">本场还没有最终转录</div>}</section><aside className="correction-library"><div className="pane-head"><div><strong>长期纠错词库</strong><span>下一场自动修正并加入识别上下文</span></div></div><div className="correction-list">{corrections.map((correction) => <div className={`correction-row ${correction.enabled ? '' : 'disabled'}`} key={correction.id}><div><strong>{correction.wrongText}</strong><span>→</span><strong>{correction.correctText}</strong></div><small>确认 {correction.confirmations} 次 · {correction.enabled ? '已生效' : '已停用'}</small><button type="button" disabled={busy} onClick={() => void setCorrectionEnabled(correction)}>{correction.enabled ? '停用' : '重新启用'}</button></div>)}</div>{corrections.length === 0 && <div className="review-empty">修正转录后可沉淀主播专属词库</div>}</aside></div></> : <div className="review-empty history-empty"><History size={20} />选择一场直播查看音频与文案</div>}</section></div>
     {message && <div className="review-message">{message}</div>}
   </section></div>;
 }
@@ -869,9 +939,30 @@ function Waveform({ active }: { active: boolean }) {
   return <div className={`waveform ${active ? 'active' : ''}`} aria-hidden="true">{Array.from({ length: 32 }, (_, index) => <i key={index} style={{ '--bar': `${16 + ((index * 13) % 24)}%`, '--delay': `${index * 35}ms` } as React.CSSProperties} />)}</div>;
 }
 
-function SpeakerTag({ speaker = 'host', onClick }: { speaker?: SpeakerLabel; onClick?: () => void }) {
+function speakerLetter(speakerId?: string): string {
+  const match = /^speaker-(\d+)$/u.exec(speakerId ?? '');
+  if (!match) return '';
+  return String.fromCharCode(64 + Number(match[1]));
+}
+
+function speakerCaption(speaker: SpeakerLabel = 'host', speakerId?: string, source?: SpeakerSource): string {
+  const letter = speakerLetter(speakerId);
+  if (source === 'automatic') return `发言人 ${letter || '?'} · 待确认`;
+  if (speaker === 'other') return `其他人${letter ? ` ${letter}` : ''}`;
+  return '主播';
+}
+
+function SpeakerTag({ speaker = 'host', speakerId, speakerSource, onClick }: { speaker?: SpeakerLabel; speakerId?: string; speakerSource?: SpeakerSource; onClick?: () => void }) {
   const isOther = speaker === 'other';
-  return <button type="button" className={`speaker-tag ${isOther ? 'other' : 'host'}`} onClick={onClick} title="标记说话人"><>{isOther ? <UsersRound size={11} /> : <UserRound size={11} />}</>{isOther ? '其他人' : '主播'}</button>;
+  const automatic = speakerSource === 'automatic';
+  return <button type="button" className={`speaker-tag ${isOther ? 'other' : 'host'} ${automatic ? 'automatic' : ''} speaker-${speakerLetter(speakerId).toLowerCase()}`} onClick={onClick} title={automatic ? '点击确认这位发言人身份' : '点击切换说话人身份'}><>{isOther || automatic ? <UsersRound size={11} /> : <UserRound size={11} />}</>{speakerCaption(speaker, speakerId, speakerSource)}</button>;
+}
+
+function toggleSpeaker(segment: Pick<TranscriptSegment, 'speaker' | 'speakerSource'>): SpeakerLabel {
+  // The first click confirms the system's candidate as the host. A second
+  // click can then move the same candidate to the other-speaker role.
+  if (segment.speakerSource === 'automatic') return 'host';
+  return segment.speaker === 'other' ? 'host' : 'other';
 }
 
 function transcriptMarkup(text: string, result: Pick<ComplianceResult, 'risk' | 'matchedTerms'> | null | undefined) {
@@ -896,10 +987,17 @@ function TranscriptStage({ state, send }: { state: SessionState; send: (message:
   const [draft, setDraft] = useState('');
   const lastFinal = state.transcriptHistory[state.transcriptHistory.length - 1];
   const latestIsCurrent = lastFinal && lastFinal.timestamp >= state.productContextStartedAt;
+  const speakerGroups = [...state.transcriptHistory.reduce((groups, segment) => {
+    const key = segment.speakerId ?? segment.speaker ?? 'host';
+    const current = groups.get(key);
+    groups.set(key, { segment, count: (current?.count ?? 0) + 1 });
+    return groups;
+  }, new Map<string, { segment: TranscriptSegment; count: number }>()).values()];
   return <section className="stage-section transcript-stage">
     <div className="section-heading"><div><span className="section-kicker">豆包大模型流式语音识别 <span>ASR</span></span><h1>{state.partialTranscript || (latestIsCurrent ? lastFinal?.text : null) || '等待主播开口'}</h1></div><div className="asr-badge"><span className="signal-dot on" />{state.isListening ? '流式语音识别中' : '待识别'}</div></div>
     <Waveform active={state.isListening} />
-    <div className="transcript-feed">{state.transcriptHistory.slice(-4).map((segment, index) => { const compliance = state.alerts.find((alert) => alert.segmentId === segment.id); return <div className={`feed-line ${index === state.transcriptHistory.slice(-4).length - 1 ? 'current' : ''} ${compliance?.risk ?? ''}`} key={segment.id}><time><span>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span><em>{formatTranscriptOffset(segment.offsetMs)}</em><SpeakerTag speaker={segment.speaker} onClick={() => send({ type: 'transcript.speaker', segmentId: segment.id, speaker: segment.speaker === 'other' ? 'host' : 'other' })} /></time>{editingId === segment.id ? <form className="transcript-edit" onSubmit={(event) => { event.preventDefault(); if (draft.trim()) { send({ type: 'transcript.correct', segmentId: segment.id, text: draft.trim(), learn: true }); setEditingId(null); } }}><input value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><button type="submit" title="保存并学习纠错"><Save size={13} /></button><button type="button" title="取消纠错" onClick={() => setEditingId(null)}>×</button></form> : <><span>{transcriptMarkup(segment.text, compliance)}</span>{segment.isFinal && <button type="button" className="transcript-edit-button" title="纠正这句转录" onClick={() => { setEditingId(segment.id); setDraft(segment.text); }}><Pencil size={12} /></button>}</>}</div>; })}</div>
+    {speakerGroups.length > 0 && <div className="speaker-groups" aria-label="本场发言人"><span>本场发言人</span>{speakerGroups.map(({ segment, count }) => <button type="button" key={segment.speakerId ?? segment.speaker} className={`speaker-group ${segment.speakerSource === 'automatic' ? 'automatic' : ''}`} onClick={() => send({ type: 'transcript.speaker', segmentId: segment.id, speaker: toggleSpeaker(segment), speakerId: segment.speakerId })} title="点击确认或切换该发言人身份"><i />{speakerCaption(segment.speaker, segment.speakerId, segment.speakerSource)} <em>{count}句</em></button>)}</div>}
+    <div className="transcript-feed">{state.transcriptHistory.slice(-4).map((segment, index) => { const compliance = state.alerts.find((alert) => alert.segmentId === segment.id); return <div className={`feed-line ${index === state.transcriptHistory.slice(-4).length - 1 ? 'current' : ''} ${compliance?.risk ?? ''}`} key={segment.id}><time><span>{new Date(segment.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span><em>{formatTranscriptOffset(segment.offsetMs)}</em><SpeakerTag speaker={segment.speaker} speakerId={segment.speakerId} speakerSource={segment.speakerSource} onClick={() => send({ type: 'transcript.speaker', segmentId: segment.id, speaker: toggleSpeaker(segment), speakerId: segment.speakerId })} /></time>{editingId === segment.id ? <form className="transcript-edit" onSubmit={(event) => { event.preventDefault(); if (draft.trim()) { send({ type: 'transcript.correct', segmentId: segment.id, text: draft.trim(), learn: true }); setEditingId(null); } }}><input value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><button type="submit" title="保存并学习纠错"><Save size={13} /></button><button type="button" title="取消纠错" onClick={() => setEditingId(null)}>×</button></form> : <><span>{transcriptMarkup(segment.text, compliance)}</span>{segment.isFinal && <button type="button" className="transcript-edit-button" title="纠正这句转录" onClick={() => { setEditingId(segment.id); setDraft(segment.text); }}><Pencil size={12} /></button>}</>}</div>; })}</div>
   </section>;
 }
 
@@ -1118,7 +1216,8 @@ function DisplayScreen() {
   const coachLatency = suggestions.find((suggestion) => suggestion.latencyMs !== undefined)?.latencyMs;
   const riskAlternative = promptCompliance && promptCompliance.risk !== 'safe' ? promptCompliance.alternative.replace(/^可以改为：/u, '') : '';
   const streamingText = session.state.partialTranscript || latestTranscript?.text || '等待主播开口';
-  const streamingSpeaker = session.state.partialTranscript ? 'host' : latestTranscript?.speaker ?? 'host';
+  const streamingSpeaker = session.state.partialTranscript ? undefined : latestTranscript;
+  const streamingSpeakerCaption = session.state.partialTranscript ? '发言人识别中' : speakerCaption(streamingSpeaker?.speaker, streamingSpeaker?.speakerId, streamingSpeaker?.speakerSource);
   const streamingTime = session.state.partialTranscript
     ? '识别中'
     : latestTranscript ? new Date(latestTranscript.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '待识别';
@@ -1127,7 +1226,7 @@ function DisplayScreen() {
     <main className="display-main">
       <div className="display-product"><img src={session.state.product.image} alt="" /><div><span className="eyebrow">ON AIR PRODUCT · {session.state.product.category}</span><h1>{session.state.product.name}</h1><strong>{session.state.product.price}</strong></div><div className="display-live"><span className={`signal-dot ${session.state.isListening ? 'on' : ''}`} />{captureLabel}</div></div>
       <section className={`display-live-transcript ${session.state.partialTranscript ? 'partial' : ''}`}>
-        <header><div><span className="eyebrow">流式话术转录</span><strong>{streamingTime}</strong></div><span className={`display-transcript-speaker ${streamingSpeaker}`}>{streamingSpeaker === 'other' ? <UsersRound size={12} /> : <UserRound size={12} />}{streamingSpeaker === 'other' ? '其他人' : '主播'}</span></header>
+        <header><div><span className="eyebrow">流式话术转录</span><strong>{streamingTime}</strong></div><span className={`display-transcript-speaker ${streamingSpeaker?.speaker === 'other' ? 'other' : ''} ${streamingSpeaker?.speakerSource === 'automatic' ? 'automatic' : ''}`}>{streamingSpeaker?.speakerSource === 'automatic' ? <UsersRound size={12} /> : streamingSpeaker?.speaker === 'other' ? <UsersRound size={12} /> : <UserRound size={12} />}{streamingSpeakerCaption}</span></header>
         <p>{transcriptMarkup(streamingText, session.state.partialTranscript ? null : result)}</p>
       </section>
       <section className="display-coach-cues">

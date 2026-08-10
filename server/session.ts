@@ -11,6 +11,7 @@ import { createDoubaoCoach, localSuggestions, type CoachInput, type CoachProvide
 import type { RuleCatalog } from './ruleCatalog';
 import type { PresenterPhraseLibrary } from './presenterPhraseLibrary';
 import { deriveSpeechCorrection, type SpeechCorrectionCatalog } from './speechCorrectionCatalog';
+import { SpeakerDiarizer } from './speakerDiarizer';
 import { DEFAULT_PRODUCT, PRODUCTS } from '../src/shared/products';
 import type {
   CaptureState,
@@ -22,6 +23,7 @@ import type {
   SessionStats,
   TranscriptSegment,
   PresenterProfile,
+  SpeakerLabel,
 } from '../src/shared/types';
 
 type Client = { socket: WebSocket; role: 'operator' | 'display' };
@@ -41,6 +43,7 @@ type LiveSessionOptions = {
   riskProfile?: RiskProfile;
   phraseLibrary?: PresenterPhraseLibrary;
   presenter?: PresenterProfile;
+  historicalEdit?: boolean;
 };
 
 const AUDIO_CHUNK_BYTES = 256 * 1024;
@@ -50,6 +53,14 @@ const SPEECH_RECOVERY_STABLE_MS = 30_000;
 
 function isNextPacketTimeout(error: Error): boolean {
   return /45000081|Timeout waiting next packet|waiting next packet timeout/iu.test(error.message);
+}
+
+function isRecoverableSpeechDisconnect(error: Error): boolean {
+  // The provider may close a long-lived stream without returning 45000081.
+  // Treat transport-level disconnects as transient, but leave quota,
+  // authentication, and malformed-request errors on the hard-failure path.
+  return /连接已断开|socket hang up|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|abnormal closure|code\s*1006/iu.test(error.message)
+    && !/450000(01|02|81|92)|quota exceeded|鉴权|authentication|unauthori[sz]ed|invalid request/iu.test(error.message);
 }
 
 function speechFailurePayload(error: Error): Record<string, unknown> {
@@ -71,6 +82,9 @@ function speechFailureMessage(error: Error): string {
   }
   if (isNextPacketTimeout(error)) {
     return '豆包大模型流式语音识别连续恢复失败，本场已暂停。请确认网络和麦克风正常后，再点击“继续收音”。';
+  }
+  if (isRecoverableSpeechDisconnect(error)) {
+    return '豆包大模型流式语音识别连接多次中断，自动恢复已达到上限，本场已暂停。请检查网络后，再点击“继续收音”。';
   }
   return '豆包大模型流式语音识别连接异常，本场已暂停。请确认网络正常后，再点击“继续收音”。';
 }
@@ -112,10 +126,14 @@ export class LiveSession {
   private readonly speechCorrectionCatalog?: SpeechCorrectionCatalog;
   private readonly archiveQueue?: RecordingArchiveQueue;
   private readonly actorId: string;
+  private readonly historicalEdit: boolean;
   private readonly now: () => number;
   private recordingStartedAt: number | null = null;
   private currentCaptureOffsetMs: number | null = null;
   private currentCaptureSampleOffset = 0;
+  private currentStreamAudioBytes = 0;
+  private readonly speakerDiarizer = new SpeakerDiarizer();
+  private readonly speakerBindings = new Map<string, SpeakerLabel>();
   private audioWriteQueue: Promise<void> = Promise.resolve();
   private pendingAsrAudioBytes = 0;
   private pendingAsrChunk: Buffer[] = [];
@@ -137,6 +155,7 @@ export class LiveSession {
     this.streamingAsrFactory = options.streamingAsrFactory ?? createDoubaoStreamingAsr;
     this.roomId = options.roomId ?? 'room-default';
     this.actorId = options.actorId ?? 'owner';
+    this.historicalEdit = options.historicalEdit === true;
     this.now = options.now ?? Date.now;
     const persistedTiming = this.timelineStore?.getSessionTiming(id) ?? { createdAt: null, recordingStartedAt: null };
     this.createdAt = persistedTiming.createdAt ?? this.now();
@@ -271,6 +290,10 @@ export class LiveSession {
 
   startListening(): void {
     if (this.stateValue.isListening || this.stateValue.captureState === 'ended') return;
+    if (this.stateValue.captureState === 'idle') {
+      this.speakerDiarizer.reset();
+      if (this.stateValue.transcriptHistory.length === 0) this.speakerBindings.clear();
+    }
     this.flushAudioBuffers();
     this.cancelSpeechRecovery(true);
     const captureEvent = this.stateValue.captureState === 'paused' ? 'capture.resumed' : 'capture.started';
@@ -280,6 +303,7 @@ export class LiveSession {
     this.recordingStartedAt ??= occurredAt;
     this.currentCaptureOffsetMs = this.offsetAt(occurredAt);
     this.currentCaptureSampleOffset = Math.floor(this.currentAsrAudioByteLength() / 2);
+    this.currentStreamAudioBytes = 0;
     this.stateValue.isListening = true;
     this.stateValue.captureState = 'live';
     this.stateValue.lastEventAt = occurredAt;
@@ -377,7 +401,7 @@ export class LiveSession {
     this.stateValue.captureState = 'ended';
     this.recordCaptureBoundary('capture.ended', occurredAt);
     this.audioWriteQueue = this.audioWriteQueue.then(() => {
-      this.timelineStore?.finalizeAudio(this.id);
+      this.timelineStore?.finalizeSession(this.id);
       this.archiveQueue?.enqueue(this.id);
     });
     void this.audioWriteQueue.catch((error: unknown) => this.status(`音频切片合成失败：${error instanceof Error ? error.message : String(error)}`, 'error'));
@@ -417,6 +441,9 @@ export class LiveSession {
 
   ingestAudio(audio: Buffer): void {
     if (!this.stateValue.isListening) return;
+    const audioStartOffsetMs = this.currentCaptureOffsetMs === null
+      ? null
+      : this.currentCaptureOffsetMs + (this.currentStreamAudioBytes / 32);
     if (this.speechStream) this.speechStream.sendAudio(audio);
     if (this.speechRecoveryStartedAt !== null && !this.speechStreamReady && audio.length > 0) {
       const available = Math.max(0, RECOVERY_AUDIO_MAX_BYTES - this.recoveryAudioBytes);
@@ -426,6 +453,8 @@ export class LiveSession {
         this.recoveryAudioBytes += buffered.length;
       }
     }
+    this.speakerDiarizer.pushAudio(audio, audioStartOffsetMs);
+    this.currentStreamAudioBytes += audio.length;
     if (!this.timelineStore || audio.length === 0) return;
     this.pendingAsrAudioBytes += audio.length;
     this.pendingAsrChunk.push(audio);
@@ -445,7 +474,7 @@ export class LiveSession {
 
   private handleSpeechFailure(error: Error, failedStream: DoubaoStreamingAsr | null, context: string | undefined): void {
     if (!this.stateValue.isListening) return;
-    if (isNextPacketTimeout(error) && this.speechRecoveryAttempt < SPEECH_RECOVERY_DELAYS_MS.length) {
+    if ((isNextPacketTimeout(error) || isRecoverableSpeechDisconnect(error)) && this.speechRecoveryAttempt < SPEECH_RECOVERY_DELAYS_MS.length) {
       this.beginSpeechRecovery(error, failedStream, context);
       return;
     }
@@ -545,6 +574,9 @@ export class LiveSession {
     const receivedOffsetMs = this.offsetAt(occurredAt);
     const startOffsetMs = timing.startTimeMs === undefined || this.currentCaptureOffsetMs === null ? null : this.currentCaptureOffsetMs + timing.startTimeMs;
     const endOffsetMs = timing.endTimeMs === undefined || this.currentCaptureOffsetMs === null ? receivedOffsetMs : this.currentCaptureOffsetMs + timing.endTimeMs;
+    const automaticSpeaker = isFinal ? this.speakerDiarizer.assign(startOffsetMs, endOffsetMs, receivedOffsetMs ?? occurredAt) : null;
+    const speakerId = automaticSpeaker?.speakerId;
+    const boundSpeaker = speakerId ? this.speakerBindings.get(speakerId) : undefined;
     const segment: TranscriptSegment = {
       id: `segment-${this.segmentNumber++}`,
       text,
@@ -553,7 +585,8 @@ export class LiveSession {
       offsetMs: endOffsetMs,
       startOffsetMs,
       endOffsetMs,
-      speaker: 'host',
+      speaker: boundSpeaker ?? 'host',
+      ...(speakerId ? { speakerId, speakerSource: boundSpeaker ? 'manual' : automaticSpeaker?.source, speakerConfidence: boundSpeaker ? 1 : automaticSpeaker?.confidence } : {}),
     };
     this.stateValue.lastEventAt = occurredAt;
     if (!isFinal) {
@@ -581,6 +614,7 @@ export class LiveSession {
       startOffsetMs,
       endOffsetMs,
       speaker: segment.speaker,
+      ...(segment.speakerId ? { speakerId: segment.speakerId, speakerSource: segment.speakerSource, speakerConfidence: segment.speakerConfidence } : {}),
       audioStartSample: timing.startTimeMs === undefined ? null : this.currentCaptureSampleOffset + Math.round((timing.startTimeMs / 1000) * 16000),
       audioEndSample: timing.endTimeMs === undefined ? null : this.currentCaptureSampleOffset + Math.round((timing.endTimeMs / 1000) * 16000),
     });
@@ -637,20 +671,32 @@ export class LiveSession {
     });
     if (index >= 0) this.broadcast({ type: 'transcript.final', segment: corrected });
     this.broadcast({ type: 'state.snapshot', state: this.state });
-    this.enqueueCompliance(corrected);
+    if (this.stateValue.captureState === 'ended' || this.historicalEdit) {
+      this.timelineStore?.refreshTranscriptSnapshot(this.id);
+      this.archiveQueue?.resync?.(this.id);
+    } else {
+      this.enqueueCompliance(corrected);
+    }
     return corrected;
   }
 
-  annotateSpeaker(segmentId: string, speaker: 'host' | 'other', actorId = this.actorId): TranscriptSegment | null {
+  annotateSpeaker(segmentId: string, speaker: SpeakerLabel, actorId = this.actorId, speakerId?: string): TranscriptSegment | null {
     const index = this.stateValue.transcriptHistory.findIndex((segment) => segment.id === segmentId && segment.isFinal);
     const original = index >= 0 ? this.stateValue.transcriptHistory[index] : this.findPersistedTranscript(segmentId);
     if (!original) return null;
-    if (original.speaker === speaker) return original;
+    const boundSpeakerId = speakerId ?? original.speakerId;
+    if (original.speaker === speaker && (!boundSpeakerId || original.speakerSource === 'manual')) return original;
+    if (boundSpeakerId) this.speakerBindings.set(boundSpeakerId, speaker);
     const annotatedAt = this.now();
-    const annotated = { ...original, speaker };
+    const annotated = { ...original, speaker, ...(boundSpeakerId ? { speakerId: boundSpeakerId, speakerSource: 'manual' as const, speakerConfidence: 1 } : {}) };
     if (index >= 0) {
       const history = [...this.stateValue.transcriptHistory];
-      history[index] = annotated;
+      for (let historyIndex = 0; historyIndex < history.length; historyIndex += 1) {
+        const candidate = history[historyIndex];
+        history[historyIndex] = (historyIndex === index || (boundSpeakerId && candidate.speakerId === boundSpeakerId))
+          ? { ...candidate, speaker, ...(boundSpeakerId ? { speakerId: boundSpeakerId } : {}), speakerSource: 'manual', speakerConfidence: 1 }
+          : candidate;
+      }
       this.stateValue.transcriptHistory = history;
     }
     this.stateValue.lastEventAt = annotatedAt;
@@ -658,9 +704,17 @@ export class LiveSession {
       segmentId,
       speaker,
       actorId,
+      ...(boundSpeakerId ? { speakerId: boundSpeakerId } : {}),
     });
-    if (index >= 0) this.broadcast({ type: 'transcript.final', segment: annotated });
+    if (index >= 0) {
+      const changed = this.stateValue.transcriptHistory.filter((candidate) => candidate.id === segmentId || (boundSpeakerId && candidate.speakerId === boundSpeakerId));
+      for (const candidate of changed) this.broadcast({ type: 'transcript.final', segment: candidate });
+    }
     this.broadcast({ type: 'state.snapshot', state: this.state });
+    if (!this.stateValue.isListening) {
+      this.timelineStore?.refreshTranscriptSnapshot(this.id);
+      this.archiveQueue?.resync?.(this.id);
+    }
     return annotated;
   }
 
@@ -669,6 +723,10 @@ export class LiveSession {
     let segment: TranscriptSegment | null = null;
     for (const event of events) {
       if (event.type === 'transcript.final' && event.payload.segmentId === segmentId && typeof event.payload.text === 'string') {
+        const persistedSpeakerId = typeof event.payload.speakerId === 'string' ? event.payload.speakerId : undefined;
+        const persistedSpeakerSource = event.payload.speakerSource === 'automatic' || event.payload.speakerSource === 'manual' || event.payload.speakerSource === 'default'
+          ? event.payload.speakerSource
+          : undefined;
         segment = {
           id: segmentId,
           text: event.payload.text,
@@ -678,14 +736,24 @@ export class LiveSession {
           startOffsetMs: typeof event.payload.startOffsetMs === 'number' ? event.payload.startOffsetMs : null,
           endOffsetMs: typeof event.payload.endOffsetMs === 'number' ? event.payload.endOffsetMs : event.offsetMs,
           speaker: event.payload.speaker === 'other' ? 'other' : 'host',
+          ...(persistedSpeakerId ? { speakerId: persistedSpeakerId } : {}),
+          ...(persistedSpeakerSource ? { speakerSource: persistedSpeakerSource } : {}),
+          ...(typeof event.payload.speakerConfidence === 'number' ? { speakerConfidence: event.payload.speakerConfidence } : {}),
         };
       }
       if (segment && event.type === 'transcript.corrected' && event.payload.segmentId === segmentId && typeof event.payload.correctedText === 'string') {
         segment = { ...segment, text: event.payload.correctedText };
       }
       if (segment && event.type === 'transcript.annotated' && event.payload.segmentId === segmentId) {
-        segment = { ...segment, speaker: event.payload.speaker === 'other' ? 'other' : 'host' };
+        segment = { ...segment, speaker: event.payload.speaker === 'other' ? 'other' : 'host', speakerSource: 'manual', speakerConfidence: 1 };
+        if (typeof event.payload.speakerId === 'string') {
+          segment = { ...segment, speakerId: event.payload.speakerId, speakerSource: 'manual', speakerConfidence: 1 };
+          this.speakerBindings.set(event.payload.speakerId, segment.speaker!);
+        }
       }
+    }
+    if (segment?.speakerId && this.speakerBindings.has(segment.speakerId)) {
+      segment = { ...segment, speaker: this.speakerBindings.get(segment.speakerId)!, speakerSource: 'manual', speakerConfidence: 1 };
     }
     return segment;
   }
@@ -711,7 +779,11 @@ export class LiveSession {
     const maxSegments = profile === 'strict' ? 20 : profile === 'optimized' ? 8 : 12;
     const windowStartMs = Math.max(this.stateValue.productContextStartedAt, segment.timestamp - windowMs);
     const segments = this.stateValue.transcriptHistory
-      .filter((candidate) => candidate.isFinal && candidate.speaker !== 'other' && candidate.timestamp >= windowStartMs && candidate.timestamp <= segment.timestamp)
+      .filter((candidate) => candidate.isFinal
+        && candidate.speaker === 'host'
+        && candidate.speakerSource !== 'automatic'
+        && candidate.timestamp >= windowStartMs
+        && candidate.timestamp <= segment.timestamp)
       .slice(-maxSegments);
     return {
       text: segments.map((candidate) => candidate.text).join('\n').slice(-4_000),
@@ -893,6 +965,10 @@ export class LiveSession {
         const segmentId = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
         const text = typeof event.payload.text === 'string' ? event.payload.text : '';
         if (!segmentId || !text) continue;
+        const restoredSpeakerId = typeof event.payload.speakerId === 'string' ? event.payload.speakerId : undefined;
+        const restoredSpeakerSource = event.payload.speakerSource === 'automatic' || event.payload.speakerSource === 'manual' || event.payload.speakerSource === 'default'
+          ? event.payload.speakerSource
+          : undefined;
         transcripts.set(segmentId, {
           id: segmentId,
           text,
@@ -902,6 +978,9 @@ export class LiveSession {
           startOffsetMs: typeof event.payload.startOffsetMs === 'number' ? event.payload.startOffsetMs : null,
           endOffsetMs: typeof event.payload.endOffsetMs === 'number' ? event.payload.endOffsetMs : event.offsetMs,
           speaker: event.payload.speaker === 'other' ? 'other' : 'host',
+          ...(restoredSpeakerId ? { speakerId: restoredSpeakerId } : {}),
+          ...(restoredSpeakerSource ? { speakerSource: restoredSpeakerSource } : {}),
+          ...(typeof event.payload.speakerConfidence === 'number' ? { speakerConfidence: event.payload.speakerConfidence } : {}),
         });
         const match = /^segment-(\d+)$/u.exec(segmentId);
         if (match) this.segmentNumber = Math.max(this.segmentNumber, Number(match[1]) + 1);
@@ -914,6 +993,14 @@ export class LiveSession {
           transcripts.set(segmentId, { ...existing, text: correctedText });
           results.delete(segmentId);
         }
+      }
+      if (event.type === 'transcript.annotated') {
+        const segmentId = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
+        const existing = transcripts.get(segmentId);
+        const speakerId = typeof event.payload.speakerId === 'string' ? event.payload.speakerId : existing?.speakerId;
+        const speaker: SpeakerLabel = event.payload.speaker === 'other' ? 'other' : 'host';
+        if (speakerId) this.speakerBindings.set(speakerId, speaker);
+        if (existing) transcripts.set(segmentId, { ...existing, speaker, ...(speakerId ? { speakerId, speakerSource: 'manual', speakerConfidence: 1 } : {}) });
       }
       if (event.type === 'compliance.result') {
         const segmentId = typeof event.payload.transcriptSegmentId === 'string' ? event.payload.transcriptSegmentId : '';
@@ -960,7 +1047,11 @@ export class LiveSession {
       }
     }
 
-    const allTranscripts = [...transcripts.values()].sort((first, second) => first.timestamp - second.timestamp);
+    const allTranscripts = [...transcripts.values()]
+      .map((segment) => segment.speakerId && this.speakerBindings.has(segment.speakerId)
+        ? { ...segment, speaker: this.speakerBindings.get(segment.speakerId)!, speakerSource: 'manual' as const, speakerConfidence: 1 }
+        : segment)
+      .sort((first, second) => first.timestamp - second.timestamp);
     const allResults = [...results.values()].sort((first, second) => first.createdAt - second.createdAt);
     this.stateValue.product = this.stateValue.lineup.find((product) => product.id === selectedProductId) ?? this.stateValue.product;
     this.stateValue.captureState = captureState;

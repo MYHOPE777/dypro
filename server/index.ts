@@ -25,7 +25,7 @@ import { createDoubaoAnalyzer } from './services';
 import { getArkKnowledgeSearchStatus } from './providers/ark';
 import { getArkConfig, requestArk } from './providers/ark';
 import { parseArkJson } from './providers/doubao';
-import type { ClientMessage, ComplianceRuleScope, CoachPurpose, RiskLevel, Product } from '../src/shared/types';
+import type { ClientMessage, ComplianceRuleScope, CoachPurpose, RiskLevel, Product, SessionHistorySummary } from '../src/shared/types';
 
 const app = express();
 const server = http.createServer(app);
@@ -145,7 +145,8 @@ function isClientMessage(value: unknown): value is ClientMessage {
         && (message.correctText === undefined || (typeof message.correctText === 'string' && message.correctText.length <= 80));
     case 'transcript.speaker':
       return typeof message.segmentId === 'string' && message.segmentId.length <= 128
-        && (message.speaker === 'host' || message.speaker === 'other');
+        && (message.speaker === 'host' || message.speaker === 'other')
+        && (message.speakerId === undefined || (typeof message.speakerId === 'string' && /^speaker-[1-4]$/u.test(message.speakerId)));
     default:
       return false;
   }
@@ -278,6 +279,28 @@ function persistedSessionRoomId(sessionId: string): string | null {
   return typeof roomId === 'string' ? roomId : null;
 }
 
+function editableSession(sessionId: string, actorId: string): LiveSession | null {
+  const active = sessions.get(sessionId);
+  if (active) return active;
+  const timeline = timelineStore.exportSession(sessionId);
+  if (!timeline) return null;
+  const created = timeline.events.find((event) => event.type === 'session.created');
+  const roomId = typeof created?.payload.roomId === 'string' ? created.payload.roomId : 'room-default';
+  const presenterEvent = timeline.events.filter((event) => event.type === 'session.created' || event.type === 'presenter.selected').at(-1);
+  const presenterId = typeof presenterEvent?.payload.presenterId === 'string' ? presenterEvent.payload.presenterId : undefined;
+  const presenter = presenterId ? phraseLibrary.getPresenter(presenterId) ?? undefined : undefined;
+  return new LiveSession(sessionId, { timelineStore, productCatalog, ruleCatalog, speechCorrectionCatalog, phraseLibrary, presenter, archiveQueue: recordingArchiveQueue, analyzer: complianceAnalyzer, roomId, actorId, historicalEdit: true });
+}
+
+function historySummary(summary: SessionHistorySummary): SessionHistorySummary {
+  const active = sessions.get(summary.sessionId);
+  return {
+    ...summary,
+    ...(active ? { captureState: active.state.captureState, updatedAt: Math.max(summary.updatedAt, active.state.lastEventAt) } : {}),
+    sync: recordingArchiveQueue.sessionStatus(summary.sessionId),
+  };
+}
+
 const requireSessionAccess: express.RequestHandler = (request, response, next) => {
   try {
     const sessionId = routeParam(request, 'id');
@@ -351,6 +374,11 @@ app.get('/api/readiness', (_request, response) => {
 
 app.get('/api/rules/sync/status', requireOperator, (_request, response) => response.json(ruleSyncQueue.status()));
 app.get('/api/phrases/sync/status', requireOperator, (_request, response) => response.json(phraseSyncQueue.status()));
+
+app.get('/api/rooms/:roomId/sessions', requireOperator, requireRoomAccess, (request, response) => {
+  const roomId = routeParam(request, 'roomId');
+  return response.json(timelineStore.listSessions(roomId).map(historySummary));
+});
 
 app.get('/api/knowledge/status', requireOperator, (_request, response) => response.json({ knowledge: getArkKnowledgeSearchStatus(process.env) }));
 
@@ -626,16 +654,52 @@ app.get('/api/session/:id/timeline.jsonl', requireOperator, requireSessionAccess
   return response.send(jsonLines);
 });
 
+app.get('/api/session/:id/transcript.txt', requireOperator, requireSessionAccess, (request, response) => {
+  const sessionId = routeParam(request, 'id');
+  let transcript = timelineStore.readTranscript(sessionId);
+  if (transcript === null) {
+    try {
+      timelineStore.refreshTranscriptSnapshot(sessionId);
+      transcript = timelineStore.readTranscript(sessionId);
+    } catch {
+      transcript = null;
+    }
+  }
+  if (transcript === null) return response.status(404).json({ message: '本地文案不存在' });
+  response.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  response.setHeader('Content-Disposition', `attachment; filename="${sessionId}.transcript.txt"`);
+  return response.send(transcript);
+});
+
+app.patch('/api/session/:id/note', requireOperator, requireSessionAccess, (request, response) => {
+  if (typeof request.body?.note !== 'string') return response.status(400).json({ message: '请提供场次备注' });
+  const note = request.body.note.trim();
+  if (note.length > 1_000) return response.status(400).json({ message: '场次备注不能超过 1000 个字符' });
+  const sessionId = routeParam(request, 'id');
+  if (sessions.get(sessionId)?.state.isListening) return response.status(409).json({ message: '直播收音中，请下播后再修改场次备注' });
+  try {
+    timelineStore.updateSessionNote(sessionId, note, actorFromRequest(request));
+    recordingArchiveQueue.resync(sessionId);
+    const roomId = persistedSessionRoomId(sessionId);
+    const summary = roomId ? timelineStore.listSessions(roomId).find((candidate) => candidate.sessionId === sessionId) : undefined;
+    return summary ? response.json(historySummary(summary)) : response.status(404).json({ message: '直播记录不存在' });
+  } catch (error) {
+    return response.status(400).json({ message: error instanceof Error ? error.message : '场次备注保存失败' });
+  }
+});
+
 app.patch('/api/session/:id/transcripts/:segmentId', requireOperator, requireSessionAccess, (request, response) => {
   const text = typeof request.body?.text === 'string' ? request.body.text.trim() : '';
   const speaker = request.body?.speaker === 'host' || request.body?.speaker === 'other' ? request.body.speaker : undefined;
+  const speakerId = typeof request.body?.speakerId === 'string' && /^speaker-[1-4]$/u.test(request.body.speakerId) ? request.body.speakerId : undefined;
   if (request.body?.speaker !== undefined && !speaker) return response.status(400).json({ message: '说话人标记只能是主播或其他人' });
+  if (request.body?.speakerId !== undefined && !speakerId) return response.status(400).json({ message: '说话人编号无效' });
   if (!text && !speaker) return response.status(400).json({ message: '请提供转录修正内容或说话人标记' });
   if (text.length > 2_000) return response.status(400).json({ message: '修正后的转录不能超过 2000 个字符' });
   const wrongText = typeof request.body?.wrongText === 'string' ? request.body.wrongText.trim() : undefined;
   const correctText = typeof request.body?.correctText === 'string' ? request.body.correctText.trim() : undefined;
   if ((wrongText && wrongText.length > 80) || (correctText && correctText.length > 80)) return response.status(400).json({ message: '单个纠错词不能超过 80 个字符' });
-  const session = sessions.get(routeParam(request, 'id'));
+  const session = editableSession(routeParam(request, 'id'), actorFromRequest(request));
   if (!session) return response.status(404).json({ message: '直播会话尚未载入' });
   try {
     const segmentId = routeParam(request, 'segmentId');
@@ -644,7 +708,7 @@ app.patch('/api/session/:id/transcripts/:segmentId', requireOperator, requireSes
       wrongText,
       correctText,
     }) : null;
-    const segment = speaker ? session.annotateSpeaker(segmentId, speaker, actorFromRequest(request)) : corrected;
+    const segment = speaker ? session.annotateSpeaker(segmentId, speaker, actorFromRequest(request), speakerId) : corrected;
     return segment ? response.json({ segment }) : response.status(404).json({ message: '转录片段不存在' });
   } catch (error) {
     return response.status(400).json({ message: error instanceof Error ? error.message : '转录纠错失败' });
@@ -809,7 +873,7 @@ wsServer.on('connection', (socket: WebSocket, request) => {
           session.correctTranscript(message.segmentId, message.text, actorId, message);
           break;
         case 'transcript.speaker':
-          session.annotateSpeaker(message.segmentId, message.speaker, actorId);
+          session.annotateSpeaker(message.segmentId, message.speaker, actorId, message.speakerId);
           break;
         default:
           break;

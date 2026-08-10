@@ -295,6 +295,33 @@ describe('LiveSession', () => {
     }
   });
 
+  it('recovers from an unexpected ASR websocket close without pausing capture', () => {
+    vi.useFakeTimers();
+    try {
+      const streamOptions: StreamingAsrOptions[] = [];
+      const streams: Array<{ connect: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }> = [];
+      const streamingAsrFactory = (options: StreamingAsrOptions) => {
+        streamOptions.push(options);
+        const stream = { connect: vi.fn(), finish: vi.fn(), close: vi.fn(), sendAudio: vi.fn() };
+        streams.push(stream);
+        return stream as unknown as DoubaoStreamingAsr;
+      };
+      const session = new LiveSession('asr-unexpected-close-session', { streamingAsrFactory });
+
+      session.startListening();
+      streamOptions[0]?.onError(new Error('豆包大模型流式语音识别连接已断开（Logid close-logid）'));
+      expect(session.state).toMatchObject({ isListening: true, captureState: 'live' });
+      vi.advanceTimersByTime(250);
+
+      expect(streams).toHaveLength(2);
+      expect(streams[0]?.close).toHaveBeenCalledOnce();
+      expect(streams[1]?.connect).toHaveBeenCalledOnce();
+      expect(session.state).toMatchObject({ isListening: true, captureState: 'live' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('replays audio captured while waiting for ASR recovery', () => {
     vi.useFakeTimers();
     try {

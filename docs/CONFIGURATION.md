@@ -222,16 +222,20 @@ SPEECH_CORRECTION_CATALOG_PATH=.data/speech-corrections/catalog.json
 
 网关应按资源 `id + version + action` 幂等处理，再写入火山数据库或知识库。失败任务采用指数退避并在服务重启后继续；云端故障不会阻塞直播。知识库适合保存语义案例和主播参考素材，已发布词级规则仍应保留在本地/业务数据库快路径。
 
-### 2.7 TOS 原始音频归档
+### 2.7 场次文案与音频异步归档
 
-TOS 不直接由实时链路调用。停止收音后，服务端先把会话 manifest POST 到归档网关，再使用网关返回的预签名 URL 流式 PUT 音频文件。
+实时链路始终先把时间线、最终文案和音频保存到本地。停止收音后，服务端再把会话 manifest POST 到归档网关；网关应把文案、备注和时间线写入业务数据库，并返回音频对象存储的预签名 URL。数据库或对象存储不可用时，任务保留在本地队列并后台重试，不阻塞下一场直播。
 
 | 参数 | 类型/默认值 | 是否必填 | 说明 |
 | --- | --- | --- | --- |
+| `SESSION_ARCHIVE_GATEWAY_URL` | HTTP(S) URL | 开启归档必填 | 推荐配置项。接收场次 manifest，负责数据库 upsert 并返回音频上传地址。 |
+| `SESSION_ARCHIVE_GATEWAY_KEY` | 字符串 | 开启归档必填 | 推荐配置项的网关 Bearer 鉴权密钥。 |
 | `TOS_ARCHIVE_GATEWAY_URL` | HTTP(S) URL | 开启归档必填 | 自建/服务区归档网关 manifest 接口，不是 TOS Bucket 地址。 |
 | `TOS_ARCHIVE_GATEWAY_KEY` | 字符串 | 开启归档必填 | 网关 Bearer 鉴权密钥。 |
 | `TOS_ARCHIVE_TIMEOUT_MS` | 毫秒，默认 `10000` | 否 | manifest 和每个音频 PUT 的超时。 |
 | `ARCHIVE_QUEUE_PATH` | 路径 | 否 | 本地归档队列位置，见 2.1。 |
+
+`SESSION_ARCHIVE_GATEWAY_*` 优先于旧的 `TOS_ARCHIVE_GATEWAY_*`，旧配置继续兼容。历史场次备注或转录被修改后，同一 `sessionId` 会重新进入同步队列；网关应按 `sessionId` 幂等更新数据库记录。
 
 manifest 请求体：
 

@@ -20,6 +20,8 @@ type ArchivedSegment = {
   id: string;
   text: string;
   speaker: SpeakerLabel;
+  speakerId?: string;
+  speakerSource?: 'default' | 'automatic' | 'manual';
   productId: string | null;
   occurredAt: number;
 };
@@ -138,11 +140,20 @@ export class FilePresenterPhraseLibrary {
   archiveSession(presenterId: string, timeline: SessionTimelineExport): PresenterPhrase[] {
     const presenter = this.requirePresenter(presenterId);
     const segments = new Map<string, ArchivedSegment>();
+    const speakerBindings = new Map<string, SpeakerLabel>();
     for (const event of timeline.events) {
       if (event.type === 'transcript.final') {
         const id = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
         const text = typeof event.payload.text === 'string' ? event.payload.text.trim() : '';
-        if (id && text) segments.set(id, { id, text, speaker: event.payload.speaker === 'other' ? 'other' : 'host', productId: event.productId, occurredAt: event.occurredAt });
+        if (id && text) segments.set(id, {
+          id,
+          text,
+          speaker: event.payload.speaker === 'other' ? 'other' : 'host',
+          ...(typeof event.payload.speakerId === 'string' ? { speakerId: event.payload.speakerId } : {}),
+          ...(event.payload.speakerSource === 'automatic' || event.payload.speakerSource === 'manual' || event.payload.speakerSource === 'default' ? { speakerSource: event.payload.speakerSource } : {}),
+          productId: event.productId,
+          occurredAt: event.occurredAt,
+        });
       }
       if (event.type === 'transcript.corrected') {
         const id = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
@@ -153,13 +164,19 @@ export class FilePresenterPhraseLibrary {
       if (event.type === 'transcript.annotated') {
         const id = typeof event.payload.segmentId === 'string' ? event.payload.segmentId : '';
         const segment = segments.get(id);
-        if (segment) segments.set(id, { ...segment, speaker: event.payload.speaker === 'other' ? 'other' : 'host' });
+        const speaker: SpeakerLabel = event.payload.speaker === 'other' ? 'other' : 'host';
+        const speakerId = typeof event.payload.speakerId === 'string' ? event.payload.speakerId : segment?.speakerId;
+        if (speakerId) speakerBindings.set(speakerId, speaker);
+        if (segment) segments.set(id, { ...segment, speaker, speakerSource: 'manual', ...(speakerId ? { speakerId } : {}) });
       }
     }
     const archived: PresenterPhrase[] = [];
     const newlyArchived: PresenterPhrase[] = [];
-    for (const segment of segments.values()) {
-      if (segment.speaker !== 'host') continue;
+    for (const originalSegment of segments.values()) {
+      const segment = originalSegment.speakerId && speakerBindings.has(originalSegment.speakerId)
+        ? { ...originalSegment, speaker: speakerBindings.get(originalSegment.speakerId)!, speakerSource: 'manual' as const }
+        : originalSegment;
+      if (segment.speaker !== 'host' || segment.speakerSource === 'automatic') continue;
       const duplicate = this.data.phrases.find((phrase) => phrase.sourceSessionId === timeline.sessionId && phrase.sourceSegmentId === segment.id);
       if (duplicate) {
         archived.push(duplicate);
