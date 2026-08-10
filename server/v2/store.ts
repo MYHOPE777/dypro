@@ -828,6 +828,9 @@ export class SqliteFactStore {
         if (lineup.length) {
           snapshot.lineup = lineup;
           snapshot.product = lineup.find((product) => product.id === snapshot.product.id) ?? snapshot.product;
+          snapshot.latestCompliance = null;
+          snapshot.coachSuggestions = [];
+          snapshot.coachPending = false;
         }
         break;
       }

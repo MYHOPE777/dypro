@@ -190,9 +190,10 @@ function useMicrophone(sendAudio: (pcm: ArrayBuffer | Uint8Array, sampleRate?: n
     }
   }, [deviceId, refreshDevices, sendAudio, stopCapture]);
 
-  const selectDevice = useCallback(async (nextDeviceId: string) => {
+  const selectDevice = useCallback(async (nextDeviceId: string): Promise<boolean> => {
     setDeviceId(nextDeviceId);
-    if (capturing) await start(nextDeviceId);
+    if (capturing) return start(nextDeviceId);
+    return true;
   }, [capturing, start]);
 
   return { capturing, error, devices, deviceId, start, stop: stopCapture, refreshDevices, selectDevice };
@@ -268,13 +269,14 @@ function LiveControls({ snapshot, connected, status, send, sendAudio }: { snapsh
   const [devicePickerOpen, setDevicePickerOpen] = useState(false);
   const selectedDevice = microphone.devices.find((device) => device.deviceId === microphone.deviceId);
   const begin = async () => { if (await microphone.start()) send({ type: snapshot.lifecycle === 'paused' ? 'resume' : 'start' }); };
+  const changeDevice = async (nextDeviceId: string) => { if (!await microphone.selectDevice(nextDeviceId) && snapshot.lifecycle === 'live') send({ type: 'pause' }); };
   const pause = () => { microphone.stop(); send({ type: 'pause' }); };
   const end = () => { microphone.stop(); send({ type: 'end' }); };
   return <div className="v2-live-controls">
     <div className={`v2-connection ${connected ? 'online' : ''}`}><i />{status}</div>
     <div className="v2-device-picker">
       <button type="button" className="device" aria-label={`选择输入设备${selectedDevice?.label ? `，当前 ${selectedDevice.label}` : ''}`} aria-expanded={devicePickerOpen} onClick={() => { setDevicePickerOpen((open) => !open); void microphone.refreshDevices(); }}><Mic size={14} /><span><strong>选择输入设备</strong><small>{selectedDevice?.label || (microphone.deviceId ? '已选择麦克风' : '系统默认麦克风')}</small></span><ChevronDown size={13} /></button>
-      {devicePickerOpen && <div className="v2-device-menu"><label htmlFor="v2-audio-input">收音设备</label><select id="v2-audio-input" value={microphone.deviceId} onChange={(event) => void microphone.selectDevice(event.target.value)}><option value="">系统默认麦克风</option>{microphone.devices.map((device, index) => <option value={device.deviceId} key={device.deviceId}>{device.label || `麦克风 ${index + 1}`}</option>)}</select><button type="button" onClick={() => void microphone.refreshDevices()}><RefreshCw size={12} />刷新设备</button></div>}
+      {devicePickerOpen && <div className="v2-device-menu"><label htmlFor="v2-audio-input">收音设备</label><select id="v2-audio-input" value={microphone.deviceId} onChange={(event) => void changeDevice(event.target.value)}><option value="">系统默认麦克风</option>{microphone.devices.map((device, index) => <option value={device.deviceId} key={device.deviceId}>{device.label || `麦克风 ${index + 1}`}</option>)}</select><button type="button" onClick={() => void microphone.refreshDevices()}><RefreshCw size={12} />刷新设备</button></div>}
     </div>
     {(snapshot.lifecycle === 'idle' || snapshot.lifecycle === 'paused') && <button type="button" className="primary" onClick={() => void begin()} disabled={!connected}><Mic size={15} />{snapshot.lifecycle === 'paused' ? '继续收音' : '开始收音'}</button>}
     {snapshot.lifecycle === 'live' && <button type="button" onClick={pause}><Pause size={15} />暂停</button>}

@@ -104,6 +104,43 @@ describe('v2 operator view', () => {
     await waitFor(() => expect(getUserMedia).toHaveBeenCalledWith({ audio: expect.objectContaining({ deviceId: { exact: 'mic-presenter' } }) }));
   });
 
+  it('pauses the live session when switching to an unavailable microphone fails', async () => {
+    const stream = { getTracks: () => [{ stop: vi.fn() }], getAudioTracks: () => [{ getSettings: () => ({ deviceId: 'mic-default' }) }] };
+    const getUserMedia = vi.fn().mockResolvedValueOnce(stream).mockRejectedValueOnce(new Error('设备不可用'));
+    vi.stubGlobal('navigator', {
+      mediaDevices: {
+        getUserMedia,
+        enumerateDevices: vi.fn().mockResolvedValue([
+          { kind: 'audioinput', deviceId: 'mic-default', label: 'MacBook 麦克风', groupId: '', toJSON: () => ({}) },
+          { kind: 'audioinput', deviceId: 'mic-presenter', label: '主播领夹麦', groupId: '', toJSON: () => ({}) },
+        ]),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      },
+    });
+    vi.stubGlobal('AudioContext', class {
+      readonly destination = {};
+      readonly sampleRate = 48_000;
+      createMediaStreamSource() { return { connect: vi.fn() }; }
+      createScriptProcessor() { return { connect: vi.fn(), disconnect: vi.fn(), onaudioprocess: null }; }
+      close() { return Promise.resolve(); }
+    });
+
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ type: 'ready', requestId: 'join', sessionId: 'live-client-test', products: PRODUCTS, snapshot: { ...snapshot(), lifecycle: 'idle' } });
+    fireEvent.click(await screen.findByRole('button', { name: /选择输入设备/u }));
+    fireEvent.click(screen.getByRole('button', { name: '开始收音' }));
+    await waitFor(() => expect(getUserMedia).toHaveBeenCalledTimes(1));
+    socket.receive({ type: 'event', event: { sessionId: 'live-client-test', sequence: 4, type: 'lifecycle.changed', occurredAt: 4, payload: { lifecycle: 'live' } }, snapshot: { ...snapshot(), lifecycle: 'live', latestSequence: 4 } });
+    await screen.findByRole('button', { name: '暂停' });
+    fireEvent.change(screen.getByLabelText('收音设备'), { target: { value: 'mic-presenter' } });
+
+    await waitFor(() => expect(getUserMedia).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(JSON.parse(socket.sent.at(-1) as string)).toMatchObject({ command: { type: 'pause' } }));
+  });
+
   it('joins a presenter screen by alias without reusing a stale local session', () => {
     localStorage.setItem('v2-live-session', 'live-stale-session');
     window.history.replaceState(null, '', '/screen/ABCD1234');
