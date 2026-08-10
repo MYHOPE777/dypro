@@ -4,3 +4,6 @@ dist/
 .DS_Store
 .data/
 .data-v2/
+.data-v2-e2e/
+playwright-report/
+test-results/

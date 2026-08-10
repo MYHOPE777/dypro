@@ -60,8 +60,8 @@ export class RealtimeReviewPipeline {
     const localCompletedAt = this.monotonicNow();
     const local = { ...normalized(localResult, segment, product, this.now()), analysisMs: this.elapsed(processStartedAt, localCompletedAt) };
     this.logTiming(input, 'local_rule', processStartedAt, localStartedAt, localCompletedAt);
-    if (!this.options.isProductSegmentCurrent(token)) return;
-    this.options.onCompliance(local, this.options.isLatest(token));
+    if (!this.options.isProductSegmentCurrent(token) || !this.options.isLatest(token)) return;
+    this.options.onCompliance(local, true);
     const fallback = localSuggestions({ product, transcript: segment.text, compliance: local, stats: input.stats, referencePhrases: input.referencePhrases } as CoachInput).slice(0, 3);
     if (this.options.isLatest(token)) this.options.onCoach(segment.id, fallback, true);
 
@@ -78,8 +78,8 @@ export class RealtimeReviewPipeline {
       const semanticCompletedAt = this.monotonicNow();
       const resolved = { ...normalized(remote.value.value, segment, product, this.now()), analysisMs: this.elapsed(processStartedAt, semanticCompletedAt) };
       this.logTiming(input, 'semantic_review', processStartedAt, semanticStartedAt ?? semanticCompletedAt, semanticCompletedAt, semanticQueuedAt, remote.timedOut || remote.value.expired, resolved.analysisTiming);
-      if (!this.options.isProductSegmentCurrent(token)) return;
-      this.options.onCompliance(resolved, this.options.isLatest(token));
+      if (!this.options.isProductSegmentCurrent(token) || !this.options.isLatest(token)) return;
+      this.options.onCompliance(resolved, true);
     }).catch(() => undefined);
 
     if (!this.options.coach?.suggestMany) {

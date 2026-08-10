@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import { AuthService, allowsControlTransport, canAccessRoom, hashPassword } from '../../server/auth';
-import { readSessionIdleTtlMs } from '../../server/config';
 
 const configuredEnv = {
   AUTH_TOKEN_SECRET: 'this-is-a-test-secret-with-32-characters',
@@ -33,7 +32,6 @@ describe('AuthService', () => {
 
   it('rejects invalid duration settings at startup', () => {
     expect(() => new AuthService({ ...configuredEnv, AUTH_TOKEN_TTL_HOURS: 'not-a-number' })).toThrow('AUTH_TOKEN_TTL_HOURS 必须是正数');
-    expect(() => readSessionIdleTtlMs({ SESSION_IDLE_TTL_MS: 'Infinity' })).toThrow('SESSION_IDLE_TTL_MS 必须是正数');
   });
 
   it('allows unconfigured control only from the local MacBook', () => {

@@ -31,6 +31,22 @@ describe('SessionReviewModule', () => {
     store.close();
   });
 
+  it('keeps a synced revision synced when approval is repeated', () => {
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    store.createSession({ sessionId: 'review-synced', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '主播', product: DEFAULT_PRODUCT, lineup: [DEFAULT_PRODUCT] });
+    store.appendSessionEvent('review-synced', { type: 'lifecycle.changed', occurredAt: 20, payload: { lifecycle: 'ended' } });
+    const review = new SessionReviewModule(store);
+    review.approveDelivery('review-synced', 'reviewer');
+    store.updateDeliveryJob('review-synced:0', 'uploading', null, 30);
+    store.settleDeliveryJob('review-synced:0', 'synced', null, 40);
+
+    const repeated = review.approveDelivery('review-synced', 'reviewer');
+
+    expect(repeated.status).toBe('synced');
+    expect(review.getReview('review-synced')?.delivery).toBe('synced');
+    store.close();
+  });
+
   it('learns a reusable room correction from historical transcript edits', () => {
     const store = new SqliteFactStore({ filename: ':memory:' });
     store.createSession({ sessionId: 'correction-session', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '主播', product: DEFAULT_PRODUCT, lineup: [DEFAULT_PRODUCT] });

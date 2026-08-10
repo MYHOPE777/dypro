@@ -636,10 +636,12 @@ export class SqliteFactStore {
       const contentRevision = numberValue(session.content_revision);
       const key = `${sessionId}:${contentRevision}`;
       const existing = this.db.prepare('SELECT * FROM delivery_jobs WHERE idempotency_key = ?').get(key);
+      const existingStatus = stringValue(existing?.status, 'queued') as DeliveryStatus;
+      const deliveryStatus: DeliveryStatus = !existing || existingStatus === 'failed' ? 'queued' : existingStatus;
       if (!existing || stringValue(existing.status) === 'failed') {
         this.db.prepare('INSERT INTO delivery_jobs (id, session_id, content_revision, idempotency_key, status, attempt_count, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(idempotency_key) DO UPDATE SET status=\'queued\', last_error=NULL, updated_at=excluded.updated_at').run(`delivery-${randomUUID()}`, sessionId, contentRevision, key, 'queued', numberValue(existing?.attempt_count), null, now, now);
       }
-      this.db.prepare('UPDATE session_reviews SET approval = ?, approved_revision = ?, approved_by = ?, approved_at = ?, delivery = ?, updated_at = ? WHERE session_id = ?').run('approved', contentRevision, actorId, now, 'queued', now, sessionId);
+      this.db.prepare('UPDATE session_reviews SET approval = ?, approved_revision = ?, approved_by = ?, approved_at = ?, delivery = ?, updated_at = ? WHERE session_id = ?').run('approved', contentRevision, actorId, now, deliveryStatus, now, sessionId);
       this.db.exec('COMMIT');
       return this.getDeliveryJob(key)!;
     } catch (error) {

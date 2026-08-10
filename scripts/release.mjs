@@ -86,9 +86,10 @@ const originalPackage = readFileSync(packagePath, 'utf8');
 const originalLock = readFileSync(lockPath, 'utf8');
 
 console.log(`准备发布 ${tag}`);
-console.log('1/5 运行测试与生产构建');
+console.log('1/5 运行测试、生产构建与端到端验收');
 runChecked('npm', ['test']);
 runChecked('npm', ['run', 'build']);
+runChecked('npm', ['run', 'test:e2e']);
 
 console.log('2/5 更新 package.json 与 package-lock.json');
 updatePackageVersion(version);

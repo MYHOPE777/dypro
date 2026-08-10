@@ -1,10 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { SpeakerDiarizer, extractSpeakerFeature } from '../../server/speakerDiarizer';
-import { LiveSession } from '../../server/session';
-import { FileTimelineStore } from '../../server/timelineStore';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
+import { LiveSession, type CapturePort } from '../../server/v2/liveSession';
+import { SqliteFactStore } from '../../server/v2/store';
+import { BoundedScheduler } from '../../server/v2/scheduler';
+import { DEFAULT_PRODUCT, PRODUCTS } from '../shared/products';
 
 function tone(frequency: number, durationMs: number): Buffer {
   const samples = Math.floor((durationMs / 1_000) * 16_000);
@@ -47,30 +46,31 @@ describe('SpeakerDiarizer', () => {
     expect(third?.speakerId).toBe(first?.speakerId);
   });
 
-  it('attaches candidate identities to live transcript segments and carries a binding forward', () => {
-    const directory = mkdtempSync(path.join(tmpdir(), 'speaker-session-'));
-    try {
-      let now = 1_000;
-      const session = new LiveSession('speaker-session', { timelineStore: new FileTimelineStore(directory), now: () => now });
-      session.startListening();
-      session.ingestAudio(tone(220, 400));
-      session.ingestTranscript('主播的一句', true, { startTimeMs: 0, endTimeMs: 380 });
-      now += 400;
-      session.ingestAudio(tone(1_200, 400));
-      session.ingestTranscript('嘉宾的一句', true, { startTimeMs: 400, endTimeMs: 780 });
+  it('attaches candidate identities to live transcript segments and carries a binding forward', async () => {
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    const capture: CapturePort = { start: () => undefined, pause: () => undefined, resume: () => undefined, end: async () => undefined, pushAudio: () => undefined };
+    const session = new LiveSession({
+      store, capture, products: PRODUCTS,
+      scheduler: new BoundedScheduler({ modelGlobal: 2, modelPerSession: 2, background: 1 }),
+      session: { sessionId: 'speaker-session', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '主播', product: DEFAULT_PRODUCT, lineup: PRODUCTS },
+    });
+    await session.dispatch({ type: 'start' });
+    await session.dispatch({ type: 'audio', track: 'asr', pcm: tone(220, 400), sampleRate: 16_000, channels: 1 });
+    session.receiveAsr({ text: '主播的一句', isFinal: true, startTimeMs: 0, endTimeMs: 380 });
+    await session.dispatch({ type: 'audio', track: 'asr', pcm: tone(1_200, 400), sampleRate: 16_000, channels: 1 });
+    session.receiveAsr({ text: '嘉宾的一句', isFinal: true, startTimeMs: 400, endTimeMs: 780 });
+    await Promise.resolve();
 
-      const [hostCandidate, guestCandidate] = session.state.transcriptHistory;
-      expect(hostCandidate).toMatchObject({ speakerId: 'speaker-1', speakerSource: 'automatic', speaker: 'host' });
-      expect(guestCandidate).toMatchObject({ speakerId: 'speaker-2', speakerSource: 'automatic', speaker: 'host' });
+    const [hostCandidate, guestCandidate] = session.snapshot().transcriptHistory;
+    expect(hostCandidate).toMatchObject({ speakerId: 'speaker-1', speakerSource: 'automatic', speaker: 'host' });
+    expect(guestCandidate).toMatchObject({ speakerId: 'speaker-2', speakerSource: 'automatic', speaker: 'host' });
 
-      session.annotateSpeaker(guestCandidate!.id, 'other');
-      expect(session.state.transcriptHistory[1]).toMatchObject({ speakerId: 'speaker-2', speakerSource: 'manual', speaker: 'other' });
-      now += 400;
-      session.ingestAudio(tone(1_200, 400));
-      session.ingestTranscript('嘉宾继续说', true, { startTimeMs: 800, endTimeMs: 1_180 });
-      expect(session.state.transcriptHistory[2]).toMatchObject({ speakerId: 'speaker-2', speakerSource: 'manual', speaker: 'other' });
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
+    await session.dispatch({ type: 'assign_speaker', segmentId: guestCandidate!.id, speaker: 'other' });
+    expect(session.snapshot().transcriptHistory[1]).toMatchObject({ speakerId: 'speaker-2', speakerSource: 'manual', speaker: 'other' });
+    await session.dispatch({ type: 'audio', track: 'asr', pcm: tone(1_200, 400), sampleRate: 16_000, channels: 1 });
+    session.receiveAsr({ text: '嘉宾继续说', isFinal: true, startTimeMs: 800, endTimeMs: 1_180 });
+    await Promise.resolve();
+    expect(session.snapshot().transcriptHistory[2]).toMatchObject({ speakerId: 'speaker-2', speakerSource: 'manual', speaker: 'other' });
+    store.close();
   });
 });

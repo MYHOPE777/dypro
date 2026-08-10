@@ -88,6 +88,7 @@ v0.3 尚未实现真实云数据库、知识库或 TOS adapter。交付任务会
 npm test
 npx tsc --noEmit
 npm run build
+npm run test:e2e
 ```
 
 生产接口：

@@ -8,7 +8,3 @@ function readPositiveNumber(raw: string | undefined, name: string, fallback: num
 export function readAuthTokenTtlMs(env: NodeJS.ProcessEnv = process.env): number {
   return Math.max(1, readPositiveNumber(env.AUTH_TOKEN_TTL_HOURS, 'AUTH_TOKEN_TTL_HOURS', 12)) * 60 * 60 * 1_000;
 }
-
-export function readSessionIdleTtlMs(env: NodeJS.ProcessEnv = process.env): number {
-  return Math.max(60_000, readPositiveNumber(env.SESSION_IDLE_TTL_MS, 'SESSION_IDLE_TTL_MS', 30 * 60_000));
-}

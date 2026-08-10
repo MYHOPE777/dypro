@@ -169,10 +169,11 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
     try {
       if (!isLiveCommand(request.body?.command)) throw new Error('无效的直播命令');
       const snapshot = runtime.snapshot(routeParam(request, 'sessionId'));
-      if (snapshot) runtime.authorization.assert(identity(request), snapshot.roomId, 'control');
+      if (!snapshot) return response.status(404).json({ message: '直播场次不存在' });
+      runtime.authorization.assert(identity(request), snapshot.roomId, 'control');
       await runtime.dispatch(routeParam(request, 'sessionId'), request.body.command);
-      response.json({ ok: true, snapshot: runtime.snapshot(routeParam(request, 'sessionId')) });
-    } catch (error) { jsonError(response, error); }
+      return response.json({ ok: true, snapshot: runtime.snapshot(routeParam(request, 'sessionId')) });
+    } catch (error) { return jsonError(response, error); }
   });
   app.post('/api/v2/sessions/:sessionId/display-link', (request, response) => {
     try { const sessionId = routeParam(request, 'sessionId'); const snapshot = runtime.snapshot(sessionId); if (!snapshot) return response.status(404).json({ message: '直播场次不存在' }); runtime.authorization.assert(identity(request), snapshot.roomId, 'view'); const link = runtime.createDisplayLink(sessionId); return response.json({ ...link, path: `/screen/${link.alias}` }); } catch (error) { return jsonError(response, error); }

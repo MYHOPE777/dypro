@@ -73,6 +73,23 @@ describe('LiveSession', () => {
     store.close();
   });
 
+  it('drops a delayed semantic result after a newer transcript arrives', async () => {
+    const pending: Array<(value: ComplianceResult) => void> = [];
+    const analyzer: ReviewAnalyzer = { analyze: () => new Promise((resolve) => pending.push(resolve)) };
+    const { store, session } = makeSession({ analyzer });
+    await session.dispatch({ type: 'start' });
+    await session.dispatch({ type: 'demo_transcript', text: '第一句正在分析', isFinal: true });
+    await session.dispatch({ type: 'demo_transcript', text: '第二句已经更新上下文', isFinal: true });
+
+    pending[0](result('serum', 'blocked'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(session.snapshot().alerts).toEqual([]);
+    expect(session.snapshot().stats.blockedCount).toBe(0);
+    pending[1](result('serum', 'safe'));
+    store.close();
+  });
+
   it('accepts the last final transcript while ending is draining', async () => {
     const capture = new FakeCapture();
     capture.holdEnd();

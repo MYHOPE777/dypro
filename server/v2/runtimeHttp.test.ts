@@ -48,6 +48,28 @@ describe('v2 HTTP/WebSocket runtime', () => {
     expect(runtime.scheduler.snapshot().background.paused).toBe(false);
   });
 
+  it('reopens a persisted session with its original room dependencies', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-runtime-reopen-room-'));
+    const env = { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') };
+    const first = createRuntime({ rootDir: directory, env });
+    first.getOrCreateSession({ sessionId: 'live-reopen-room', roomId: 'room-private' });
+    first.rules.create('room-private', 'owner', {
+      name: '私有直播间规则', pattern: '私有风险词', risk: 'blocked', title: '命中私有规则',
+      reason: '仅用于验证重启后的直播间绑定', alternative: '安全表达', policyRef: '测试规则',
+    });
+    await first.close();
+
+    const second = createRuntime({ rootDir: directory, env });
+    cleanups.push(async () => { await second.close(); rmSync(directory, { recursive: true, force: true }); });
+    const restored = second.getSession('live-reopen-room');
+    expect(restored?.snapshot().roomId).toBe('room-private');
+
+    await restored!.dispatch({ type: 'start' });
+    await restored!.dispatch({ type: 'demo_transcript', text: '这句话包含私有风险词' });
+
+    expect(restored?.snapshot().latestCompliance).toMatchObject({ source: 'custom-rule', risk: 'blocked', title: '命中私有规则' });
+  });
+
   it('archives original-rate and 16k ASR audio as separate assets', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'dypro-runtime-audio-'));
     const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });
@@ -145,6 +167,22 @@ describe('v2 HTTP/WebSocket runtime', () => {
     expect(error.type === 'error' && error.message).toContain('主播屏地址已失效');
     expect(runtime.listSessions('room-default')).toHaveLength(1);
     display.close();
+  });
+
+  it('rejects commands for an unknown session instead of creating one implicitly', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-unknown-session-command-'));
+    const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });
+    const http = createV2Http(runtime, { clientDir: join(directory, 'missing-client') });
+    await new Promise<void>((resolve) => http.server.listen(0, '127.0.0.1', resolve));
+    const port = (http.server.address() as AddressInfo).port;
+    cleanups.push(async () => { await new Promise<void>((resolve) => http.server.close(() => resolve())); await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+
+    const response = await fetch(`http://127.0.0.1:${port}/api/v2/sessions/missing-session/commands`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ command: { type: 'start' } }),
+    });
+
+    expect(response.status).toBe(404);
+    expect(runtime.listSessions()).toHaveLength(0);
   });
 
   it('requires signed operator identity and keeps review actions reviewer-only', async () => {

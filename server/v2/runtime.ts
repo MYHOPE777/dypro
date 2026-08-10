@@ -16,6 +16,8 @@ import { AuthorizationModule } from './authorization';
 import { RuleModule } from './rules';
 import { PresenterModule } from './presenters';
 
+export type LiveSessionPort = Pick<LiveSession, 'dispatch' | 'snapshot' | 'subscribe'> & { readonly id: string };
+
 export type V2Runtime = {
   readonly store: SqliteFactStore;
   readonly scheduler: BoundedScheduler;
@@ -25,8 +27,8 @@ export type V2Runtime = {
   readonly rules: RuleModule;
   readonly presenters: PresenterModule;
   readonly products: Product[];
-  getOrCreateSession(input?: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string }): LiveSession;
-  getSession(sessionId: string): LiveSession | null;
+  getOrCreateSession(input?: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string }): LiveSessionPort;
+  getSession(sessionId: string): LiveSessionPort | null;
   dispatch(sessionId: string, command: LiveCommand): Promise<void>;
   snapshot(sessionId: string): LiveSessionSnapshot | null;
   subscribe(sessionId: string, listener: (event: LiveEvent, snapshot: LiveSessionSnapshot) => void): () => void;
@@ -75,18 +77,20 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
   const getOrCreateSession = (input: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string } = {}): LiveSession => {
     const requestedId = validSessionId(input.sessionId);
     if (requestedId && sessions.has(requestedId)) return sessions.get(requestedId)!;
-    const targetRoom = input.roomId && /^[a-zA-Z0-9_-]{2,96}$/u.test(input.roomId) ? input.roomId : roomId;
-    store.ensureRoom({ id: targetRoom, tenantId: 'tenant-local', name: targetRoom === roomId ? '默认直播间' : targetRoom, accountName: '本地账号', ownerActorId: 'owner' });
-    products.forEach((product) => store.upsertProduct('tenant-local', product, targetRoom));
+    const persisted = requestedId ? store.getSessionSnapshot(requestedId) : null;
+    const targetRoom = persisted?.roomId ?? (input.roomId && /^[a-zA-Z0-9_-]{2,96}$/u.test(input.roomId) ? input.roomId : roomId);
+    const tenantId = persisted?.tenantId ?? 'tenant-local';
+    store.ensureRoom({ id: targetRoom, tenantId, name: targetRoom === roomId ? '默认直播间' : targetRoom, accountName: '本地账号', ownerActorId: 'owner' });
+    products.forEach((product) => store.upsertProduct(tenantId, product, targetRoom));
     const sessionId = requestedId ?? `live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const defaultPresenter = presenters.ensureDefault(targetRoom);
-    const requestedPresenter = input.presenterId ? presenters.get(input.presenterId) : null;
+    const requestedPresenter = presenters.get(persisted?.presenterId ?? input.presenterId ?? '');
     const presenter = requestedPresenter?.roomId === targetRoom ? requestedPresenter : defaultPresenter;
     const presenterId = presenter.id;
-    const presenterName = input.presenterName?.trim() || presenter.name;
+    const presenterName = persisted?.presenterName ?? (input.presenterName?.trim() || presenter.name);
     const writer = {
-      source: new AudioFileWriter(audioRoot, 'tenant-local', targetRoom, sessionId, 'source.pcm'),
-      asr: new AudioFileWriter(audioRoot, 'tenant-local', targetRoom, sessionId, 'asr-16k.pcm'),
+      source: new AudioFileWriter(audioRoot, tenantId, targetRoom, sessionId, 'source.pcm'),
+      asr: new AudioFileWriter(audioRoot, tenantId, targetRoom, sessionId, 'asr-16k.pcm'),
     };
     let liveSession!: LiveSession;
     const capture = new CaptureModule({
@@ -111,7 +115,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
       },
       onComplianceResult: (result) => { rules.learn(targetRoom, sessionId, result); },
       onReviewTiming: (timing) => console.info('[realtime-review]', JSON.stringify(timing)),
-      session: { sessionId, tenantId: 'tenant-local', roomId: targetRoom, presenterId, presenterName, product: products[0], lineup: products },
+      session: { sessionId, tenantId, roomId: targetRoom, presenterId, presenterName, product: persisted?.product ?? products[0], lineup: persisted?.lineup ?? products },
     });
     writers.set(sessionId, writer);
     liveSession.subscribe((event) => {
