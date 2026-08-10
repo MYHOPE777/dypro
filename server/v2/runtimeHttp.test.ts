@@ -143,11 +143,14 @@ describe('v2 HTTP/WebSocket runtime', () => {
     const directory = mkdtempSync(join(tmpdir(), 'dypro-session-lineup-'));
     const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });
     const session = runtime.getOrCreateSession({ sessionId: 'live-session-lineup', roomId: 'room-session-lineup' });
+    const events: string[] = [];
+    session.subscribe((event) => events.push(event.type));
     await session.dispatch({ type: 'start' });
     await session.dispatch({ type: 'set_lineup', productIds: ['serum', 'headphones'] });
     await runtime.upsertProduct('room-session-lineup', { ...PRODUCTS[2], name: '直播间新增保温杯' });
 
     expect(session.snapshot().lineup.map((product) => product.id)).toEqual(['serum', 'headphones']);
+    expect(events).toContain('catalog.updated');
     await runtime.close();
     rmSync(directory, { recursive: true, force: true });
   });

@@ -46,6 +46,8 @@ export type LiveCommand =
   | { type: 'stop' }
   | { type: 'select_product'; productId: string; source?: 'operator' | 'speech' }
   | { type: 'set_lineup'; productIds: string[] }
+  /** Server-internal room catalog notification; external transports must reject it. */
+  | { type: 'catalog_sync'; products: Product[] }
   | { type: 'set_risk_profile'; profile: RiskProfile }
   | { type: 'select_presenter'; presenterId: string }
   | { type: 'demo_transcript'; text: string; isFinal?: boolean }
@@ -58,6 +60,7 @@ export type LiveEventType =
   | 'lifecycle.changed'
   | 'product.selected'
   | 'lineup.updated'
+  | 'catalog.updated'
   | 'risk_profile.changed'
   | 'presenter.selected'
   | 'transcript.partial'

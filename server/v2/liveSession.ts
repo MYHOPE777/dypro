@@ -155,6 +155,9 @@ export class LiveSession {
       case 'set_lineup':
         this.setLineup(command.productIds);
         return;
+      case 'catalog_sync':
+        this.commit('catalog.updated', { products: JSON.stringify(command.products) });
+        return;
       case 'set_risk_profile':
         if (this.snapshotValue.riskProfile !== command.profile) this.commit('risk_profile.changed', { profile: command.profile });
         return;

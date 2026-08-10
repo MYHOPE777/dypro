@@ -86,4 +86,18 @@ describe('LiveSessionClient', () => {
     expect(join.command.token).toBe('signed-operator-token');
     client.close();
   });
+
+  it('refreshes the room catalog without changing the session lineup', () => {
+    const client = new LiveSessionClient({ roomId: 'room-default', role: 'operator' });
+    client.connect();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ type: 'ready', requestId: 'join', sessionId: 'live-reconnect', products: PRODUCTS, snapshot: snapshot(2) });
+    const extra = { ...PRODUCTS[2], id: 'new-product', name: '新商品' };
+    socket.receive({ type: 'event', event: { sessionId: 'live-reconnect', sequence: 3, type: 'catalog.updated', occurredAt: 3, payload: { products: JSON.stringify([...PRODUCTS, extra]) } }, snapshot: snapshot(3) });
+
+    expect(client.products.at(-1)).toMatchObject({ id: 'new-product', name: '新商品' });
+    expect(client.snapshot?.lineup).toHaveLength(PRODUCTS.length);
+    client.close();
+  });
 });

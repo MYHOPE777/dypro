@@ -153,7 +153,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
       const snapshot = session.snapshot();
       const catalogIds = new Set(catalog.map((product) => product.id));
       const retainedIds = snapshot.lineup.map((product) => product.id).filter((productId) => catalogIds.has(productId));
-      return session.dispatch({ type: 'set_lineup', productIds: retainedIds.length > 0 ? retainedIds : catalog.map((product) => product.id) });
+      return session.dispatch({ type: 'catalog_sync', products: catalog }).then(() => session.dispatch({ type: 'set_lineup', productIds: retainedIds.length > 0 ? retainedIds : catalog.map((product) => product.id) }));
     }));
     return catalog;
   };
