@@ -105,7 +105,10 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
       next();
     } catch (error) { jsonError(response, error, 401); }
   });
-  app.get('/api/v2/rooms', (_request, response) => response.json(runtime.listRooms()));
+  app.get('/api/v2/rooms', (request, response) => {
+    const current = identity(request);
+    response.json(runtime.listRooms().filter((room) => current.role === 'reviewer' || current.roomIds.includes(room.id) || room.ownerActorId === current.actorId));
+  });
   app.get('/api/v2/rooms/:roomId/products', (request, response) => {
     try { runtime.authorization.assert(identity(request), routeParam(request, 'roomId'), 'view'); response.json(runtime.products); } catch (error) { jsonError(response, error, 403); }
   });

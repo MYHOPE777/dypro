@@ -160,6 +160,7 @@ describe('v2 HTTP/WebSocket runtime', () => {
       ]),
     };
     const runtime = createRuntime({ rootDir: directory, env });
+    runtime.store.ensureRoom({ id: 'room-private', tenantId: 'tenant-local', ownerActorId: 'another-operator', name: '其他直播间' });
     const http = createV2Http(runtime, { clientDir: join(directory, 'missing-client') });
     await new Promise<void>((resolve) => http.server.listen(0, '127.0.0.1', resolve));
     const port = (http.server.address() as AddressInfo).port;
@@ -170,6 +171,10 @@ describe('v2 HTTP/WebSocket runtime', () => {
     });
     const login = await loginResponse.json() as { token: string };
     expect(loginResponse.status).toBe(200);
+
+    const roomsResponse = await fetch(`http://127.0.0.1:${port}/api/v2/rooms`, { headers: { Authorization: `Bearer ${login.token}` } });
+    const rooms = await roomsResponse.json() as Array<{ id: string }>;
+    expect(rooms.map((room) => room.id)).toEqual(['room-default']);
 
     const sessionsResponse = await fetch(`http://127.0.0.1:${port}/api/v2/sessions?roomId=room-default`, { headers: { Authorization: `Bearer ${login.token}` } });
     expect(sessionsResponse.status).toBe(403);
