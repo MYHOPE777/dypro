@@ -1,4 +1,5 @@
-import type { CoachPurpose, CoachSuggestion, ComplianceResult, Product, SessionStats } from '../../src/shared/types';
+import { analyzeTranscript } from '../../src/compliance/engine';
+import type { CoachPurpose, CoachSuggestion, ComplianceResult, ComplianceRule, Product, SessionStats } from '../../src/shared/types';
 import { getArkConfig, requestArk } from './ark';
 import { parseArkJson } from './doubao';
 
@@ -8,6 +9,8 @@ export type CoachInput = {
   compliance: ComplianceResult | null;
   stats: SessionStats;
   referencePhrases?: Array<{ text: string; purpose?: CoachPurpose }>;
+  templateMode?: 'reference' | 'generate';
+  customRules?: ComplianceRule[];
 };
 
 export type CoachProvider = {
@@ -18,7 +21,7 @@ export type CoachProvider = {
 const PURPOSES: CoachPurpose[] = ['塑品', '憋单', '逼单', '转化', '互动', '留人', '答疑'];
 
 const SYSTEM_PROMPT = `你是资深直播间运营教练，擅长把商品卖点、用户互动和合规表达组织成主播下一句可直接说的话。
-根据当前商品、主播刚说的话、合规风险和直播进程，给出三段角度不同、自然、具体、短促的备选话术。
+根据当前商品、主播刚说的话、合规风险和直播进程，给出三段角度不同、自然、具体、短促的备选话术。若没有可复用的主播模板，必须基于商品事实独立生成，不要声称存在历史模板。
 只输出 JSON：{"suggestions":[{"purpose":"塑品|憋单|逼单|转化|互动|留人|答疑","text":"主播下一句直接照读的话","reason":"这句建议的作用，不超过20字"}]}。
 suggestions 必须正好三项，每段控制在 60 个汉字以内，不能编造价格、库存、功效或赠品；有合规风险时第一段必须先给安全替代表达，三段不得只是同义改写。
 purpose 含义：塑品=建立商品价值，憋单=保留购买悬念，逼单=推动当下决策，转化=明确下单动作，互动=引导评论或回答观众，留人=留住观看，答疑=回应疑问。`;
@@ -131,6 +134,8 @@ export class DoubaoCoach implements CoachProvider {
     const startedAt = performance.now();
     const fallback = localSuggestions(input);
     if (!this.config) return fallback;
+    const references = (input.referencePhrases ?? []).filter((phrase) => phrase.text.trim()).slice(0, 10);
+    const templateMode = references.length > 0 ? 'reference' : 'generate';
     try {
       const content = await requestArk(
         this.config,
@@ -150,7 +155,11 @@ export class DoubaoCoach implements CoachProvider {
             alternative: input.compliance.alternative,
           } : { risk: 'safe' },
           progress: input.stats,
-          referencePhrases: input.referencePhrases?.slice(0, 10) ?? [],
+          templateMode,
+          templateInstruction: templateMode === 'generate'
+            ? '当前没有主播模板话术，请根据商品事实、主播原话和合规结果独立预测下一句，生成三段可直接照读的话术。'
+            : '当前有主播模板话术，可以参考其风格，但必须结合当前商品和合规结果重新组织。',
+          referencePhrases: references,
         }),
         this.maxOutputTokens,
         Boolean(this.config.knowledgeResourceId),
@@ -172,7 +181,16 @@ export class DoubaoCoach implements CoachProvider {
           latencyMs,
         }];
       });
-      const merged = [...suggestions, ...fallback.map((suggestion) => ({ ...suggestion, latencyMs }))]
+      const guardedSuggestions = (await Promise.all(suggestions.map(async (suggestion) => ({
+        suggestion,
+        result: await analyzeTranscript({
+          productId: input.product.id,
+          product: input.product,
+          transcript: suggestion.text,
+          customRules: input.customRules,
+        }),
+      })))).filter(({ result }) => result.risk === 'safe').map(({ suggestion }) => suggestion);
+      const merged = [...guardedSuggestions, ...fallback.map((suggestion) => ({ ...suggestion, latencyMs }))]
         .filter((suggestion, index, all) => all.findIndex((item) => item.text === suggestion.text) === index)
         .slice(0, 3);
       return merged.length === 3 ? merged : fallback.map((suggestion) => ({ ...suggestion, latencyMs }));

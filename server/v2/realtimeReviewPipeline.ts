@@ -29,6 +29,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Pr
 }
 
 const MODEL_BUDGET_MS = 2_000;
+const RISK_SEVERITY = { safe: 0, warning: 1, blocked: 2 } as const;
 
 function normalized(result: ComplianceResult, segment: TranscriptSegment, product: Product, now: number): ComplianceResult {
   return { ...result, id: result.id || `compliance-${now}`, segmentId: segment.id, productId: product.id, transcript: segment.text, createdAt: now };
@@ -62,11 +63,43 @@ export class RealtimeReviewPipeline {
     this.logTiming(input, 'local_rule', processStartedAt, localStartedAt, localCompletedAt);
     if (!this.options.isProductSegmentCurrent(token) || !this.options.isLatest(token)) return;
     this.options.onCompliance(local, true);
-    const fallback = localSuggestions({ product, transcript: segment.text, compliance: local, stats: input.stats, referencePhrases: input.referencePhrases } as CoachInput).slice(0, 3);
+    const references = input.referencePhrases?.filter((phrase) => phrase.text.trim()) ?? [];
+    const coachInput = (compliance: ComplianceResult): CoachInput => ({
+      product,
+      transcript: segment.text,
+      compliance,
+      stats: input.stats,
+      referencePhrases: references,
+      templateMode: references.length ? 'reference' : 'generate',
+      customRules: input.customRules,
+    });
+    const fallbackFor = (compliance: ComplianceResult) => localSuggestions(coachInput(compliance)).slice(0, 3);
+    const fallback = fallbackFor(local);
     if (this.options.isLatest(token)) this.options.onCoach(segment.id, fallback, true);
+
+    const requestCoach = async (compliance: ComplianceResult, safeFallback: CoachSuggestion[]) => {
+      const queuedAt = this.monotonicNow();
+      let startedAt: number | undefined;
+      const task = this.options.scheduler.run('model', this.options.sessionId, async () => {
+        startedAt = this.monotonicNow();
+        const remainingMs = MODEL_BUDGET_MS - this.elapsed(queuedAt, startedAt);
+        if (remainingMs <= 0) return { value: safeFallback, expired: true };
+        const result = await withTimeout(this.options.coach!.suggestMany!(coachInput(compliance)), remainingMs, safeFallback);
+        return { value: result.value, expired: result.timedOut };
+      });
+      const remote = await withTimeout(task, MODEL_BUDGET_MS, { value: safeFallback, expired: true });
+      return {
+        suggestions: remote.value.value.slice(0, 3),
+        queuedAt,
+        startedAt: startedAt ?? this.monotonicNow(),
+        completedAt: this.monotonicNow(),
+        timedOut: remote.timedOut || remote.value.expired,
+      };
+    };
 
     const semanticQueuedAt = this.monotonicNow();
     let semanticStartedAt: number | undefined;
+    let semanticOverrideActive = false;
     const semanticTask = this.options.scheduler.run('model', this.options.sessionId, async () => {
       semanticStartedAt = this.monotonicNow();
       const remainingMs = MODEL_BUDGET_MS - this.elapsed(semanticQueuedAt, semanticStartedAt);
@@ -80,6 +113,20 @@ export class RealtimeReviewPipeline {
       this.logTiming(input, 'semantic_review', processStartedAt, semanticStartedAt ?? semanticCompletedAt, semanticCompletedAt, semanticQueuedAt, remote.timedOut || remote.value.expired, resolved.analysisTiming);
       if (!this.options.isProductSegmentCurrent(token) || !this.options.isLatest(token)) return;
       this.options.onCompliance(resolved, true);
+      if (RISK_SEVERITY[resolved.risk] <= RISK_SEVERITY[local.risk]) return;
+      semanticOverrideActive = true;
+      const safeFallback = fallbackFor(resolved);
+      if (!this.options.coach?.suggestMany) {
+        this.options.onCoach(segment.id, safeFallback, false);
+        return;
+      }
+      this.options.onCoach(segment.id, safeFallback, true);
+      void requestCoach(resolved, safeFallback).then((correctedCoach) => {
+        this.logTiming(input, 'coach', processStartedAt, correctedCoach.startedAt, correctedCoach.completedAt, correctedCoach.queuedAt, correctedCoach.timedOut);
+        if (this.options.isProductSegmentCurrent(token) && this.options.isLatest(token)) this.options.onCoach(segment.id, correctedCoach.suggestions, false);
+      }).catch(() => {
+        if (this.options.isProductSegmentCurrent(token) && this.options.isLatest(token)) this.options.onCoach(segment.id, safeFallback, false);
+      });
     }).catch(() => undefined);
 
     if (!this.options.coach?.suggestMany) {
@@ -87,21 +134,11 @@ export class RealtimeReviewPipeline {
       this.logTiming(input, 'coach', processStartedAt, localCompletedAt, localCompletedAt, undefined, false);
       return;
     }
-    const coachQueuedAt = this.monotonicNow();
-    let coachStartedAt: number | undefined;
-    const coachTask = this.options.scheduler.run('model', this.options.sessionId, async () => {
-      coachStartedAt = this.monotonicNow();
-      const remainingMs = MODEL_BUDGET_MS - this.elapsed(coachQueuedAt, coachStartedAt);
-      if (remainingMs <= 0) return { value: fallback, expired: true };
-      const result = await withTimeout(this.options.coach!.suggestMany!({ product, transcript: segment.text, compliance: local, stats: input.stats, referencePhrases: input.referencePhrases }), remainingMs, fallback);
-      return { value: result.value, expired: result.timedOut };
-    });
-    void withTimeout(coachTask, MODEL_BUDGET_MS, { value: fallback, expired: true }).then((remoteCoach) => {
-      const coachCompletedAt = this.monotonicNow();
-      this.logTiming(input, 'coach', processStartedAt, coachStartedAt ?? coachCompletedAt, coachCompletedAt, coachQueuedAt, remoteCoach.timedOut || remoteCoach.value.expired);
-      if (this.options.isLatest(token)) this.options.onCoach(segment.id, remoteCoach.value.value.slice(0, 3), false);
+    void requestCoach(local, fallback).then((remoteCoach) => {
+      this.logTiming(input, 'coach', processStartedAt, remoteCoach.startedAt, remoteCoach.completedAt, remoteCoach.queuedAt, remoteCoach.timedOut);
+      if (!semanticOverrideActive && this.options.isProductSegmentCurrent(token) && this.options.isLatest(token)) this.options.onCoach(segment.id, remoteCoach.suggestions, false);
     }).catch(() => {
-      if (this.options.isLatest(token)) this.options.onCoach(segment.id, fallback, false);
+      if (!semanticOverrideActive && this.options.isProductSegmentCurrent(token) && this.options.isLatest(token)) this.options.onCoach(segment.id, fallback, false);
     });
   }
 

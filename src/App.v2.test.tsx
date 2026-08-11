@@ -59,6 +59,44 @@ describe('v2 operator view', () => {
     });
   });
 
+  it('labels generated coaching choices as coming from Doubao', async () => {
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({
+      type: 'ready',
+      requestId: 'join',
+      sessionId: 'live-coach-source',
+      products: PRODUCTS,
+      snapshot: {
+        ...snapshot(),
+        sessionId: 'live-coach-source',
+        coachSuggestions: snapshot().coachSuggestions.map((suggestion) => ({ ...suggestion, source: 'doubao' as const })),
+      },
+    });
+
+    expect(await screen.findByText('豆包生成 · 三段合规话术')).toBeTruthy();
+  });
+
+  it('labels model suggestions and local safety replacements separately', async () => {
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    const mixedSuggestions = snapshot().coachSuggestions.map((suggestion, index) => ({
+      ...suggestion,
+      source: index === 0 ? 'doubao' as const : 'local-fallback' as const,
+    }));
+    socket.receive({
+      type: 'ready',
+      requestId: 'join',
+      sessionId: 'live-mixed-coach-source',
+      products: PRODUCTS,
+      snapshot: { ...snapshot(), sessionId: 'live-mixed-coach-source', coachSuggestions: mixedSuggestions },
+    });
+
+    expect(await screen.findByText('豆包生成 1 段 · 本地安全补足')).toBeTruthy();
+  });
+
   it('keeps the microphone input device entry visible in the operator controls', async () => {
     render(<App />);
     const socket = FakeWebSocket.instances[0];

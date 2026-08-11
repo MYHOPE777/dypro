@@ -237,8 +237,16 @@ function CoachBoard({ snapshot, display = false }: { snapshot: LiveSessionSnapsh
     { id: 'empty-2', purpose: '互动' as const, text: '问问大家最想了解哪个细节，再按页面信息逐项说明。', reason: '引导评论互动', source: 'local-fallback' as const, createdAt: Date.now() },
     { id: 'empty-3', purpose: '转化' as const, text: '需要的朋友可以打开商品卡，确认规格和实时价格。', reason: '承接下单动作', source: 'local-fallback' as const, createdAt: Date.now() },
   ];
+  const doubaoSuggestionCount = suggestions.filter((suggestion) => suggestion.source === 'doubao').length;
+  const coachStatus = snapshot.coachPending
+    ? '豆包正在预测合规下一句'
+    : doubaoSuggestionCount === 3
+      ? '豆包生成 · 三段合规话术'
+      : doubaoSuggestionCount > 0
+        ? `豆包生成 ${doubaoSuggestionCount} 段 · 本地安全补足`
+        : '本地安全备选 · 三段话术';
   return <section className={`v2-coach-board ${display ? 'display' : ''}`}>
-    <header><div><Sparkles size={16} /><span>主播下一句</span></div><small>{snapshot.coachPending ? '正在结合本场状态优化' : '三段备选话术'}</small></header>
+    <header><div><Sparkles size={16} /><span>主播下一句</span></div><small>{coachStatus}</small></header>
     <div className="v2-coach-grid">{suggestions.slice(0, 3).map((suggestion, index) => <article key={suggestion.id}><div><b>{index + 1}</b><strong>{suggestion.purpose}</strong></div><p>{suggestion.text}</p><small>{suggestion.reason}</small></article>)}</div>
   </section>;
 }

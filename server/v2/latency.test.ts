@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { analyzeTranscript } from '../../src/compliance/engine';
 import { DEFAULT_PRODUCT } from '../../src/shared/products';
 import type { ComplianceResult, CoachSuggestion, TranscriptSegment } from '../../src/shared/types';
+import type { CoachInput } from '../providers/doubaoCoach';
 import { BoundedScheduler } from './scheduler';
 import { RealtimeReviewPipeline } from './realtimeReviewPipeline';
 
@@ -73,6 +74,41 @@ describe('realtime latency budgets', () => {
     await vi.waitFor(() => expect(analysisStarted).toBe(true));
     expect(coachStarted).toBe(true);
     finishAnalysis({ id: 'remote', productId: DEFAULT_PRODUCT.id, risk: 'safe', title: '可继续', reason: '安全', alternative: '', policyRef: 'test', confidence: 0.9, source: 'doubao', transcript: segment.text, createdAt: 1 });
+  });
+
+  it('regenerates coaching after semantic review raises the risk level', async () => {
+    const coachInputs: CoachInput[] = [];
+    const coachUpdates: Array<{ suggestions: CoachSuggestion[]; pending: boolean }> = [];
+    const suggestions = (prefix: string): CoachSuggestion[] => [0, 1, 2].map((index) => ({
+      id: `${prefix}-${index}`,
+      purpose: index === 0 ? '转化' : '互动',
+      text: `${prefix}话术${index + 1}`,
+      reason: '测试',
+      source: 'doubao',
+      createdAt: index,
+    }));
+    const pipeline = new RealtimeReviewPipeline({
+      sessionId: 'semantic-escalation-session',
+      scheduler: new BoundedScheduler({ modelGlobal: 4, modelPerSession: 2, background: 1 }),
+      analyzer: { analyze: async () => ({ id: 'remote-risk', productId: DEFAULT_PRODUCT.id, risk: 'blocked', title: '语义风险', reason: '需要替换', alternative: '可以改为：只介绍商品页面信息。', policyRef: 'test', confidence: 0.95, source: 'doubao', transcript: segment.text, createdAt: 1 }) },
+      coach: {
+        suggest: async () => suggestions('unused')[0],
+        suggestMany: async (coachInput) => {
+          coachInputs.push(coachInput);
+          return suggestions(coachInput.compliance?.risk === 'blocked' ? '纠正后' : '初次');
+        },
+      },
+      isProductSegmentCurrent: () => true,
+      isLatest: () => true,
+      onCompliance: () => undefined,
+      onCoach: (_segmentId, next, pending) => coachUpdates.push({ suggestions: next, pending }),
+    });
+
+    await pipeline.process({ token: { requestSequence: 1, productRevision: 0, segmentRevision: 0, segmentId: segment.id }, segment, product: DEFAULT_PRODUCT, riskProfile: 'strict', context: { text: segment.text, segmentCount: 1, windowStartMs: 0, windowEndMs: 1 }, stats: { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 } });
+    await vi.waitFor(() => expect(coachInputs.map((entry) => entry.compliance?.risk)).toContain('blocked'));
+    await vi.waitFor(() => expect(coachUpdates.at(-1)).toMatchObject({ pending: false }));
+
+    expect(coachUpdates.at(-1)?.suggestions.every((suggestion) => suggestion.text.startsWith('纠正后'))).toBe(true);
   });
 
   it('keeps total latency on results and emits detailed stage timings for logs', async () => {
