@@ -181,6 +181,7 @@ export type ComplianceAnalysisTiming = {
   path: 'local' | 'cache' | 'ark' | 'fallback';
   analyzerMs: number;
   localGuardrailMs: number;
+  reviewReason?: string;
   cacheLookupMs?: number;
   arkRequestMs?: number;
   responseParseMs?: number;
@@ -251,13 +252,18 @@ export type ProductImportResponse = {
   warnings: string[];
 };
 
-export type ComplianceRuleScope = 'room' | 'shared';
+/** Legacy `shared` rules are retained for persisted data; new rules should use room/category/product. */
+export type ComplianceRuleScope = 'room' | 'category' | 'product' | 'shared';
 export type ComplianceRuleStatus = 'draft' | 'pending_review' | 'published' | 'rejected' | 'rolled_back';
 
 export type ComplianceRule = {
   id: string;
   roomId: string;
   scope: ComplianceRuleScope;
+  /** Required when scope is `product`; absent on legacy room rules. */
+  productId?: string;
+  /** Required when scope is `category`; absent on legacy room rules. */
+  category?: string;
   name: string;
   matchType: 'contains' | 'regex';
   pattern: string;

@@ -120,13 +120,13 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
       store, scheduler, products: () => store.listProducts(tenantId, targetRoom), capture,
       analyzer: createDoubaoAnalyzer(env),
       coach: createDoubaoCoach(env),
-      rules: () => rules.active(targetRoom),
+      rules: (product) => rules.active(targetRoom, product),
       referencePhrases: (activePresenterId, productId) => presenters.references(activePresenterId, productId).slice(0, 10).map((phrase) => ({ text: phrase.text, purpose: phrase.purpose })),
       resolvePresenter: (activePresenterId) => {
         const candidate = presenters.get(activePresenterId);
         return candidate?.roomId === targetRoom ? { id: candidate.id, name: candidate.name } : null;
       },
-      onComplianceResult: (result) => { rules.learn(targetRoom, sessionId, result); },
+      onComplianceResult: (result) => { rules.learn(targetRoom, sessionId, result, liveSession.snapshot().product); },
       onReviewTiming: (timing) => console.info('[realtime-review]', JSON.stringify(timing)),
       session: { sessionId, tenantId, roomId: targetRoom, presenterId, presenterName, product: persisted?.product ?? roomProducts[0], lineup: persisted?.lineup?.length ? persisted.lineup : roomProducts },
     });

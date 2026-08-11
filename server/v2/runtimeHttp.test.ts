@@ -92,6 +92,49 @@ describe('v2 HTTP/WebSocket runtime', () => {
     expect(restored?.snapshot().latestCompliance).toMatchObject({ source: 'custom-rule', risk: 'blocked', title: '命中私有规则' });
   });
 
+  it('keeps rule scope and review rollback lifecycle visible over HTTP', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-rule-governance-'));
+    const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });
+    runtime.getOrCreateSession({ sessionId: 'live-rule-governance', roomId: 'room-rule-governance' });
+    const http = createV2Http(runtime, { clientDir: join(directory, 'missing-client') });
+    await new Promise<void>((resolve) => http.server.listen(0, '127.0.0.1', resolve));
+    const port = (http.server.address() as AddressInfo).port;
+    cleanups.push(async () => { await new Promise<void>((resolve) => http.server.close(() => resolve())); await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+
+    const createResponse = await fetch(`http://127.0.0.1:${port}/api/v2/rooms/room-rule-governance/rules`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        name: '商品专属风险词', pattern: '商品专属风险词', risk: 'blocked', title: '商品风险', reason: '测试商品规则', alternative: '安全表达', policyRef: '测试', scope: 'product', productId: PRODUCTS[0].id,
+      }),
+    });
+    const created = await createResponse.json() as { id: string; scope: string; productId?: string; version: number };
+    expect(createResponse.status).toBe(201);
+    expect(created).toMatchObject({ scope: 'product', productId: PRODUCTS[0].id, version: 1 });
+
+    const editedResponse = await fetch(`http://127.0.0.1:${port}/api/v2/rules/${created.id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ alternative: '编辑后的安全表达' }),
+    });
+    expect(editedResponse.status).toBe(200);
+    expect((await editedResponse.json() as { version: number }).version).toBe(2);
+
+    const rollbackResponse = await fetch(`http://127.0.0.1:${port}/api/v2/rules/${created.id}/rollback`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ version: 1 }),
+    });
+    const rolledBack = await rollbackResponse.json() as { version: number; alternative: string };
+    expect(rollbackResponse.status).toBe(200);
+    expect(rolledBack).toMatchObject({ version: 3, alternative: '安全表达' });
+
+    const learned = runtime.rules.learn('room-rule-governance', 'session-learning', {
+      id: 'remote-finding', productId: PRODUCTS[0].id, risk: 'blocked', title: '待审核', reason: '模型发现', alternative: '安全表达', policyRef: '测试', confidence: 0.99, source: 'doubao', transcript: '模型新风险词', createdAt: 1, matchedTerms: ['模型新风险词'], ruleKind: 'term',
+    }, PRODUCTS[0])[0];
+    expect(learned).toMatchObject({ status: 'pending_review', enabled: false, scope: 'product' });
+    const reviewResponse = await fetch(`http://127.0.0.1:${port}/api/v2/rules/${learned!.id}/review`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ decision: 'approved' }),
+    });
+    expect(reviewResponse.status).toBe(200);
+    expect(await reviewResponse.json()).toMatchObject({ status: 'published', enabled: true });
+    expect(runtime.rules.active('room-rule-governance', PRODUCTS[0]).some((rule) => rule.id === learned!.id)).toBe(true);
+  });
+
   it('keeps product details isolated per live room through the public API', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'dypro-room-products-'));
     const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });

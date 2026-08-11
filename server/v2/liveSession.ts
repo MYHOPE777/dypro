@@ -9,6 +9,7 @@ import { BoundedScheduler } from './scheduler';
 import { SqliteFactStore, type SessionCreation } from './store';
 import { RealtimeReviewPipeline, type RealtimeReviewTiming } from './realtimeReviewPipeline';
 import { SpeakerDiarizer, type SpeakerAssignment } from '../speakerDiarizer';
+import { buildRiskContext } from '../compliance/contextWindow';
 
 export type CapturePort = {
   start(): void;
@@ -32,7 +33,7 @@ export type LiveSessionOptions = {
   coach?: CoachProvider;
   now?: () => number;
   endingDrainTimeoutMs?: number;
-  rules?: () => ComplianceRule[];
+  rules?: (product: Product) => ComplianceRule[];
   referencePhrases?: (presenterId: string, productId: string) => Array<{ text: string; purpose?: CoachPurpose }>;
   resolvePresenter?: (presenterId: string) => { id: string; name: string } | null;
   onComplianceResult?: (result: ComplianceResult) => void;
@@ -71,7 +72,7 @@ export class LiveSession {
   private segmentSequence = 0;
   private readonly segmentRevisions = new Map<string, number>();
   private readonly reviewPipeline: RealtimeReviewPipeline;
-  private readonly rulesProvider: () => ComplianceRule[];
+  private readonly rulesProvider: (product: Product) => ComplianceRule[];
   private readonly referencePhraseProvider: (presenterId: string, productId: string) => Array<{ text: string; purpose?: CoachPurpose }>;
   private readonly presenterResolver: (presenterId: string) => { id: string; name: string } | null;
   private readonly speakerDiarizer = new SpeakerDiarizer();
@@ -261,22 +262,26 @@ export class LiveSession {
       this.commit('transcript.partial', { text, segment: JSON.stringify(segment) });
       return;
     }
-    const mentioned = findMentionedProduct(text, this.snapshotValue.lineup);
+    // Product auto-switching follows the host only. A guest or operator may
+    // mention another SKU while answering questions; that must not change the
+    // active product context used for risk rules and coaching.
+    const mentioned = segment.speaker !== 'other' ? findMentionedProduct(text, this.snapshotValue.lineup) : null;
     if (mentioned && mentioned.product.id !== this.snapshotValue.product.id) this.selectProduct(mentioned.product.id, 'speech');
     const product = this.snapshotValue.product;
     const requestNumber = ++this.requestSequence;
     const productGeneration = this.productRevision;
     const revision = this.segmentRevisions.get(id) ?? 0;
     this.commit('transcript.final', { segment: JSON.stringify(segment), productId: product.id });
-    const productContext = this.snapshotValue.transcriptHistory.filter((candidate) => candidate.timestamp >= this.productContextStartedAt);
+    const productContext = buildRiskContext(this.snapshotValue.transcriptHistory, this.productContextStartedAt, now);
     await this.reviewPipeline.process({
       token: { requestSequence: requestNumber, productRevision: productGeneration, segmentRevision: revision, segmentId: id },
       segment,
       product,
+      roomId: this.snapshotValue.roomId,
       riskProfile: this.snapshotValue.riskProfile,
-      context: { text: productContext.slice(-12).map((candidate) => candidate.text).join('\n'), segmentCount: productContext.length, windowStartMs: this.productContextStartedAt, windowEndMs: now },
+      context: productContext,
       stats: this.snapshotValue.stats,
-      customRules: this.rulesProvider(),
+      customRules: this.rulesProvider(product),
       referencePhrases: this.referencePhraseProvider(this.snapshotValue.presenterId, product.id),
     });
   }

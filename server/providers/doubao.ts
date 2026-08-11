@@ -1,6 +1,7 @@
 import type { ComplianceAnalyzer, AnalysisInput } from '../../src/compliance/engine';
 import { analyzeTranscript } from '../../src/compliance/engine';
 import type { ComplianceAnalysisTiming, ComplianceCategory, ComplianceResult } from '../../src/shared/types';
+import { SemanticReviewPolicy } from '../compliance/semanticReviewPolicy';
 import { getArkConfig, requestArk, type ArkConfig } from './ark';
 
 const severity = { safe: 0, warning: 1, blocked: 2 } as const;
@@ -62,7 +63,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
   private readonly localFastPath: boolean;
   private readonly cacheTtlMs: number;
   private readonly cache = new Map<string, { expiresAt: number; result: ComplianceResult }>();
-  private readonly semanticSampleCounts = new Map<string, number>();
+  private readonly reviewPolicy = new SemanticReviewPolicy();
 
   constructor(env: NodeJS.ProcessEnv = process.env) {
     this.config = getArkConfig(env);
@@ -78,14 +79,22 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
     const localStartedAt = performance.now();
     const localResult = await analyzeTranscript(input);
     const localGuardrailMs = elapsedMs(localStartedAt);
-    // High-confidence local blocks are already actionable; do not spend the realtime budget waiting for a second opinion.
-    // Local warnings from the built-in or published room rules are also actionable and avoid a model round trip.
-    if (!this.config || localResult.risk === 'blocked' || (this.localFastPath && localResult.risk === 'warning')) {
+    const review = this.reviewPolicy.decide({
+      roomId: input.roomId,
+      productId: input.productId,
+      productCategory: input.product?.category,
+      transcript: input.transcript,
+      contextText: input.context?.text,
+      riskProfile: input.riskProfile,
+      localResult,
+      speakerId: input.speakerId,
+      localFastPath: this.localFastPath,
+    });
+    // High-confidence local blocks are already actionable. Other results use the policy
+    // so context-triggered warnings can still reach the semantic model.
+    if (!this.config || !review.shouldReview) {
       const path: ComplianceAnalysisTiming['path'] = !this.config || localResult.risk === 'blocked' ? 'local' : 'fallback';
-      return { ...localResult, analysisTiming: { path, analyzerMs: elapsedMs(analyzerStartedAt), localGuardrailMs } };
-    }
-    if (localResult.risk === 'safe' && !this.shouldRunSemanticCheck(input)) {
-      return { ...localResult, analysisTiming: { path: 'local', analyzerMs: elapsedMs(analyzerStartedAt), localGuardrailMs } };
+      return { ...localResult, analysisTiming: { path, analyzerMs: elapsedMs(analyzerStartedAt), localGuardrailMs, reviewReason: !this.config ? 'not_configured' : review.reason } };
     }
     const cacheStartedAt = performance.now();
     const cacheKey = this.cacheKey(input);
@@ -99,6 +108,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
           analyzerMs: elapsedMs(analyzerStartedAt),
           localGuardrailMs,
           cacheLookupMs,
+          reviewReason: review.reason,
         },
       };
     }
@@ -125,7 +135,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
       const content = await requestArk(
         this.config,
         SYSTEM_PROMPT,
-        `当前商品：${JSON.stringify(product)}\n当前风险档位：${input.riskProfile ?? 'balanced'}\n主播当前原话：${input.transcript}\n同一商品最近上下文：${input.context?.text ?? '无'}\n本直播间相关规则：${JSON.stringify(compactRules)}`,
+        `当前商品：${JSON.stringify(product)}\n当前风险档位：${input.riskProfile ?? 'balanced'}\n当前说话人：${input.speaker === 'other' ? '其他人' : '主播'}\n主播当前原话：${input.transcript}\n同一商品最近上下文：${input.context?.text ?? '无'}\n本直播间相关规则：${JSON.stringify(compactRules)}`,
         this.maxOutputTokens,
         true,
       );
@@ -139,6 +149,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
         analyzerMs: elapsedMs(analyzerStartedAt),
         localGuardrailMs,
         cacheLookupMs,
+        reviewReason: review.reason,
         arkRequestMs,
         responseParseMs,
       };
@@ -156,6 +167,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
           analyzerMs: elapsedMs(analyzerStartedAt),
           localGuardrailMs,
           cacheLookupMs,
+          reviewReason: review.reason,
         },
       };
     }
@@ -165,20 +177,11 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
     return JSON.stringify({
       roomId: input.roomId ?? '',
       productId: input.productId,
+      speakerId: input.speakerId ?? '',
       transcript: input.transcript.trim(),
       riskProfile: input.riskProfile ?? 'balanced',
       context: input.context?.text ?? '',
       rules: input.customRules?.map((rule) => `${rule.id}:${rule.version}:${rule.enabled}:${rule.status}`).join('|') ?? '',
     });
-  }
-
-  private shouldRunSemanticCheck(input: AnalysisInput): boolean {
-    if (!input.riskProfile || input.riskProfile === 'strict') return true;
-    const semanticTrigger = /暗示|相当于|就像|好比|发动机|汽油|血液|心脏|疏通|排毒|修复|替代药|不用吃药|不能明说|懂的都懂|那个部位|指标恢复|循环起来/iu;
-    if (semanticTrigger.test(`${input.transcript}\n${input.context?.text ?? ''}`)) return true;
-    const key = `${input.roomId ?? ''}:${input.productId}`;
-    const count = (this.semanticSampleCounts.get(key) ?? 0) + 1;
-    this.semanticSampleCounts.set(key, count);
-    return count % (input.riskProfile === 'optimized' ? 3 : 2) === 0;
   }
 }

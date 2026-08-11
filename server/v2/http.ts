@@ -167,7 +167,8 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
     try {
       const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'control');
       const risk = request.body?.risk === 'blocked' || request.body?.risk === 'warning' ? request.body.risk : 'safe';
-      response.status(201).json(runtime.rules.create(roomId, actorId(request), { name: bodyString(request.body?.name, '规则名称'), pattern: bodyString(request.body?.pattern, '匹配内容'), matchType: request.body?.matchType === 'regex' ? 'regex' : 'contains', risk, title: bodyString(request.body?.title, '提醒标题'), reason: bodyString(request.body?.reason, '提醒原因'), alternative: bodyString(request.body?.alternative, '替代表达'), policyRef: bodyString(request.body?.policyRef, '规则依据') }));
+      const scope = request.body?.scope === 'product' || request.body?.scope === 'category' ? request.body.scope : 'room';
+      response.status(201).json(runtime.rules.create(roomId, actorId(request), { name: bodyString(request.body?.name, '规则名称'), pattern: bodyString(request.body?.pattern, '匹配内容'), matchType: request.body?.matchType === 'regex' ? 'regex' : 'contains', risk, title: bodyString(request.body?.title, '提醒标题'), reason: bodyString(request.body?.reason, '提醒原因'), alternative: bodyString(request.body?.alternative, '替代表达'), policyRef: bodyString(request.body?.policyRef, '规则依据'), scope, ...(typeof request.body?.productId === 'string' ? { productId: request.body.productId } : {}), ...(typeof request.body?.category === 'string' ? { category: request.body.category } : {}) }));
     } catch (error) { jsonError(response, error); }
   });
   app.patch('/api/v2/rules/:ruleId', (request, response) => {
@@ -176,9 +177,23 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
       const patch = request.body && typeof request.body === 'object' ? request.body as Record<string, unknown> : {};
       return response.json(runtime.rules.update(ruleId, actorId(request), {
         ...(typeof patch.name === 'string' ? { name: patch.name } : {}), ...(typeof patch.pattern === 'string' ? { pattern: patch.pattern } : {}),
-        ...(patch.matchType === 'regex' || patch.matchType === 'contains' ? { matchType: patch.matchType } : {}), ...(patch.risk === 'safe' || patch.risk === 'warning' || patch.risk === 'blocked' ? { risk: patch.risk } : {}),
+        ...(patch.matchType === 'regex' || patch.matchType === 'contains' ? { matchType: patch.matchType } : {}), ...(patch.risk === 'safe' || patch.risk === 'warning' || patch.risk === 'blocked' ? { risk: patch.risk } : {}), ...(patch.scope === 'room' || patch.scope === 'category' || patch.scope === 'product' || patch.scope === 'shared' ? { scope: patch.scope } : {}), ...(typeof patch.productId === 'string' ? { productId: patch.productId } : {}), ...(typeof patch.category === 'string' ? { category: patch.category } : {}),
         ...(typeof patch.title === 'string' ? { title: patch.title } : {}), ...(typeof patch.reason === 'string' ? { reason: patch.reason } : {}), ...(typeof patch.alternative === 'string' ? { alternative: patch.alternative } : {}), ...(typeof patch.policyRef === 'string' ? { policyRef: patch.policyRef } : {}), ...(typeof patch.enabled === 'boolean' ? { enabled: patch.enabled } : {}),
       }));
+    } catch (error) { return jsonError(response, error); }
+  });
+  app.post('/api/v2/rules/:ruleId/review', (request, response) => {
+    try {
+      const ruleId = routeParam(request, 'ruleId'); const rule = runtime.store.getRule(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assert(identity(request), rule.roomId, 'control');
+      if (request.body?.decision !== 'approved' && request.body?.decision !== 'rejected') return response.status(400).json({ message: '审核决定无效' });
+      return response.json(runtime.rules.review(ruleId, actorId(request), request.body.decision));
+    } catch (error) { return jsonError(response, error); }
+  });
+  app.post('/api/v2/rules/:ruleId/rollback', (request, response) => {
+    try {
+      const ruleId = routeParam(request, 'ruleId'); const rule = runtime.store.getRule(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assert(identity(request), rule.roomId, 'control');
+      const version = Number(request.body?.version); if (!Number.isInteger(version) || version < 1) return response.status(400).json({ message: '目标版本无效' });
+      return response.json(runtime.rules.rollback(ruleId, actorId(request), version));
     } catch (error) { return jsonError(response, error); }
   });
   app.get('/api/v2/rooms/:roomId/presenters', (request, response) => {

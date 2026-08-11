@@ -11,17 +11,21 @@ describe('SQLite catalog modules', () => {
     const store = new SqliteFactStore({ filename: ':memory:' });
     const rules = new RuleModule(store, () => 100);
     const finding: ComplianceResult = { id: 'finding', productId: DEFAULT_PRODUCT.id, risk: 'blocked', title: '暗示功效', reason: '测试', alternative: '安全表达', policyRef: '规则', confidence: 0.98, source: 'doubao', transcript: '神奇发动机', createdAt: 1, matchedTerms: ['神奇发动机'], ruleKind: 'term' };
-    rules.learn('room-default', 'session-1', finding);
-    const local = await analyzeTranscript({ roomId: 'room-default', productId: DEFAULT_PRODUCT.id, transcript: '又提到神奇发动机', product: DEFAULT_PRODUCT, customRules: rules.active('room-default') });
+    rules.learn('room-default', 'session-1', finding, DEFAULT_PRODUCT);
+    expect(rules.list('room-default')[0]).toMatchObject({ status: 'pending_review', enabled: false, scope: 'product', productId: DEFAULT_PRODUCT.id });
+    expect(rules.active('room-default', DEFAULT_PRODUCT)).toHaveLength(0);
+    rules.review(rules.list('room-default')[0].id, 'owner', 'approved');
+    const local = await analyzeTranscript({ roomId: 'room-default', productId: DEFAULT_PRODUCT.id, transcript: '又提到神奇发动机', product: DEFAULT_PRODUCT, customRules: rules.active('room-default', DEFAULT_PRODUCT) });
     expect(local.source).toBe('custom-rule');
     expect(local.risk).toBe('blocked');
-    rules.learn('room-default', 'session-2', { ...finding, confidence: 0.99 });
-    expect(rules.list('room-default')[0]).toMatchObject({ version: 2, evidenceCount: 2, lastSessionId: 'session-2' });
+    rules.learn('room-default', 'session-2', { ...finding, confidence: 0.99 }, DEFAULT_PRODUCT);
+    // Approval creates a new published version before later evidence is merged.
+    expect(rules.list('room-default')[0]).toMatchObject({ version: 3, evidenceCount: 2, lastSessionId: 'session-2' });
     expect(store.listResourceDeliveryJobs('queued')).toHaveLength(1);
-    expect(store.listResourceDeliveryJobs('superseded')).toHaveLength(1);
-    rules.learn('room-default', 'session-3', { ...finding, confidence: 0.7, matchedTerms: ['低置信词'] });
+    expect(store.listResourceDeliveryJobs('superseded')).toHaveLength(2);
+    rules.learn('room-default', 'session-3', { ...finding, confidence: 0.7, matchedTerms: ['低置信词'] }, DEFAULT_PRODUCT);
     expect(rules.list('room-default')).toHaveLength(1);
-    rules.learn('room-default', 'session-4', { ...finding, source: 'local-fallback', confidence: 0.99, matchedTerms: ['内置风险词'] });
+    rules.learn('room-default', 'session-4', { ...finding, source: 'local-fallback', confidence: 0.99, matchedTerms: ['内置风险词'] }, DEFAULT_PRODUCT);
     expect(rules.list('room-default')).toHaveLength(1);
     store.close();
   });
@@ -40,6 +44,18 @@ describe('SQLite catalog modules', () => {
     const phrase = presenters.phrases(presenter.id)[0];
     presenters.updatePhrase(phrase.id, { status: 'reference' });
     expect(presenters.references(presenter.id, DEFAULT_PRODUCT.id)[0].text).toBe('主播自己的话术');
+    store.close();
+  });
+
+  it('does not let a rejected learned rule bypass review through the enabled switch', () => {
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    const rules = new RuleModule(store, () => 100);
+    const learned = rules.learn('room-default', 'session-1', { id: 'finding', productId: DEFAULT_PRODUCT.id, risk: 'blocked', title: '待审核', reason: '测试', alternative: '安全表达', policyRef: '测试', confidence: 0.99, source: 'doubao', transcript: '模型新风险词', createdAt: 1, matchedTerms: ['模型新风险词'], ruleKind: 'term' }, DEFAULT_PRODUCT)[0]!;
+
+    const rejected = rules.review(learned.id, 'owner', 'rejected');
+    expect(rejected).toMatchObject({ status: 'rejected', enabled: false, approvedBy: undefined });
+    expect(() => rules.update(learned.id, 'owner', { enabled: true })).toThrow('必须通过审核');
+    expect(rules.review(learned.id, 'owner', 'approved')).toMatchObject({ status: 'published', enabled: true, approvedBy: 'owner' });
     store.close();
   });
 });

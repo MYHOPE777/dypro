@@ -15,7 +15,7 @@
 | `src/App.tsx` | 操作台、主播屏、资料管理和历史复核视图。 |
 | `src/clients/` | 带类型的 HTTP/WebSocket 客户端。 |
 
-领域术语以根目录 `CONTEXT.md` 为准，直播间商品隔离决策见 `docs/adr/0001-room-owned-product-catalogs.md`。
+领域术语以根目录 `CONTEXT.md` 为准，直播间商品隔离决策见 `docs/adr/0001-room-owned-product-catalogs.md`，实时风控边界见 `docs/COMPLIANCE_ARCHITECTURE.md` 和 `docs/COMPLIANCE_POLICY.md`。
 
 ## 2. 每次修改的固定流程
 

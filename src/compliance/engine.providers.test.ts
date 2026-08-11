@@ -68,22 +68,19 @@ describe('DoubaoComplianceAnalyzer', () => {
     vi.stubGlobal('fetch', fetchMock);
     const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model' });
 
-    await analyzer.analyze({ roomId: 'room-default', productId: 'serum', transcript: '这款面料触感柔软', riskProfile: 'optimized' });
-    await analyzer.analyze({ roomId: 'room-default', productId: 'serum', transcript: '日常通勤搭配很方便', riskProfile: 'optimized' });
-    await analyzer.analyze({ roomId: 'room-default', productId: 'serum', transcript: '现在看一下它的细节', riskProfile: 'optimized' });
+    for (const transcript of ['这款面料触感柔软', '日常通勤搭配很方便', '现在看一下它的细节', '再看一下包装设计', '触感比较轻薄', '适合日常通勤', '大家可以看细节', '我们继续介绍规格']) await analyzer.analyze({ roomId: 'room-default', productId: 'serum', transcript, riskProfile: 'optimized' });
 
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
-  it('reviews every second ordinary safe sentence in balanced mode', async () => {
+  it('reviews every fourth ordinary safe sentence in balanced mode', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       output_text: JSON.stringify({ risk: 'safe', category: 'context', title: '可继续', reason: '未发现风险', alternative: '继续介绍', policyRef: '平台规则', confidence: 0.9, matchedTerms: [], ruleKind: 'sentence' }),
     }), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
     const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model' });
 
-    await analyzer.analyze({ roomId: 'room-default', productId: 'serum', transcript: '先看一下瓶身设计', riskProfile: 'balanced' });
-    await analyzer.analyze({ roomId: 'room-default', productId: 'serum', transcript: '再看一下使用方式', riskProfile: 'balanced' });
+    for (const transcript of ['先看一下瓶身设计', '再看一下使用方式', '我们看一下规格', '最后看一下包装']) await analyzer.analyze({ roomId: 'room-default', productId: 'serum', transcript, riskProfile: 'balanced' });
 
     expect(fetchMock).toHaveBeenCalledOnce();
   });

@@ -388,6 +388,15 @@ export class SqliteFactStore {
     return row ? parseJson<ComplianceRule>(row.rule_json, {} as ComplianceRule) : null;
   }
 
+  getRuleVersion(ruleId: string, version: number): ComplianceRule | null {
+    const row = this.db.prepare('SELECT rule_json FROM rule_versions WHERE rule_id = ? AND version = ?').get(ruleId, version);
+    return row ? parseJson<ComplianceRule>(row.rule_json, {} as ComplianceRule) : null;
+  }
+
+  listRuleVersions(ruleId: string): ComplianceRule[] {
+    return this.db.prepare('SELECT rule_json FROM rule_versions WHERE rule_id = ? ORDER BY version DESC').all(ruleId).map((row) => parseJson<ComplianceRule>(row.rule_json, {} as ComplianceRule));
+  }
+
   listRules(roomId: string, activeOnly = false): ComplianceRule[] {
     const rows = this.db.prepare('SELECT rule_json FROM compliance_rules WHERE room_id = ? ORDER BY updated_at DESC').all(roomId);
     const rules = rows.map((row) => parseJson<ComplianceRule>(row.rule_json, {} as ComplianceRule));

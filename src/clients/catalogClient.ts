@@ -16,8 +16,10 @@ export class CatalogClient {
     }
   }
   async removeProduct(roomId: string, productId: string): Promise<Product[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/products/${encodeURIComponent(productId)}`, { method: 'DELETE' }); }
-  async createRule(roomId: string, input: { name: string; pattern: string; risk: 'warning' | 'blocked'; title: string; reason: string; alternative: string; policyRef: string }): Promise<ComplianceRule> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/rules`, { method: 'POST', body: JSON.stringify(input) }); }
+  async createRule(roomId: string, input: { name: string; pattern: string; risk: 'warning' | 'blocked'; title: string; reason: string; alternative: string; policyRef: string; scope?: 'room' | 'category' | 'product'; productId?: string; category?: string }): Promise<ComplianceRule> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/rules`, { method: 'POST', body: JSON.stringify(input) }); }
   async setRuleEnabled(rule: ComplianceRule, enabled: boolean): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }); }
+  async reviewRule(rule: ComplianceRule, decision: 'approved' | 'rejected'): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}/review`, { method: 'POST', body: JSON.stringify({ decision }) }); }
+  async rollbackRule(rule: ComplianceRule, version: number): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}/rollback`, { method: 'POST', body: JSON.stringify({ version }) }); }
   async presenters(roomId: string): Promise<PresenterProfile[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/presenters`); }
   async createPresenter(roomId: string, name: string): Promise<PresenterProfile> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/presenters`, { method: 'POST', body: JSON.stringify({ name }) }); }
   async phrases(presenterId: string, productId?: string): Promise<PresenterPhrase[]> { return this.request(`/api/v2/presenters/${encodeURIComponent(presenterId)}/phrases${productId ? `?productId=${encodeURIComponent(productId)}` : ''}`); }

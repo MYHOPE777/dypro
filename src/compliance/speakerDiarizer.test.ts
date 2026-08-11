@@ -71,6 +71,12 @@ describe('SpeakerDiarizer', () => {
     session.receiveAsr({ text: '嘉宾继续说', isFinal: true, startTimeMs: 800, endTimeMs: 1_180 });
     await Promise.resolve();
     expect(session.snapshot().transcriptHistory[2]).toMatchObject({ speakerId: 'speaker-2', speakerSource: 'manual', speaker: 'other' });
+
+    await session.dispatch({ type: 'audio', track: 'asr', pcm: tone(1_200, 400), sampleRate: 16_000, channels: 1 });
+    session.receiveAsr({ text: '耳机商品', isFinal: true, startTimeMs: 1_200, endTimeMs: 1_580 });
+    await Promise.resolve();
+    expect(session.snapshot().transcriptHistory.at(-1)).toMatchObject({ speakerId: 'speaker-2', speaker: 'other' });
+    expect(session.snapshot().product.id).toBe(DEFAULT_PRODUCT.id);
     store.close();
   });
 });

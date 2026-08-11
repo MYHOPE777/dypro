@@ -1,5 +1,5 @@
 import safeRegex from 'safe-regex2';
-import type { ComplianceCategory, ComplianceEnforcement, ComplianceResult, ComplianceRule, Product, RiskLevel, RiskProfile } from '../shared/types';
+import type { ComplianceCategory, ComplianceEnforcement, ComplianceResult, ComplianceRule, Product, RiskLevel, RiskProfile, SpeakerLabel } from '../shared/types';
 
 export type AnalysisInput = {
   roomId?: string;
@@ -8,6 +8,8 @@ export type AnalysisInput = {
   product?: Pick<Product, 'id' | 'name' | 'category' | 'price' | 'compliantPhrases'>;
   customRules?: ComplianceRule[];
   riskProfile?: RiskProfile;
+  speaker?: SpeakerLabel;
+  speakerId?: string;
   context?: { text: string; segmentCount: number; windowStartMs: number; windowEndMs: number };
 };
 
@@ -176,6 +178,10 @@ const RULES: Rule[] = [
 const makeId = () => `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const severity: Record<RiskLevel, number> = { safe: 0, warning: 1, blocked: 2 };
 
+function customScopeWeight(scope: ComplianceRule['scope']): number {
+  return scope === 'product' ? 3 : scope === 'category' ? 2 : 1;
+}
+
 function enforcementFor(risk: RiskLevel): ComplianceEnforcement {
   return risk === 'blocked' ? 'block_phrase' : risk === 'warning' ? 'warn' : 'allow';
 }
@@ -234,7 +240,10 @@ export function evaluateCustomRules(input: AnalysisInput): ComplianceResult | nu
     } catch {
       return false;
     }
-  }).sort((first, second) => severity[second.risk] - severity[first.risk])[0];
+  }).sort((first, second) => severity[second.risk] - severity[first.risk]
+    || customScopeWeight(second.scope) - customScopeWeight(first.scope)
+    || second.pattern.length - first.pattern.length
+    || second.version - first.version)[0];
   if (!rule) return null;
   return {
     id: `rule-${rule.id}-${Date.now()}`,
