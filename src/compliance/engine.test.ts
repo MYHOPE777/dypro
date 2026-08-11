@@ -46,6 +46,20 @@ describe('analyzeTranscript', () => {
     expect(result.alternative).not.toContain('肤感');
   });
 
+  it.each(['耳聋都可以治好', '治好耳聋', '耳聋能够根治'])('blocks cure claims that combine a medical condition with efficacy language: %s', async (transcript) => {
+    const result = await analyzeTranscript({ productId: 'headphones', transcript });
+
+    expect(result.risk).toBe('blocked');
+    expect(result.title).toContain('医疗');
+    expect(result.matchedTerms?.[0]).toBeTruthy();
+  });
+
+  it('allows a medical condition mention without a treatment claim', async () => {
+    const result = await analyzeTranscript({ productId: 'headphones', transcript: '关注耳聋人士的日常佩戴体验，具体以产品页面为准' });
+
+    expect(result.risk).toBe('safe');
+  });
+
   it('never lets a custom safe rule downgrade a built-in blocked expression', async () => {
     const safeRule: ComplianceRule = {
       id: 'rule-safe', roomId: 'room-default', scope: 'room', name: '普通保证用语', matchType: 'contains', pattern: '保证',

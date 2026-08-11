@@ -24,6 +24,8 @@ type Rule = {
   policyRef: string;
 };
 
+const MEDICAL_CONDITION_CLAIM = /(?:治疗|治愈|治好|根治|医治).{0,12}(?:耳聋|失聪|耳鸣|近视|白内障|糖尿病|高血压|癌症|肿瘤|抑郁症|关节炎)|(?:耳聋|失聪|耳鸣|近视|白内障|糖尿病|高血压|癌症|肿瘤|抑郁症|关节炎).{0,12}(?:治疗|治愈|治好|根治|医治)/iu;
+
 function matchedTerms(transcript: string, pattern: RegExp): string[] {
   const match = transcript.match(pattern);
   return match?.[0] ? [match[0]] : [];
@@ -76,6 +78,14 @@ const RULES: Rule[] = [
     policyRef: '直播电商｜价格与促销宣传',
   },
   {
+    pattern: MEDICAL_CONDITION_CLAIM,
+    risk: 'blocked',
+    title: '医疗功效暗示',
+    reason: '将疾病或症状与治疗、治愈等医学功效绑定，属于高风险医疗功效宣传。',
+    alternative: (product) => `可以改为：介绍${product?.name ?? '这款商品'}的日常使用场景，不对疾病治疗或恢复作承诺。`,
+    policyRef: '广告法｜直播电商营销行为规范',
+  },
+  {
     pattern: /保证|一定|绝对|百分之百|100%|全部消失|永不反弹|根治|立刻见效|三天.*消失/iu,
     risk: 'blocked',
     title: '绝对化功效承诺',
@@ -86,7 +96,7 @@ const RULES: Rule[] = [
     policyRef: '广告法｜化妆品功效宣称规范',
   },
   {
-    pattern: /治疗|治愈|药效|处方|降血糖|降血压|抗癌|消炎|杀菌|医学证明/iu,
+    pattern: /治疗|治愈|治好|药效|处方|降血糖|降血压|抗癌|消炎|杀菌|医学证明/iu,
     risk: 'blocked',
     title: '医疗功效暗示',
     reason: '把日常消费品与疾病治疗、药效或医学结论绑定，容易构成医疗功效暗示。',
