@@ -76,7 +76,7 @@ function useLive(role: 'operator' | 'display') {
       if (next.sessionId) {
         localStorage.setItem('v2-live-session', next.sessionId);
         const query = new URLSearchParams(window.location.search);
-        if (!query.get('session') && role === 'operator') {
+        if (role === 'operator' && query.get('session') !== next.sessionId) {
           query.set('session', next.sessionId);
           window.history.replaceState(null, '', `${window.location.pathname}?${query}`);
         }
@@ -268,7 +268,11 @@ function LiveControls({ snapshot, connected, status, send, sendAudio }: { snapsh
   const microphone = useMicrophone(sendAudio);
   const [devicePickerOpen, setDevicePickerOpen] = useState(false);
   const selectedDevice = microphone.devices.find((device) => device.deviceId === microphone.deviceId);
-  const begin = async () => { if (await microphone.start()) send({ type: snapshot.lifecycle === 'paused' ? 'resume' : 'start' }); };
+  const begin = async () => {
+    if (!await microphone.start()) return;
+    setDevicePickerOpen(false);
+    send({ type: snapshot.lifecycle === 'paused' ? 'resume' : 'start' });
+  };
   const changeDevice = async (nextDeviceId: string) => { if (!await microphone.selectDevice(nextDeviceId) && snapshot.lifecycle === 'live') send({ type: 'pause' }); };
   const pause = () => { microphone.stop(); send({ type: 'pause' }); };
   const end = () => { microphone.stop(); send({ type: 'end' }); };
@@ -278,9 +282,9 @@ function LiveControls({ snapshot, connected, status, send, sendAudio }: { snapsh
       <button type="button" className="device" aria-label={`选择输入设备${selectedDevice?.label ? `，当前 ${selectedDevice.label}` : ''}`} aria-expanded={devicePickerOpen} onClick={() => { setDevicePickerOpen((open) => !open); void microphone.refreshDevices(); }}><Mic size={14} /><span><strong>选择输入设备</strong><small>{selectedDevice?.label || (microphone.deviceId ? '已选择麦克风' : '系统默认麦克风')}</small></span><ChevronDown size={13} /></button>
       {devicePickerOpen && <div className="v2-device-menu"><label htmlFor="v2-audio-input">收音设备</label><select id="v2-audio-input" value={microphone.deviceId} onChange={(event) => void changeDevice(event.target.value)}><option value="">系统默认麦克风</option>{microphone.devices.map((device, index) => <option value={device.deviceId} key={device.deviceId}>{device.label || `麦克风 ${index + 1}`}</option>)}</select><button type="button" onClick={() => void microphone.refreshDevices()}><RefreshCw size={12} />刷新设备</button></div>}
     </div>
-    {(snapshot.lifecycle === 'idle' || snapshot.lifecycle === 'paused') && <button type="button" className="primary" onClick={() => void begin()} disabled={!connected}><Mic size={15} />{snapshot.lifecycle === 'paused' ? '继续收音' : '开始收音'}</button>}
-    {snapshot.lifecycle === 'live' && <button type="button" onClick={pause}><Pause size={15} />暂停</button>}
-    {snapshot.lifecycle !== 'idle' && snapshot.lifecycle !== 'ended' && <button type="button" className="danger" onClick={end}><CircleStop size={15} />结束本场</button>}
+    {(snapshot.lifecycle === 'idle' || snapshot.lifecycle === 'paused') && <button type="button" className="primary" onClick={() => void begin()} disabled={!connected}><Mic size={15} />{snapshot.lifecycle === 'paused' ? '继续录制' : '开启直播录制'}</button>}
+    {snapshot.lifecycle === 'live' && <button type="button" onClick={pause}><Pause size={15} />暂停录制</button>}
+    {snapshot.lifecycle !== 'idle' && snapshot.lifecycle !== 'ended' && <button type="button" className="danger" onClick={end} disabled={snapshot.lifecycle === 'ending'}><CircleStop size={15} />{snapshot.lifecycle === 'ending' ? '正在结束' : '结束本场'}</button>}
     {microphone.error && <span className="v2-control-error">{microphone.error}</span>}
   </div>;
 }

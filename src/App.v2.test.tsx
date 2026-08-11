@@ -68,6 +68,36 @@ describe('v2 operator view', () => {
     expect(await screen.findByRole('button', { name: /选择输入设备/u })).toBeTruthy();
   });
 
+  it('shows an explicit live recording action for an idle session', async () => {
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ type: 'ready', requestId: 'join', sessionId: 'live-recording-ready', products: PRODUCTS, snapshot: { ...snapshot(), sessionId: 'live-recording-ready', lifecycle: 'idle' } });
+
+    expect(await screen.findByRole('button', { name: '开启直播录制' })).toBeTruthy();
+  });
+
+  it('replaces an ended session URL with the next session returned by the server', async () => {
+    window.history.replaceState(null, '', '/?session=live-ended-url');
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ type: 'ready', requestId: 'join', sessionId: 'live-next-session', products: PRODUCTS, snapshot: { ...snapshot(), sessionId: 'live-next-session', lifecycle: 'idle' } });
+
+    await waitFor(() => expect(window.location.search).toBe('?session=live-next-session'));
+  });
+
+  it('sends an end command from the live recording controls', async () => {
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ type: 'ready', requestId: 'join', sessionId: 'live-end-command', products: PRODUCTS, snapshot: { ...snapshot(), sessionId: 'live-end-command', lifecycle: 'live' } });
+
+    fireEvent.click(await screen.findByRole('button', { name: '结束本场' }));
+    const frame = JSON.parse(socket.sent.at(-1) as string) as { command: { type: string } };
+    expect(frame.command).toEqual({ type: 'end' });
+  });
+
   it('starts capture with the microphone selected by the operator', async () => {
     const getUserMedia = vi.fn().mockResolvedValue({
       getTracks: () => [{ stop: vi.fn() }],
@@ -99,9 +129,10 @@ describe('v2 operator view', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: /选择输入设备/u }));
     fireEvent.change(await screen.findByLabelText('收音设备'), { target: { value: 'mic-presenter' } });
-    fireEvent.click(screen.getByRole('button', { name: '开始收音' }));
+    fireEvent.click(screen.getByRole('button', { name: '开启直播录制' }));
 
     await waitFor(() => expect(getUserMedia).toHaveBeenCalledWith({ audio: expect.objectContaining({ deviceId: { exact: 'mic-presenter' } }) }));
+    expect(screen.getByRole('button', { name: /选择输入设备/u }).getAttribute('aria-expanded')).toBe('false');
   });
 
   it('pauses the live session when switching to an unavailable microphone fails', async () => {
@@ -131,10 +162,11 @@ describe('v2 operator view', () => {
     socket.open();
     socket.receive({ type: 'ready', requestId: 'join', sessionId: 'live-client-test', products: PRODUCTS, snapshot: { ...snapshot(), lifecycle: 'idle' } });
     fireEvent.click(await screen.findByRole('button', { name: /选择输入设备/u }));
-    fireEvent.click(screen.getByRole('button', { name: '开始收音' }));
+    fireEvent.click(screen.getByRole('button', { name: '开启直播录制' }));
     await waitFor(() => expect(getUserMedia).toHaveBeenCalledTimes(1));
     socket.receive({ type: 'event', event: { sessionId: 'live-client-test', sequence: 4, type: 'lifecycle.changed', occurredAt: 4, payload: { lifecycle: 'live' } }, snapshot: { ...snapshot(), lifecycle: 'live', latestSequence: 4 } });
-    await screen.findByRole('button', { name: '暂停' });
+    await screen.findByRole('button', { name: '暂停录制' });
+    fireEvent.click(screen.getByRole('button', { name: /选择输入设备/u }));
     fireEvent.change(screen.getByLabelText('收音设备'), { target: { value: 'mic-presenter' } });
 
     await waitFor(() => expect(getUserMedia).toHaveBeenCalledTimes(2));

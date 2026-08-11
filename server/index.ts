@@ -6,18 +6,25 @@ import { createV2Http } from './v2/http';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const runtime = createRuntime({ env: process.env, rootDir });
-const { server } = createV2Http(runtime);
+const httpRuntime = createV2Http(runtime);
+const { server } = httpRuntime;
 const port = Number(process.env.PORT ?? 8787);
 
 server.listen(port, '0.0.0.0', () => {
   console.log(`Live runtime v2 listening on http://localhost:${port}`);
 });
 
+let shutdownStarted = false;
 const shutdown = (): void => {
-  server.close(async () => {
-    await runtime.close();
-    process.exit(0);
-  });
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  void httpRuntime.close()
+    .then(() => runtime.close())
+    .then(() => process.exit(0))
+    .catch((error) => {
+      console.error('[runtime-shutdown]', error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    });
 };
 process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);

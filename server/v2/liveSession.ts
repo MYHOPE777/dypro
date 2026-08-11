@@ -75,6 +75,7 @@ export class LiveSession {
   private readonly speakerDiarizer = new SpeakerDiarizer();
   private readonly speakerBindings = new Map<string, SpeakerLabel>();
   private audioOffsetMs = 0;
+  private endingPromise: Promise<void> | null = null;
 
   constructor(options: LiveSessionOptions) {
     this.store = options.store;
@@ -201,8 +202,17 @@ export class LiveSession {
     this.commit('capture.error', { message: error.message });
   }
 
-  private async end(): Promise<void> {
-    if (this.snapshotValue.lifecycle === 'idle' || this.snapshotValue.lifecycle === 'ended') return;
+  private end(): Promise<void> {
+    if (this.snapshotValue.lifecycle === 'idle' || this.snapshotValue.lifecycle === 'ended') return Promise.resolve();
+    if (this.endingPromise) return this.endingPromise;
+    const promise = this.finishEnd();
+    this.endingPromise = promise;
+    const clear = () => { if (this.endingPromise === promise) this.endingPromise = null; };
+    void promise.then(clear, clear);
+    return promise;
+  }
+
+  private async finishEnd(): Promise<void> {
     if (this.snapshotValue.lifecycle !== 'ending') this.commit('lifecycle.changed', { lifecycle: 'ending' });
     const drained = await drainWithin(this.capture.end(), this.endingDrainTimeoutMs);
     if (!drained) this.commit('capture.error', { message: 'ASR 排空超时，已保留已收到的最后转录' });
@@ -282,7 +292,13 @@ export class LiveSession {
   private commit(type: LiveEvent['type'], payload: Record<string, unknown>): LiveEvent {
     const event = this.store.appendSessionEvent(this.id, { type, occurredAt: this.now(), payload });
     this.snapshotValue = this.store.getSessionSnapshot(this.id)!;
-    for (const listener of this.listeners) listener(event, this.snapshot());
+    for (const listener of this.listeners) {
+      try {
+        listener(event, this.snapshot());
+      } catch (error) {
+        console.error('[live-session-listener]', JSON.stringify({ sessionId: this.id, eventType: event.type, error: error instanceof Error ? error.message : String(error) }));
+      }
+    }
     return event;
   }
 }

@@ -11,10 +11,11 @@ class FakeCapture implements CapturePort {
   startCount = 0;
   pauseCount = 0;
   resumeCount = 0;
+  endCalls = 0;
   start(): void { this.startCount += 1; }
   pause(): void { this.pauseCount += 1; }
   resume(): void { this.resumeCount += 1; }
-  end(): Promise<void> { return this.endPromise; }
+  end(): Promise<void> { this.endCalls += 1; return this.endPromise; }
   holdEnd(): void { this.endPromise = new Promise<void>((resolve) => { this.resolveEnd = resolve; }); }
   finishEnd(): void { this.resolveEnd?.(); this.resolveEnd = null; }
   pushAudio(): void { /* no-op fake */ }
@@ -57,6 +58,36 @@ describe('LiveSession', () => {
     await ending;
     expect(session.snapshot().lifecycle).toBe('ended');
     expect(events).toContain('session.ended');
+    store.close();
+  });
+
+  it('coalesces repeated end commands while capture is draining', async () => {
+    const capture = new FakeCapture();
+    capture.holdEnd();
+    const { store, session } = makeSession({ capture });
+    await session.dispatch({ type: 'start' });
+
+    const firstEnd = session.dispatch({ type: 'end' });
+    const secondEnd = session.dispatch({ type: 'end' });
+    expect(capture.endCalls).toBe(1);
+    expect(session.snapshot().lifecycle).toBe('ending');
+
+    capture.finishEnd();
+    await Promise.all([firstEnd, secondEnd]);
+    expect(session.snapshot().lifecycle).toBe('ended');
+    expect(store.listSessionEvents(session.id).filter((event) => event.type === 'session.ended')).toHaveLength(1);
+    store.close();
+  });
+
+  it('finishes ending even when a non-critical event subscriber fails', async () => {
+    const { store, session } = makeSession();
+    session.subscribe((event) => {
+      if (event.type === 'session.ended') throw new Error('archive failed');
+    });
+    await session.dispatch({ type: 'start' });
+
+    await expect(session.dispatch({ type: 'end' })).resolves.toBeUndefined();
+    expect(session.snapshot().lifecycle).toBe('ended');
     store.close();
   });
 

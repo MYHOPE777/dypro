@@ -27,6 +27,7 @@ export type V2Runtime = {
   readonly rules: RuleModule;
   readonly presenters: PresenterModule;
   getOrCreateSession(input?: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string }): LiveSessionPort;
+  getOrCreateOperatorSession(input?: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string }): LiveSessionPort;
   getSession(sessionId: string): LiveSessionPort | null;
   dispatch(sessionId: string, command: LiveCommand): Promise<void>;
   snapshot(sessionId: string): LiveSessionSnapshot | null;
@@ -93,7 +94,10 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
     const roomProducts = ensureRoomCatalog(targetRoom, tenantId);
     const sessionId = requestedId ?? `live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const defaultPresenter = presenters.ensureDefault(targetRoom);
-    const requestedPresenter = presenters.get(persisted?.presenterId ?? input.presenterId ?? '');
+    let requestedPresenter = presenters.get(persisted?.presenterId ?? input.presenterId ?? '');
+    if (!requestedPresenter && persisted?.presenterId) {
+      requestedPresenter = store.ensurePresenter({ id: persisted.presenterId, roomId: targetRoom, name: persisted.presenterName || '默认主播', accountName: '本地账号' });
+    }
     const presenter = requestedPresenter?.roomId === targetRoom ? requestedPresenter : defaultPresenter;
     const presenterId = presenter.id;
     const presenterName = persisted?.presenterName ?? (input.presenterName?.trim() || presenter.name);
@@ -131,15 +135,39 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
       if (event.type === 'lifecycle.changed' || event.type === 'capture.error') syncBackgroundScheduling();
       if (event.type === 'session.ended') {
         const snapshot = liveSession.snapshot();
-        presenters.archiveSession(snapshot.presenterId, sessionId, snapshot.product.id, snapshot.transcriptHistory);
+        try {
+          presenters.archiveSession(snapshot.presenterId, sessionId, snapshot.product.id, snapshot.transcriptHistory);
+        } catch (error) {
+          console.error('[session-archive]', JSON.stringify({ sessionId, presenterId: snapshot.presenterId, error: error instanceof Error ? error.message : String(error) }));
+        }
         void Promise.all([writer.source.finalize(), writer.asr.finalize()]).then(([source, asr]) => {
           if (source.byteLength > 0) store.registerAudioAsset({ id: `audio-source-${sessionId}`, sessionId, path: source.path, encoding: 'pcm_s16le_source', byteLength: source.byteLength, durationMs: source.durationMs, sampleRate: source.sampleRate, channels: source.channels });
           if (asr.byteLength > 0) store.registerAudioAsset({ id: `audio-asr-${sessionId}`, sessionId, path: asr.path, encoding: 'pcm_s16le_asr', byteLength: asr.byteLength, durationMs: asr.durationMs, sampleRate: asr.sampleRate, channels: asr.channels });
-        }).catch(() => undefined);
+        }).catch((error) => console.error('[audio-finalize]', JSON.stringify({ sessionId, error: error instanceof Error ? error.message : String(error) })));
       }
     });
     sessions.set(sessionId, liveSession);
     return liveSession;
+  };
+
+  // An operator URL identifies the last working session. Once that session has
+  // ended, start the next session in the same room instead of leaving the
+  // operator on a read-only ended snapshot.
+  const getOrCreateOperatorSession = (input: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string } = {}): LiveSession => {
+    const requestedId = validSessionId(input.sessionId);
+    const requestedSnapshot = requestedId ? (sessions.get(requestedId)?.snapshot() ?? store.getSessionSnapshot(requestedId)) : null;
+    if (requestedSnapshot?.lifecycle !== 'ended') return getOrCreateSession(input);
+
+    const activeInRoom = [...sessions.values()]
+      .map((session) => session.snapshot())
+      .filter((snapshot) => snapshot.roomId === requestedSnapshot.roomId && (snapshot.lifecycle === 'idle' || snapshot.lifecycle === 'paused'))
+      .sort((left, right) => right.createdAt - left.createdAt)[0];
+    if (activeInRoom) return getOrCreateSession({ sessionId: activeInRoom.sessionId });
+
+    const persistedActive = store.listSessionSummaries(requestedSnapshot.roomId).find((summary) => summary.lifecycle === 'idle' || summary.lifecycle === 'paused');
+    if (persistedActive) return getOrCreateSession({ sessionId: persistedActive.sessionId });
+
+    return getOrCreateSession({ roomId: requestedSnapshot.roomId, presenterId: requestedSnapshot.presenterId, presenterName: requestedSnapshot.presenterName });
   };
 
   const syncRoomCatalog = async (targetRoom: string): Promise<Product[]> => {
@@ -161,6 +189,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
   return {
     store, scheduler, review, delivery, authorization, rules, presenters,
     getOrCreateSession,
+    getOrCreateOperatorSession,
     getSession: (sessionId) => sessions.get(sessionId) ?? (store.getSessionSnapshot(sessionId) ? getOrCreateSession({ sessionId }) : null),
     dispatch: async (sessionId, command) => { const session = getOrCreateSession({ sessionId }); await session.dispatch(command); },
     snapshot: (sessionId) => sessions.get(sessionId)?.snapshot() ?? store.getSessionSnapshot(sessionId),

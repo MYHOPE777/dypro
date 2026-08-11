@@ -13,6 +13,8 @@ npm start
 
 打开 [http://localhost:8787](http://localhost:8787)。完整配置见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
 
+开发、版本发布、变更记录和回滚流程见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) 与 [CHANGELOG.md](CHANGELOG.md)。
+
 开发模式：
 
 ```bash

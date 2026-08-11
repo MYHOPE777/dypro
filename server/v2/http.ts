@@ -111,7 +111,7 @@ function isJoinCommand(value: unknown): value is V2JoinCommand {
     && (command.actorId === undefined || (typeof command.actorId === 'string' && command.actorId.length <= 96));
 }
 
-export type V2Http = { app: express.Express; server: http.Server; wsServer: WebSocketServer };
+export type V2Http = { app: express.Express; server: http.Server; wsServer: WebSocketServer; close(): Promise<void> };
 
 export function createV2Http(runtime: V2Runtime, options: { clientDir?: string } = {}): V2Http {
   const app = express();
@@ -119,6 +119,7 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
   const wsServer = new WebSocketServer({ noServer: true, maxPayload: 1_000_000 });
   const clientDir = options.clientDir ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../dist/client');
   const sockets = new WeakMap<WebSocket, { sessionId: string; roomId: string; identity: AuthIdentity | null; role: 'operator' | 'display'; unsubscribe: () => void; sequence: number }>();
+  const clients = new Set<WebSocket>();
   const captureLeases = new CaptureLease<WebSocket>();
 
   app.use(cors());
@@ -259,6 +260,7 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
   };
 
   wsServer.on('connection', (socket, request) => {
+    clients.add(socket);
     let joined = false;
     socket.on('message', async (data, isBinary) => {
       const current = sockets.get(socket);
@@ -281,9 +283,12 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
           const aliasDisplay = command.role === 'display' && Boolean(command.displayAlias && resolvedSessionId);
           if (!aliasDisplay) runtime.authorization.assertControlTransport({ encrypted: Boolean((request.socket as typeof request.socket & { encrypted?: boolean }).encrypted), remoteAddress: request.socket.remoteAddress, forwardedProto: typeof request.headers['x-forwarded-proto'] === 'string' ? request.headers['x-forwarded-proto'] : undefined });
           const joinIdentity = aliasDisplay ? null : runtime.authorization.authenticate({ token: command.token, claimedActorId: command.actorId, remoteAddress: request.socket.remoteAddress, origin: typeof request.headers.origin === 'string' ? request.headers.origin : undefined });
-          const accessRoomId = (resolvedSessionId ? runtime.snapshot(resolvedSessionId)?.roomId : undefined) ?? command.roomId ?? 'room-default';
+          const requestedSnapshot = resolvedSessionId ? runtime.snapshot(resolvedSessionId) : null;
+          const accessRoomId = requestedSnapshot?.roomId ?? command.roomId ?? 'room-default';
           if (joinIdentity) runtime.authorization.assert(joinIdentity, accessRoomId, 'view');
-          const session = runtime.getOrCreateSession({ sessionId: resolvedSessionId ?? undefined, roomId: command.roomId, presenterId: command.presenterId });
+          const session = command.role === 'operator'
+            ? runtime.getOrCreateOperatorSession({ sessionId: resolvedSessionId ?? undefined, roomId: requestedSnapshot?.roomId ?? command.roomId, presenterId: requestedSnapshot?.presenterId ?? command.presenterId, presenterName: requestedSnapshot?.presenterName })
+            : runtime.getOrCreateSession({ sessionId: resolvedSessionId ?? undefined, roomId: command.roomId, presenterId: command.presenterId });
           if (joinIdentity) runtime.authorization.assert(joinIdentity, session.snapshot().roomId, 'view');
           const unsubscribe = runtime.subscribe(session.id, (event, snapshot) => {
             const state = sockets.get(socket);
@@ -310,6 +315,7 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
       }
     });
     socket.on('close', () => {
+      clients.delete(socket);
       const state = sockets.get(socket);
       state?.unsubscribe();
       if (state && captureLeases.release(state.sessionId, socket) && runtime.snapshot(state.sessionId)?.lifecycle === 'live') void runtime.dispatch(state.sessionId, { type: 'pause' });
@@ -329,5 +335,17 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
       return next();
     });
   }
-  return { app, server, wsServer };
+  let closePromise: Promise<void> | null = null;
+  const close = (): Promise<void> => {
+    if (closePromise) return closePromise;
+    closePromise = (async () => {
+      await new Promise<void>((resolve) => {
+        wsServer.close(() => resolve());
+        for (const client of clients) client.terminate();
+      });
+      if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    })();
+    return closePromise;
+  };
+  return { app, server, wsServer, close };
 }

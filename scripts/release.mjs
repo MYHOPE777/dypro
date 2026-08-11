@@ -6,6 +6,7 @@ import process from 'node:process';
 const root = exec('git', ['rev-parse', '--show-toplevel']).trim();
 const packagePath = path.join(root, 'package.json');
 const lockPath = path.join(root, 'package-lock.json');
+const changelogPath = path.join(root, 'CHANGELOG.md');
 const backupDirectory = path.join(root, '.git', 'backups');
 
 function exec(command, args, options = {}) {
@@ -55,6 +56,11 @@ function updatePackageVersion(version) {
   writeFileSync(lockPath, `${JSON.stringify(lockJson, null, 2)}\n`, 'utf8');
 }
 
+function assertChangelog(version) {
+  const changelog = readFileSync(changelogPath, 'utf8');
+  if (!changelog.includes(`## [${version}]`)) throw new Error(`CHANGELOG.md 缺少版本 ${version}，请先记录变更、验证和回滚说明`);
+}
+
 function restoreFiles(originalPackage, originalLock) {
   writeFileSync(packagePath, originalPackage, 'utf8');
   writeFileSync(lockPath, originalLock, 'utf8');
@@ -86,6 +92,7 @@ const originalPackage = readFileSync(packagePath, 'utf8');
 const originalLock = readFileSync(lockPath, 'utf8');
 
 console.log(`准备发布 ${tag}`);
+assertChangelog(version);
 console.log('1/5 运行测试、生产构建与端到端验收');
 runChecked('npm', ['test']);
 runChecked('npm', ['run', 'build']);

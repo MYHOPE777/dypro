@@ -9,6 +9,7 @@ import { PRODUCTS } from '../../src/shared/products';
 import { hashPassword } from '../auth';
 import { createV2Http } from './http';
 import { createRuntime, type V2Runtime } from './runtime';
+import { SqliteFactStore } from './store';
 
 class Inbox {
   private readonly frames: V2ServerFrame[] = [];
@@ -47,6 +48,26 @@ describe('v2 HTTP/WebSocket runtime', () => {
     expect(runtime.scheduler.snapshot().background.paused).toBe(true);
     await second.dispatch({ type: 'pause' });
     expect(runtime.scheduler.snapshot().background.paused).toBe(false);
+  });
+
+  it('restores a missing legacy presenter before archiving an ended session', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-legacy-presenter-'));
+    const dbPath = join(directory, 'app.sqlite');
+    const seed = new SqliteFactStore({ filename: dbPath, audioRoot: join(directory, 'audio') });
+    seed.ensureRoom({ id: 'room-default', tenantId: 'tenant-local' });
+    seed.createSession({ sessionId: 'live-legacy-presenter', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-legacy', presenterName: '历史主播', product: PRODUCTS[0], lineup: PRODUCTS });
+    seed.appendSessionEvent('live-legacy-presenter', { type: 'lifecycle.changed', occurredAt: 2, payload: { lifecycle: 'live' } });
+    seed.appendSessionEvent('live-legacy-presenter', { type: 'transcript.final', occurredAt: 3, payload: { segment: JSON.stringify({ id: 'legacy-segment', text: '历史主播话术', isFinal: true, timestamp: 3, offsetMs: 1_000, startOffsetMs: 0, endOffsetMs: 1_000, speaker: 'host' }) } });
+    seed.close();
+
+    const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: dbPath, V2_AUDIO_DIR: join(directory, 'audio') } });
+    cleanups.push(async () => { await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+    const session = runtime.getOrCreateSession({ sessionId: 'live-legacy-presenter' });
+
+    expect(runtime.presenters.get('presenter-legacy')).toMatchObject({ roomId: 'room-default', name: '历史主播' });
+    await session.dispatch({ type: 'end' });
+    expect(session.snapshot().lifecycle).toBe('ended');
+    expect(runtime.presenters.phrases('presenter-legacy')).toHaveLength(1);
   });
 
   it('reopens a persisted session with its original room dependencies', async () => {
@@ -210,6 +231,28 @@ describe('v2 HTTP/WebSocket runtime', () => {
     first.close(); second.close();
   });
 
+  it('closes upgraded websocket clients before completing server shutdown', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-http-shutdown-'));
+    const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });
+    const http = createV2Http(runtime, { clientDir: join(directory, 'missing-client') });
+    await new Promise<void>((resolve) => http.server.listen(0, '127.0.0.1', resolve));
+    const port = (http.server.address() as AddressInfo).port;
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/ws/v2`);
+    await new Promise<void>((resolve) => socket.once('open', resolve));
+    socket.send(JSON.stringify({ requestId: 'shutdown-join', command: { type: 'session.join', roomId: 'room-default', role: 'operator' } }));
+    await new Promise<void>((resolve) => socket.once('message', resolve));
+    const socketClosed = new Promise<void>((resolve) => socket.once('close', resolve));
+
+    const close = (http as typeof http & { close?: () => Promise<void> }).close;
+    expect(close).toBeTypeOf('function');
+    await close!();
+    await socketClosed;
+    expect(http.server.listening).toBe(false);
+    expect(socket.readyState).toBe(WebSocket.CLOSED);
+    await runtime.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
   it('joins the original session through a generated presenter alias', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'dypro-display-link-'));
     const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });
@@ -231,6 +274,39 @@ describe('v2 HTTP/WebSocket runtime', () => {
     const ready = await inbox.until((frame) => frame.type === 'ready');
     expect(ready.type === 'ready' && ready.sessionId).toBe(session.id);
     display.close();
+  });
+
+  it('opens a new idle session when an operator returns through an ended session URL', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-next-live-session-'));
+    const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });
+    const ended = runtime.getOrCreateSession({ sessionId: 'live-ended-url', roomId: 'room-next-live' });
+    await ended.dispatch({ type: 'start' });
+    await ended.dispatch({ type: 'end' });
+    const http = createV2Http(runtime, { clientDir: join(directory, 'missing-client') });
+    await new Promise<void>((resolve) => http.server.listen(0, '127.0.0.1', resolve));
+    const port = (http.server.address() as AddressInfo).port;
+    cleanups.push(async () => { await new Promise<void>((resolve) => http.server.close(() => resolve())); await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+
+    const operator = new WebSocket(`ws://127.0.0.1:${port}/ws/v2`);
+    await new Promise<void>((resolve) => operator.once('open', resolve));
+    const inbox = new Inbox(operator);
+    operator.send(JSON.stringify({ requestId: 'join-ended-url', command: { type: 'session.join', sessionId: ended.id, roomId: 'room-next-live', role: 'operator' } }));
+    const ready = await inbox.until((frame) => frame.type === 'ready');
+
+    expect(ready.type === 'ready' && ready.sessionId).not.toBe(ended.id);
+    expect(ready.type === 'ready' && ready.snapshot).toMatchObject({ roomId: 'room-next-live', lifecycle: 'idle' });
+    expect(runtime.listSessions('room-next-live')).toHaveLength(2);
+
+    const secondOperator = new WebSocket(`ws://127.0.0.1:${port}/ws/v2`);
+    await new Promise<void>((resolve) => secondOperator.once('open', resolve));
+    const secondInbox = new Inbox(secondOperator);
+    secondOperator.send(JSON.stringify({ requestId: 'join-ended-url-again', command: { type: 'session.join', sessionId: ended.id, roomId: 'room-next-live', role: 'operator' } }));
+    const secondReady = await secondInbox.until((frame) => frame.type === 'ready');
+
+    expect(secondReady.type === 'ready' && secondReady.sessionId).toBe(ready.type === 'ready' ? ready.sessionId : '');
+    expect(runtime.listSessions('room-next-live')).toHaveLength(2);
+    secondOperator.close();
+    operator.close();
   });
 
   it('rejects an expired presenter alias without creating another session', async () => {
