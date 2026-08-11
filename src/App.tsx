@@ -398,17 +398,17 @@ function ProductCatalogEditor({ roomId, activeProductId, products }: { roomId: s
 
   return <div className="v2-product-manager">
     <section className="v2-product-catalog">
-      <header><div><strong>当前直播间商品</strong><small>{items.length} 个 · 修改后实时同步本场</small></div><button type="button" aria-label="新增商品" onClick={() => setDraft(blankProduct())}><Plus size={14} /></button></header>
+      <header><div><strong>当前直播间商品</strong><small>{items.length} 个 · 修改后实时同步本场</small></div><button type="button" className="v2-add-product" onClick={() => setDraft(blankProduct())}><Plus size={13} />新增商品</button></header>
       <div>{items.map((product) => <article className={product.id === activeProductId ? 'active' : ''} key={product.id}><img src={product.image} alt="" /><div><strong>{product.name}</strong><small>{product.category} · {product.price} · {product.sku}</small><p>{product.description}</p></div><div className="v2-product-actions"><button type="button" aria-label={`编辑 ${product.name}`} onClick={() => setDraft(structuredClone(product))}><Pencil size={13} /></button><button type="button" aria-label={`移除 ${product.name}`} disabled={busy || items.length <= 1} onClick={() => void remove(product)}><Trash2 size={13} /></button></div></article>)}</div>
     </section>
     <section className="v2-product-editor-panel">
       {draft ? <form onSubmit={(event) => void save(event)}>
         <header><div><strong>{items.some((product) => product.id === draft.id) ? '编辑商品资料' : '新增直播间商品'}</strong><small>{draft.id}</small></div><button type="button" aria-label="关闭商品编辑" onClick={() => setDraft(null)}><X size={14} /></button></header>
         <div className="v2-product-fields"><label>商品名称<input value={draft.name} onChange={(event) => updateDraft('name', event.target.value)} required /></label><label>商品分类<input value={draft.category} onChange={(event) => updateDraft('category', event.target.value)} required /></label><label>实时价格<input value={draft.price} onChange={(event) => updateDraft('price', event.target.value)} required /></label><label>商品编码<input value={draft.sku} onChange={(event) => updateDraft('sku', event.target.value)} required /></label></div>
-        <label>商品描述<textarea value={draft.description} onChange={(event) => updateDraft('description', event.target.value)} required /></label>
-        <label>核心卖点<textarea value={draft.sellingPoints.join('\n')} onChange={(event) => updateDraft('sellingPoints', event.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} placeholder="每行一个卖点" required /></label>
-        <label>对应商品参考话术<textarea value={draft.compliantPhrases.join('\n')} onChange={(event) => updateDraft('compliantPhrases', event.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} placeholder="每行一段，可直接给主播参考" required /></label>
-        <button type="submit" disabled={busy || !draft.name.trim() || !draft.description.trim() || !draft.sellingPoints.length || !draft.compliantPhrases.length}><Save size={13} />保存并同步本场</button>
+        <label>商品描述<textarea value={draft.description} onChange={(event) => updateDraft('description', event.target.value)} placeholder="可稍后补充" /></label>
+        <label>核心卖点<textarea value={draft.sellingPoints.join('\n')} onChange={(event) => updateDraft('sellingPoints', event.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} placeholder="每行一个卖点，可稍后补充" /></label>
+        <label>对应商品参考话术<textarea value={draft.compliantPhrases.join('\n')} onChange={(event) => updateDraft('compliantPhrases', event.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} placeholder="每行一段，可稍后补充" /></label>
+        <button type="submit" disabled={busy || !draft.name.trim() || !draft.category.trim() || !draft.price.trim() || !draft.sku.trim()}><Save size={13} />保存并同步本场</button>
       </form> : <div className="v2-product-editor-empty"><Package size={24} /><strong>选择商品开始调整</strong><span>开播中修改会同步到中控台、主播屏和本场历史</span></div>}
     </section>
     {message && <div className="v2-product-message">{message}</div>}

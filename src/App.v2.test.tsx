@@ -262,4 +262,27 @@ describe('v2 operator view', () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v2/rooms/room-default/products/serum', expect.objectContaining({ method: 'PUT' })));
   });
+
+  it('creates a room product before optional selling material is completed', async () => {
+    const fetchMock = vi.fn().mockImplementation(async (input: string, init?: RequestInit) => {
+      if (input.endsWith('/rules')) return { ok: true, json: async () => ({ rules: [], audits: [] }) };
+      if (input.endsWith('/presenters')) return { ok: true, json: async () => [] };
+      if (input.endsWith('/products') && !init?.method) return { ok: true, json: async () => PRODUCTS };
+      if (input.includes('/products/product-') && init?.method === 'PUT') return { ok: true, json: async () => JSON.parse(init.body as string) };
+      throw new Error(`unexpected request: ${input}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ type: 'ready', requestId: 'join', sessionId: 'live-client-test', products: PRODUCTS, snapshot: snapshot() });
+    fireEvent.click(await screen.findByRole('button', { name: '资料管理' }));
+    fireEvent.click(await screen.findByRole('button', { name: '商品资料' }));
+    fireEvent.click(await screen.findByRole('button', { name: '新增商品' }));
+    fireEvent.change(screen.getByLabelText('商品名称'), { target: { value: '当前直播间新商品' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存并同步本场' }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/v2/rooms/room-default/products/product-'), expect.objectContaining({ method: 'PUT' })));
+  });
 });

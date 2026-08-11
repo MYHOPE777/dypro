@@ -46,6 +46,14 @@ function productText(value: unknown, name: string, maximum: number): string {
   return text;
 }
 
+function optionalProductText(value: unknown, name: string, maximum: number): string {
+  if (value === undefined || value === null || value === '') return '';
+  if (typeof value !== 'string') throw new Error(`${name}格式无效`);
+  const text = value.trim();
+  if (text.length > maximum) throw new Error(`${name}不能超过 ${maximum} 个字符`);
+  return text;
+}
+
 function productTextList(value: unknown, name: string, maximumItems = 20): string[] {
   if (!Array.isArray(value) || value.length > maximumItems || value.some((item) => typeof item !== 'string' || !item.trim() || item.trim().length > 200)) throw new Error(`${name}格式无效`);
   return value.map((item) => (item as string).trim());
@@ -62,7 +70,7 @@ function productInput(productId: string, value: unknown): Product {
     price: productText(product.price, '商品价格', 40),
     stock,
     sku: productText(product.sku, '商品编码', 96),
-    description: productText(product.description, '商品描述', 1_000),
+    description: optionalProductText(product.description, '商品描述', 1_000),
     sellingPoints: productTextList(product.sellingPoints, '商品卖点'),
     compliantPhrases: productTextList(product.compliantPhrases, '参考话术'),
     image: typeof product.image === 'string' && product.image.trim().length <= 500 ? product.image.trim() : '/products/serum.svg',

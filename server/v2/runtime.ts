@@ -170,7 +170,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
     return getOrCreateSession({ roomId: requestedSnapshot.roomId, presenterId: requestedSnapshot.presenterId, presenterName: requestedSnapshot.presenterName });
   };
 
-  const syncRoomCatalog = async (targetRoom: string): Promise<Product[]> => {
+  const syncRoomCatalog = async (targetRoom: string, appendProductId?: string): Promise<Product[]> => {
     const room = store.listRooms().find((candidate) => candidate.id === targetRoom);
     if (!room) throw new Error('直播间不存在');
     const catalog = store.listProducts(room.tenantId ?? 'tenant-local', targetRoom);
@@ -181,6 +181,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
       const snapshot = session.snapshot();
       const catalogIds = new Set(catalog.map((product) => product.id));
       const retainedIds = snapshot.lineup.map((product) => product.id).filter((productId) => catalogIds.has(productId));
+      if (appendProductId && catalogIds.has(appendProductId) && !retainedIds.includes(appendProductId)) retainedIds.push(appendProductId);
       return session.dispatch({ type: 'catalog_sync', products: catalog }).then(() => session.dispatch({ type: 'set_lineup', productIds: retainedIds.length > 0 ? retainedIds : catalog.map((product) => product.id) }));
     }));
     return catalog;
@@ -203,9 +204,11 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
     upsertProduct: async (targetRoom, product) => {
       const room = store.listRooms().find((candidate) => candidate.id === targetRoom);
       if (!room) throw new Error('直播间不存在');
+      const tenantId = room.tenantId ?? 'tenant-local';
+      const isNew = !store.listProducts(tenantId, targetRoom).some((candidate) => candidate.id === product.id);
       const saved = { ...product, source: 'manual' as const, updatedAt: Date.now() };
-      store.upsertProduct(room.tenantId ?? 'tenant-local', saved, targetRoom);
-      await syncRoomCatalog(targetRoom);
+      store.upsertProduct(tenantId, saved, targetRoom);
+      await syncRoomCatalog(targetRoom, isNew ? saved.id : undefined);
       return saved;
     },
     removeProduct: async (targetRoom, productId) => {

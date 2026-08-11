@@ -123,6 +123,25 @@ describe('v2 HTTP/WebSocket runtime', () => {
     operator.close();
   });
 
+  it('creates a room product before optional selling material is completed', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-room-product-create-'));
+    const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });
+    const session = runtime.getOrCreateSession({ sessionId: 'live-room-product-create', roomId: 'room-product-create' });
+    const http = createV2Http(runtime, { clientDir: join(directory, 'missing-client') });
+    await new Promise<void>((resolve) => http.server.listen(0, '127.0.0.1', resolve));
+    const port = (http.server.address() as AddressInfo).port;
+    cleanups.push(async () => { await new Promise<void>((resolve) => http.server.close(() => resolve())); await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+    const product = { ...PRODUCTS[0], id: 'product-room-new', name: '直播间新商品', description: '', sellingPoints: [], compliantPhrases: [] };
+
+    const response = await fetch(`http://127.0.0.1:${port}/api/v2/rooms/room-product-create/products/${product.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(product),
+    });
+
+    expect(response.status).toBe(200);
+    expect(runtime.listProducts('room-product-create')).toContainEqual(expect.objectContaining({ id: product.id, name: product.name }));
+    expect(session.snapshot().lineup).toContainEqual(expect.objectContaining({ id: product.id, name: product.name }));
+  });
+
   it('broadcasts live product edits and retains the selected product in session history', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'dypro-live-product-edit-'));
     const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });

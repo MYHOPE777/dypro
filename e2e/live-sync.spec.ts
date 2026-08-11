@@ -29,9 +29,17 @@ test('keeps operator and presenter views synchronized', async ({ page, browser, 
     await page.getByRole('button', { name: '保存并同步本场' }).click();
     await expect(page.getByText('商品资料已同步到当前直播间和本场页面')).toBeVisible();
     await expect(presenter.locator('.v2-brand small')).toHaveText(liveProductName);
+    const newProductName = `直播间新商品-${testInfo.project.name}`;
+    await page.getByRole('button', { name: '新增商品' }).click();
+    await page.getByLabel('商品名称').fill(newProductName);
+    await page.getByRole('button', { name: '保存并同步本场' }).click();
+    await expect(page.locator('.v2-product-catalog').getByText(newProductName)).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath('product-editor.png'), fullPage: true });
     await page.getByTitle('关闭').click();
     await expect(page.getByRole('heading', { name: liveProductName })).toBeVisible();
+    await page.getByRole('button', { name: new RegExp(newProductName, 'u') }).click();
+    await expect(page.getByRole('heading', { name: newProductName })).toBeVisible();
+    await expect(presenter.locator('.v2-brand small')).toHaveText(newProductName);
 
     const transcript = '云感降噪耳机适合日常通勤使用';
     await page.getByPlaceholder('粘贴或输入主播话术进行核验').fill(transcript);
