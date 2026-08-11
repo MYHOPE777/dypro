@@ -366,7 +366,7 @@ function blankProduct(): Product {
   };
 }
 
-function ProductCatalogEditor({ roomId, activeProductId, products }: { roomId: string; activeProductId: string; products: Product[] }) {
+function ProductCatalogEditor({ roomId, activeProductId, products, onSaved }: { roomId: string; activeProductId: string; products: Product[]; onSaved?: (product: Product, isNew: boolean) => void }) {
   const client = useMemo(() => new CatalogClient(), []);
   const [items, setItems] = useState(products);
   const [draft, setDraft] = useState<Product | null>(null);
@@ -384,8 +384,10 @@ function ProductCatalogEditor({ roomId, activeProductId, products }: { roomId: s
     if (!draft) return;
     setBusy(true); setMessage('');
     try {
+      const isNew = !items.some((product) => product.id === draft.id);
       const saved = await client.saveProduct(roomId, { ...draft, updatedAt: Date.now() });
       setItems((current) => current.some((product) => product.id === saved.id) ? current.map((product) => product.id === saved.id ? saved : product) : [...current, saved]);
+      onSaved?.(saved, isNew);
       setDraft(null);
       setMessage('商品资料已同步到当前直播间和本场页面');
     } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } finally { setBusy(false); }
@@ -448,7 +450,9 @@ function LibraryWorkspace({ snapshot, products, send, onClose }: { snapshot: Liv
   return <div className="v2-modal"><section className="v2-review-workspace v2-library-workspace">
     <header><div><BookOpen size={19} /><span><strong>资料管理</strong><small>商品、风险规则与主播专属话术均保存在本机</small></span></div><button type="button" title="关闭" onClick={onClose}><X size={17} /></button></header>
     <nav>{(['phrases', 'rules', 'products'] as const).map((item) => <button type="button" key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item === 'phrases' ? '主播话术' : item === 'rules' ? '风险规则' : '商品资料'}</button>)}</nav>
-    <main>{tab === 'products' && <ProductCatalogEditor roomId={snapshot.roomId} activeProductId={snapshot.product.id} products={products} />}
+    <main>{tab === 'products' && <ProductCatalogEditor roomId={snapshot.roomId} activeProductId={snapshot.product.id} products={products} onSaved={(product, isNew) => {
+      if (isNew) send({ type: 'set_lineup', productIds: [...new Set([...snapshot.lineup.map((candidate) => candidate.id), product.id])] });
+    }} />}
       {tab === 'rules' && <div className="v2-library-columns"><section><header><span>新增高置信规则</span></header><input value={ruleDraft.pattern} onChange={(event) => setRuleDraft({ ...ruleDraft, pattern: event.target.value })} placeholder="风险词或明确短语" /><input value={ruleDraft.title} onChange={(event) => setRuleDraft({ ...ruleDraft, title: event.target.value })} placeholder="提醒标题" /><textarea value={ruleDraft.alternative} onChange={(event) => setRuleDraft({ ...ruleDraft, alternative: event.target.value })} placeholder="主播可直接替换的安全表达" /><button type="button" disabled={busy || !ruleDraft.pattern || !ruleDraft.title || !ruleDraft.alternative} onClick={addRule}><Plus size={13} />保存规则</button></section><section className="v2-library-list">{rules.map((rule) => <article key={rule.id}><div><span className={rule.risk}>{rule.risk === 'blocked' ? '高风险' : '提醒'}</span><strong>{rule.name}</strong></div><p>{rule.pattern}</p><small>{rule.origin === 'learned' ? `自动沉淀 · 证据 ${rule.evidenceCount ?? 1} 次` : `人工规则 · v${rule.version}`}</small><button type="button" onClick={() => void run(() => client.setRuleEnabled(rule, !rule.enabled))}>{rule.enabled ? '停用' : '启用'}</button></article>)}</section></div>}
       {tab === 'phrases' && <div className="v2-library-columns"><section><header><span>主播档案</span></header><select value={presenterId} onChange={(event) => setPresenterId(event.target.value)}>{presenters.map((presenter) => <option value={presenter.id} key={presenter.id}>{presenter.name}</option>)}</select><button type="button" disabled={!presenterId || presenterId === snapshot.presenterId} onClick={() => send({ type: 'select_presenter', presenterId })}><UserRound size={13} />{presenterId === snapshot.presenterId ? '本场当前主播' : '设为本场主播'}</button><div className="v2-inline-form"><input value={newPresenter} onChange={(event) => setNewPresenter(event.target.value)} placeholder="新增主播名称" /><button type="button" disabled={!newPresenter.trim() || busy} onClick={addPresenter}><Plus size={13} /></button></div><select value={purpose} onChange={(event) => setPurpose(event.target.value as CoachPurpose)}><option>塑品</option><option>憋单</option><option>逼单</option><option>转化</option><option>互动</option><option>留人</option><option>答疑</option></select><textarea value={phraseDraft} onChange={(event) => setPhraseDraft(event.target.value)} placeholder="录入头部直播间话术，或保存下一场参考表达" /><button type="button" disabled={busy || !presenterId || !phraseDraft.trim()} onClick={addPhrase}><Save size={13} />保存话术</button></section><section className="v2-library-list">{phrases.map((phrase) => <article key={phrase.id}><div><span className={phrase.status}>{phrase.status === 'reference' ? '下一场参考' : phrase.source === 'session' ? '下播归档' : '草稿'}</span><strong>{phrase.purpose ?? '通用'}</strong></div><p>{phrase.text}</p><small>{phrase.source === 'session' ? '来自历史直播' : phrase.source === 'manual' ? '人工录入' : '豆包改写'} · v{phrase.version}</small><button type="button" onClick={() => void run(() => client.updatePhrase(phrase.id, { status: phrase.status === 'reference' ? 'draft' : 'reference' }))}>{phrase.status === 'reference' ? '取消参考' : '选为参考'}</button></article>)}</section></div>}
     </main>{message && <div className="v2-review-message">{message}</div>}

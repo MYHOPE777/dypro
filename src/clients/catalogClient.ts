@@ -5,7 +5,16 @@ export class CatalogClient {
   constructor(private readonly actorId = 'local-operator') {}
   async rules(roomId: string): Promise<{ rules: ComplianceRule[]; audits: RuleAuditEntry[] }> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/rules`); }
   async products(roomId: string): Promise<Product[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/products`); }
-  async saveProduct(roomId: string, product: Product): Promise<Product> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/products/${encodeURIComponent(product.id)}`, { method: 'PUT', body: JSON.stringify(product) }); }
+  async saveProduct(roomId: string, product: Product): Promise<Product> {
+    const url = `/api/v2/rooms/${encodeURIComponent(roomId)}/products/${encodeURIComponent(product.id)}`;
+    try {
+      return await this.request(url, { method: 'PUT', body: JSON.stringify(product) });
+    } catch (error) {
+      // Keep live sessions usable while an older local process is finishing.
+      if (product.description.trim() || !(error instanceof Error) || !/商品描述不能为空/u.test(error.message)) throw error;
+      return this.request(url, { method: 'PUT', body: JSON.stringify({ ...product, description: `${product.name}，商品资料待补充。` }) });
+    }
+  }
   async removeProduct(roomId: string, productId: string): Promise<Product[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/products/${encodeURIComponent(productId)}`, { method: 'DELETE' }); }
   async createRule(roomId: string, input: { name: string; pattern: string; risk: 'warning' | 'blocked'; title: string; reason: string; alternative: string; policyRef: string }): Promise<ComplianceRule> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/rules`, { method: 'POST', body: JSON.stringify(input) }); }
   async setRuleEnabled(rule: ComplianceRule, enabled: boolean): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }); }

@@ -284,5 +284,10 @@ describe('v2 operator view', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存并同步本场' }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/v2/rooms/room-default/products/product-'), expect.objectContaining({ method: 'PUT' })));
+    await waitFor(() => {
+      const frame = JSON.parse(socket.sent.at(-1) as string) as { command: { type: string; productIds?: string[] } };
+      expect(frame.command.type).toBe('set_lineup');
+      expect(frame.command.productIds?.some((productId) => productId.startsWith('product-'))).toBe(true);
+    });
   });
 });
