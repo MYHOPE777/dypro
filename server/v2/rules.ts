@@ -26,7 +26,9 @@ export class RuleModule {
   }
 
   learn(roomId: string, sessionId: string, result: ComplianceResult): ComplianceRule[] {
-    if (result.risk === 'safe' || result.ruleKind !== 'term' || result.confidence < 0.95) return [];
+    // Local built-ins already run on every sentence. Only a high-confidence
+    // remote term finding is novel enough to become a durable room rule.
+    if (result.source !== 'doubao' || result.risk === 'safe' || result.ruleKind !== 'term' || result.confidence < 0.95) return [];
     return (result.matchedTerms ?? []).map((term) => term.trim()).filter((term) => term.length >= 2 && term.length <= 40).slice(0, 4).map((term) => {
       const existing = this.list(roomId).find((rule) => rule.matchType === 'contains' && rule.pattern.toLocaleLowerCase() === term.toLocaleLowerCase());
       const now = this.now();

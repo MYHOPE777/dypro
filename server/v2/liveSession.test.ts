@@ -147,6 +147,25 @@ describe('LiveSession', () => {
     store.close();
   });
 
+  it('resets semantic context when the active product changes', async () => {
+    const contexts: string[] = [];
+    const analyzer: ReviewAnalyzer = { analyze: async (input) => {
+      contexts.push(input.context?.text ?? '');
+      return result(input.productId, 'safe');
+    } };
+    const { store, session } = makeSession({ analyzer });
+    await session.dispatch({ type: 'start' });
+    await session.dispatch({ type: 'demo_transcript', text: '精华商品的上一段介绍', isFinal: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await session.dispatch({ type: 'select_product', productId: 'headphones' });
+    await session.dispatch({ type: 'demo_transcript', text: '耳机商品的当前介绍', isFinal: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(contexts.at(-1)).toContain('耳机商品的当前介绍');
+    expect(contexts.at(-1)).not.toContain('精华商品的上一段介绍');
+    store.close();
+  });
+
   it('accepts the last final transcript while ending is draining', async () => {
     const capture = new FakeCapture();
     capture.holdEnd();

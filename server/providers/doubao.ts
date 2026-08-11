@@ -1,14 +1,15 @@
 import type { ComplianceAnalyzer, AnalysisInput } from '../../src/compliance/engine';
 import { analyzeTranscript } from '../../src/compliance/engine';
-import type { ComplianceAnalysisTiming, ComplianceResult } from '../../src/shared/types';
+import type { ComplianceAnalysisTiming, ComplianceCategory, ComplianceResult } from '../../src/shared/types';
 import { getArkConfig, requestArk, type ArkConfig } from './ark';
 
 const severity = { safe: 0, warning: 1, blocked: 2 } as const;
 
 const SYSTEM_PROMPT = `你是抖音电商直播合规审核员。结合当前商品和主播原话判断平台直播违规风险。
-只输出 JSON，不要 Markdown，字段顺序固定：{"risk":"safe|warning|blocked","title":"不超过12字","reason":"不超过45字的具体原因","alternative":"不超过60字、主播可立即照读且不保留违规承诺的替代表达","policyRef":"不超过20字的规则类别","confidence":0到1,"matchedTerms":["命中的违规词或短语"],"ruleKind":"term|sentence|context"}。
+只输出 JSON，不要 Markdown，字段顺序固定：{"risk":"safe|warning|blocked","category":"appearance|health|medical|suitability|urgency|extreme|guarantee|context","title":"不超过12字","reason":"不超过45字的具体原因","alternative":"不超过60字、主播可立即照读且不保留违规承诺的替代表达","policyRef":"不超过20字的规则类别","confidence":0到1,"matchedTerms":["命中的违规词或短语"],"ruleKind":"term|sentence|context"}。
 matchedTerms 只填写原话中实际命中的词或短语，安全时返回空数组。
 term 仅用于可脱离上下文稳定复用的明确违禁词；sentence 用于单句语义；context 用于依赖多句上下文、隐喻或暗示才能成立的判断。
+否定、引用、科普敏感表达不能按正向功效承诺直接 blocked；若仍可能被平台词审误判，返回 warning。
 blocked 用于医疗功效、绝对化承诺、虚假或不可证明的结果保证；warning 用于极限词、紧迫性和需要核验的宣传；没有明显风险才用 safe。`;
 
 const DEFAULT_CACHE_TTL_MS = 30_000;
@@ -33,6 +34,8 @@ function fromDoubao(input: AnalysisInput, payload: Record<string, unknown>): Com
   const payloadTerms = Array.isArray(payload.matchedTerms)
     ? payload.matchedTerms.filter((term): term is string => typeof term === 'string' && term.trim().length > 0).map((term) => term.trim()).slice(0, 8)
     : [];
+  const categories = new Set<ComplianceCategory>(['appearance', 'health', 'medical', 'suitability', 'urgency', 'extreme', 'guarantee', 'context']);
+  const category = typeof payload.category === 'string' && categories.has(payload.category as ComplianceCategory) ? payload.category as ComplianceCategory : 'context';
   return {
     id: `doubao-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     productId: input.productId,
@@ -43,6 +46,9 @@ function fromDoubao(input: AnalysisInput, payload: Record<string, unknown>): Com
     policyRef: text(payload.policyRef, '抖音电商直播合规规则'),
     confidence,
     source: 'doubao',
+    enforcement: risk === 'blocked' ? 'block_phrase' : risk === 'warning' ? 'warn' : 'allow',
+    category,
+    ruleId: 'doubao-semantic',
     transcript: input.transcript,
     createdAt: Date.now(),
     matchedTerms: payloadTerms,
@@ -56,7 +62,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
   private readonly localFastPath: boolean;
   private readonly cacheTtlMs: number;
   private readonly cache = new Map<string, { expiresAt: number; result: ComplianceResult }>();
-  private readonly optimizedSampleCounts = new Map<string, number>();
+  private readonly semanticSampleCounts = new Map<string, number>();
 
   constructor(env: NodeJS.ProcessEnv = process.env) {
     this.config = getArkConfig(env);
@@ -78,7 +84,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
       const path: ComplianceAnalysisTiming['path'] = !this.config || localResult.risk === 'blocked' ? 'local' : 'fallback';
       return { ...localResult, analysisTiming: { path, analyzerMs: elapsedMs(analyzerStartedAt), localGuardrailMs } };
     }
-    if (input.riskProfile === 'optimized' && localResult.risk === 'safe' && !this.shouldRunOptimizedSemanticCheck(input)) {
+    if (localResult.risk === 'safe' && !this.shouldRunSemanticCheck(input)) {
       return { ...localResult, analysisTiming: { path: 'local', analyzerMs: elapsedMs(analyzerStartedAt), localGuardrailMs } };
     }
     const cacheStartedAt = performance.now();
@@ -166,12 +172,13 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
     });
   }
 
-  private shouldRunOptimizedSemanticCheck(input: AnalysisInput): boolean {
-    const semanticTrigger = /暗示|相当于|就像|好比|发动机|汽油|血液|心脏|疏通|排毒|修复|替代药|不用吃药/iu;
+  private shouldRunSemanticCheck(input: AnalysisInput): boolean {
+    if (!input.riskProfile || input.riskProfile === 'strict') return true;
+    const semanticTrigger = /暗示|相当于|就像|好比|发动机|汽油|血液|心脏|疏通|排毒|修复|替代药|不用吃药|不能明说|懂的都懂|那个部位|指标恢复|循环起来/iu;
     if (semanticTrigger.test(`${input.transcript}\n${input.context?.text ?? ''}`)) return true;
     const key = `${input.roomId ?? ''}:${input.productId}`;
-    const count = (this.optimizedSampleCounts.get(key) ?? 0) + 1;
-    this.optimizedSampleCounts.set(key, count);
-    return count % 3 === 0;
+    const count = (this.semanticSampleCounts.get(key) ?? 0) + 1;
+    this.semanticSampleCounts.set(key, count);
+    return count % (input.riskProfile === 'optimized' ? 3 : 2) === 0;
   }
 }

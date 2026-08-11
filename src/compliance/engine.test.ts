@@ -71,4 +71,41 @@ describe('analyzeTranscript', () => {
     expect(result.risk).toBe('blocked');
     expect(result.title).toContain('绝对化');
   });
+
+  it('chooses the highest-priority medical finding when one sentence matches several rules', async () => {
+    const result = await analyzeTranscript({ productId: 'headphones', transcript: '全网最低价，而且耳聋都可以治好' });
+
+    expect(result.risk).toBe('blocked');
+    expect(result.category).toBe('medical');
+    expect(result.ruleId).toBe('medical-condition-efficacy');
+    expect(result.enforcement).toBe('block_phrase');
+  });
+
+  it.each([
+    '不要说治疗耳聋，这不是商品功效',
+    '比如有人说耳聋都可以治好，这是错误说法',
+    '平台不允许宣传治疗糖尿病的效果',
+  ])('downgrades negated, quoted, and educational medical wording to a caution: %s', async (transcript) => {
+    const result = await analyzeTranscript({ productId: 'headphones', transcript });
+
+    expect(result.risk).toBe('warning');
+    expect(result.category).toBe('context');
+    expect(result.ruleId).toBe('sensitive-claim-reference');
+    expect(result.enforcement).toBe('warn');
+  });
+
+  it('does not block an ordinary guarantee that is not tied to an outcome', async () => {
+    const result = await analyzeTranscript({ productId: 'mug', transcript: '这款保温杯保证品质，售后按页面规则执行' });
+
+    expect(result.risk).toBe('safe');
+    expect(result.enforcement).toBe('allow');
+  });
+
+  it('keeps outcome guarantees blocked while classifying extreme words as warnings', async () => {
+    const blocked = await analyzeTranscript({ productId: 'serum', transcript: '保证三天见效' });
+    const warning = await analyzeTranscript({ productId: 'serum', transcript: '今天是全网最低价' });
+
+    expect(blocked).toMatchObject({ risk: 'blocked', category: 'guarantee', ruleKind: 'sentence', enforcement: 'block_phrase' });
+    expect(warning).toMatchObject({ risk: 'warning', category: 'extreme', ruleKind: 'term', enforcement: 'warn' });
+  });
 });

@@ -65,6 +65,8 @@ export class LiveSession {
   private readonly listeners = new Set<LiveSessionListener>();
   private snapshotValue: LiveSessionSnapshot;
   private productRevision = 0;
+  /** Context sent to semantic review is scoped to the active product. */
+  private productContextStartedAt = 0;
   private requestSequence = 0;
   private segmentSequence = 0;
   private readonly segmentRevisions = new Map<string, number>();
@@ -91,6 +93,7 @@ export class LiveSession {
     const existing = this.store.getSessionSnapshot(this.id);
     this.store.createSession(options.session);
     this.snapshotValue = this.store.getSessionSnapshot(this.id)!;
+    this.productContextStartedAt = this.snapshotValue.createdAt;
     this.segmentSequence = this.snapshotValue.transcriptHistory.reduce((maximum, segment) => {
       const match = segment.id.match(/-segment-(\d+)$/u);
       return Math.max(maximum, match ? Number(match[1]) : 0);
@@ -224,6 +227,7 @@ export class LiveSession {
     const product = this.snapshotValue.lineup.find((candidate) => candidate.id === productId) ?? this.products().find((candidate) => candidate.id === productId);
     if (!product || this.snapshotValue.product.id === product.id) return;
     this.productRevision += 1;
+    this.productContextStartedAt = this.now();
     this.commit('product.selected', { product: JSON.stringify(product), source });
   }
 
@@ -232,7 +236,10 @@ export class LiveSession {
     const lineup = productIds.map((id) => products.find((product) => product.id === id)).filter((product): product is Product => Boolean(product));
     if (lineup.length === 0) return;
     const refreshedActiveProduct = lineup.find((product) => product.id === this.snapshotValue.product.id);
-    if (!refreshedActiveProduct || JSON.stringify(refreshedActiveProduct) !== JSON.stringify(this.snapshotValue.product)) this.productRevision += 1;
+    if (!refreshedActiveProduct || JSON.stringify(refreshedActiveProduct) !== JSON.stringify(this.snapshotValue.product)) {
+      this.productRevision += 1;
+      this.productContextStartedAt = this.now();
+    }
     this.commit('lineup.updated', { lineup: JSON.stringify(lineup) });
     if (!lineup.some((product) => product.id === this.snapshotValue.product.id)) this.selectProduct(lineup[0].id, 'operator');
   }
@@ -261,12 +268,13 @@ export class LiveSession {
     const productGeneration = this.productRevision;
     const revision = this.segmentRevisions.get(id) ?? 0;
     this.commit('transcript.final', { segment: JSON.stringify(segment), productId: product.id });
+    const productContext = this.snapshotValue.transcriptHistory.filter((candidate) => candidate.timestamp >= this.productContextStartedAt);
     await this.reviewPipeline.process({
       token: { requestSequence: requestNumber, productRevision: productGeneration, segmentRevision: revision, segmentId: id },
       segment,
       product,
       riskProfile: this.snapshotValue.riskProfile,
-      context: { text: this.snapshotValue.transcriptHistory.slice(-12).map((candidate) => candidate.text).join('\n'), segmentCount: this.snapshotValue.transcriptHistory.length, windowStartMs: now - 60_000, windowEndMs: now },
+      context: { text: productContext.slice(-12).map((candidate) => candidate.text).join('\n'), segmentCount: productContext.length, windowStartMs: this.productContextStartedAt, windowEndMs: now },
       stats: this.snapshotValue.stats,
       customRules: this.rulesProvider(),
       referencePhrases: this.referencePhraseProvider(this.snapshotValue.presenterId, product.id),

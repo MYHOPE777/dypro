@@ -21,6 +21,8 @@ describe('SQLite catalog modules', () => {
     expect(store.listResourceDeliveryJobs('superseded')).toHaveLength(1);
     rules.learn('room-default', 'session-3', { ...finding, confidence: 0.7, matchedTerms: ['低置信词'] });
     expect(rules.list('room-default')).toHaveLength(1);
+    rules.learn('room-default', 'session-4', { ...finding, source: 'local-fallback', confidence: 0.99, matchedTerms: ['内置风险词'] });
+    expect(rules.list('room-default')).toHaveLength(1);
     store.close();
   });
 

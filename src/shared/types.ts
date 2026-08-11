@@ -1,5 +1,8 @@
 export type RiskLevel = 'safe' | 'warning' | 'blocked';
 export type RiskProfile = 'strict' | 'balanced' | 'optimized';
+export type ComplianceEnforcement = 'allow' | 'warn' | 'block_phrase';
+export type ComplianceCategory = 'appearance' | 'health' | 'medical' | 'suitability' | 'urgency' | 'extreme' | 'guarantee' | 'context';
+export type ComplianceRuleKind = 'term' | 'sentence' | 'context';
 export type CaptureState = 'idle' | 'live' | 'paused' | 'ended';
 export type SpeakerLabel = 'host' | 'other';
 export type SpeakerSource = 'default' | 'automatic' | 'manual';
@@ -148,6 +151,10 @@ export type ComplianceResult = {
   policyRef: string;
   confidence: number;
   source: 'doubao' | 'local-fallback' | 'custom-rule';
+  /** Operator action. block_phrase replaces the current wording; it never stops capture or ends the live session. */
+  enforcement?: ComplianceEnforcement;
+  category?: ComplianceCategory;
+  ruleId?: string;
   transcript: string;
   createdAt: number;
   /** Milliseconds from final transcript receipt to the completed compliance result. */
@@ -157,7 +164,7 @@ export type ComplianceResult = {
   /** Terms or phrases identified as the reason for a non-safe result. */
   matchedTerms?: string[];
   /** Only stable term findings are eligible for automatic rule learning. */
-  ruleKind?: 'term' | 'sentence' | 'context';
+  ruleKind?: ComplianceRuleKind;
 };
 
 export type CoachSuggestion = {
