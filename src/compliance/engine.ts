@@ -5,7 +5,7 @@ export type AnalysisInput = {
   roomId?: string;
   productId: string;
   transcript: string;
-  product?: Pick<Product, 'id' | 'name' | 'category' | 'price' | 'compliantPhrases'>;
+  product?: Pick<Product, 'id' | 'name' | 'category' | 'price' | 'compliantPhrases'> & Partial<Pick<Product, 'description' | 'sellingPoints' | 'complianceProfile' | 'updatedAt'>>;
   customRules?: ComplianceRule[];
   riskProfile?: RiskProfile;
   speaker?: SpeakerLabel;
@@ -209,6 +209,35 @@ function resolveBuiltInRule(transcript: string): LocalRuleMatch | null {
   return matches[0];
 }
 
+function productProfileResult(input: AnalysisInput): ComplianceResult | null {
+  const keyword = input.product?.complianceProfile?.riskKeywords
+    .map((item) => item.trim())
+    .filter((item) => item.length >= 2)
+    .sort((left, right) => right.length - left.length)
+    .find((item) => input.transcript.toLocaleLowerCase().includes(item.toLocaleLowerCase()));
+  if (!keyword) return null;
+  const profile = input.product!.complianceProfile!;
+  const highConfidence = profile.status === 'verified';
+  return {
+    id: `profile-${input.productId}-${Date.now()}` ,
+    productId: input.productId,
+    risk: highConfidence ? 'blocked' : 'warning',
+    title: '命中商品合规边界',
+    reason: `${profile.industry} / ${profile.category}商品资料将“${keyword}”标记为高风险宣传。`,
+    alternative: profile.safeSellingPoints[0] || input.product?.compliantPhrases[0] || '可以改为：只介绍商品页面可核验的材质、规格和使用场景。',
+    policyRef: '抖音带货直播｜商品合规画像',
+    confidence: highConfidence ? Math.max(0.9, profile.confidence) : Math.max(0.72, profile.confidence),
+    source: 'local-fallback',
+    enforcement: highConfidence ? 'block_phrase' : 'warn',
+    category: 'context',
+    ruleId: `product-profile:${input.productId}` ,
+    transcript: input.transcript,
+    createdAt: Date.now(),
+    matchedTerms: [keyword],
+    ruleKind: 'term',
+  };
+}
+
 function resultFromRule(input: AnalysisInput, rule: Rule, terms: string[], now: number, source: ComplianceResult['source'], id = makeId()): ComplianceResult {
   return {
     id,
@@ -269,9 +298,12 @@ export async function analyzeTranscript(input: AnalysisInput): Promise<Complianc
   const customResult = evaluateCustomRules(input);
   const builtIn = resolveBuiltInRule(input.transcript);
   const localResult = builtIn ? resultFromRule(input, builtIn.rule, builtIn.terms, Date.now(), 'local-fallback') : null;
+  const profileResult = productProfileResult(input);
   const now = Date.now();
 
-  if (customResult && (!localResult || severity[customResult.risk] > severity[localResult.risk])) return customResult;
+  const candidates = [customResult, localResult, profileResult].filter((result): result is ComplianceResult => Boolean(result));
+  candidates.sort((left, right) => severity[right.risk] - severity[left.risk] || right.confidence - left.confidence);
+  if (candidates[0]) return candidates[0];
 
   if (!localResult) {
     if (customResult) return customResult;

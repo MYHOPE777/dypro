@@ -18,4 +18,13 @@ describe('CatalogClient', () => {
     expect(saved).toMatchObject({ id: product.id, name: product.name });
     expect(saved.description).toContain('资料待补充');
   });
+
+  it('requests a fresh compliance profile for an existing room product', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(PRODUCTS[0]), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await new CatalogClient().generateProductComplianceProfile('room-a', 'product-a');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v2/rooms/room-a/products/product-a/compliance-profile/generate', expect.objectContaining({ method: 'POST' }));
+  });
 });

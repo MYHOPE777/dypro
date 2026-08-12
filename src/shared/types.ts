@@ -7,6 +7,22 @@ export type CaptureState = 'idle' | 'live' | 'paused' | 'ended';
 export type SpeakerLabel = 'host' | 'other';
 export type SpeakerSource = 'default' | 'automatic' | 'manual';
 export type CoachPurpose = '塑品' | '憋单' | '逼单' | '转化' | '互动' | '留人' | '答疑';
+export type CommercePlatformRuleset = 'douyin-ecommerce-live';
+
+export type ProductComplianceProfile = {
+  industry: string;
+  category: string;
+  platformRuleset: CommercePlatformRuleset;
+  complianceSummary: string;
+  riskKeywords: string[];
+  riskBoundaries: string[];
+  requiredDisclosures: string[];
+  safeSellingPoints: string[];
+  confidence: number;
+  source: 'doubao' | 'local-fallback' | 'manual';
+  status: 'generated' | 'needs_review' | 'verified';
+  updatedAt: number;
+};
 
 export type LiveRoom = {
   id: string;
@@ -32,6 +48,7 @@ export type Product = {
   image: string;
   accent: string;
   compliantPhrases: string[];
+  complianceProfile?: ProductComplianceProfile;
   source: 'seed' | 'manual' | 'doubao' | 'local-fallback';
   sourceText?: string;
   updatedAt: number;

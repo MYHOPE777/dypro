@@ -38,4 +38,18 @@ describe('BoundedScheduler', () => {
     scheduler.resumeBackground();
     await expect(background).resolves.toBe('uploaded');
   });
+
+  it('reserves model capacity for realtime review while product profiling runs at low priority', async () => {
+    const scheduler = new BoundedScheduler({ modelGlobal: 4, modelPerSession: 2, background: 1 });
+    const lowHeld = deferred<string>();
+    const lowFirst = scheduler.run('model', 'profile-a', () => lowHeld.promise, { priority: 'low' });
+    const lowSecond = scheduler.run('model', 'profile-b', async () => 'profile-b', { priority: 'low' });
+    const review = scheduler.run('model', 'live-session', async () => 'review');
+
+    await expect(review).resolves.toBe('review');
+    expect(scheduler.snapshot().model).toMatchObject({ running: 1, queued: 1 });
+    lowHeld.resolve('profile-a');
+    await expect(lowFirst).resolves.toBe('profile-a');
+    await expect(lowSecond).resolves.toBe('profile-b');
+  });
 });

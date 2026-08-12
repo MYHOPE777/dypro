@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
 import type { V2ServerFrame } from '../../src/shared/v2Protocol';
 import { PRODUCTS } from '../../src/shared/products';
+import type { ProductComplianceProfile } from '../../src/shared/types';
 import { hashPassword } from '../auth';
 import { createV2Http } from './http';
 import { createRuntime, type V2Runtime } from './runtime';
@@ -183,6 +184,40 @@ describe('v2 HTTP/WebSocket runtime', () => {
     expect(response.status).toBe(200);
     expect(runtime.listProducts('room-product-create')).toContainEqual(expect.objectContaining({ id: product.id, name: product.name }));
     expect(session.snapshot().lineup).toContainEqual(expect.objectContaining({ id: product.id, name: product.name }));
+  });
+
+  it('saves immediately with a local profile and applies the Doubao profile in the background', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-product-profile-'));
+    const generated: ProductComplianceProfile = { industry: '食品饮料', category: '冲调食品/营养食品', platformRuleset: 'douyin-ecommerce-live', complianceSummary: '普通食品只介绍配料、规格和食用场景。', riskKeywords: ['替代药物'], riskBoundaries: ['不得宣传疾病治疗'], requiredDisclosures: ['配料表以页面为准'], safeSellingPoints: ['介绍配料和口味'], confidence: 0.94, source: 'doubao', status: 'generated', updatedAt: 200 };
+    const profiler = { profile: vi.fn().mockResolvedValue(generated) };
+    const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') }, productProfiler: profiler });
+    const session = runtime.getOrCreateSession({ sessionId: 'live-product-profile', roomId: 'room-product-profile' });
+    cleanups.push(async () => { await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+    const product = { ...PRODUCTS[0], id: 'nutrition-food', name: '营养冲调食品', category: '其他', description: '含谷物和维生素的冲调食品', sellingPoints: ['早餐冲调'] };
+    await session.dispatch({ type: 'start' });
+    expect(runtime.scheduler.snapshot().background.paused).toBe(true);
+
+    const saved = await runtime.upsertProduct('room-product-profile', product);
+
+    expect(saved.complianceProfile).toMatchObject({ platformRuleset: 'douyin-ecommerce-live', source: 'local-fallback', status: 'needs_review' });
+    await vi.waitFor(() => expect(runtime.listProducts('room-product-profile').find((item) => item.id === product.id)?.complianceProfile).toMatchObject({ industry: '食品饮料', category: '冲调食品/营养食品', source: 'doubao' }));
+    expect(profiler.profile).toHaveBeenCalledOnce();
+  });
+
+  it('preserves a manually verified product profile during later product edits', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-manual-product-profile-'));
+    const profiler = { profile: vi.fn() };
+    const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') }, productProfiler: profiler });
+    runtime.getOrCreateSession({ sessionId: 'live-manual-product-profile', roomId: 'room-manual-product-profile' });
+    cleanups.push(async () => { await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+    const manual: ProductComplianceProfile = { industry: '自定义行业', category: '自定义类目', platformRuleset: 'douyin-ecommerce-live', complianceSummary: '人工确认的合规边界。', riskKeywords: ['人工高风险词'], riskBoundaries: ['人工语义边界'], requiredDisclosures: ['人工必要披露'], safeSellingPoints: ['人工安全方向'], confidence: 1, source: 'manual', status: 'verified', updatedAt: 100 };
+
+    const saved = await runtime.upsertProduct('room-manual-product-profile', { ...PRODUCTS[0], id: 'manual-profile-product', name: '人工画像商品', category: manual.category, complianceProfile: manual });
+    const edited = await runtime.upsertProduct('room-manual-product-profile', { ...saved, description: '修改后的商品描述' });
+
+    expect(edited.complianceProfile).toEqual(manual);
+    expect(edited.category).toBe('自定义类目');
+    expect(profiler.profile).not.toHaveBeenCalled();
   });
 
   it('broadcasts live product edits and retains the selected product in session history', async () => {

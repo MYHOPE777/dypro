@@ -108,4 +108,25 @@ describe('analyzeTranscript', () => {
     expect(blocked).toMatchObject({ risk: 'blocked', category: 'guarantee', ruleKind: 'sentence', enforcement: 'block_phrase' });
     expect(warning).toMatchObject({ risk: 'warning', category: 'extreme', ruleKind: 'term', enforcement: 'warn' });
   });
+
+  it('uses a verified product compliance profile as a product-specific local guardrail', async () => {
+    const result = await analyzeTranscript({
+      productId: 'custom-food',
+      product: { id: 'custom-food', name: '营养食品', category: '食品/营养补充类', price: '¥99', compliantPhrases: [], complianceProfile: { industry: '食品饮料', category: '食品/营养补充类', platformRuleset: 'douyin-ecommerce-live', complianceSummary: '普通食品不得宣传医疗功效', riskKeywords: ['替代药物'], riskBoundaries: ['不得宣传疾病治疗'], requiredDisclosures: ['配料表以页面为准'], safeSellingPoints: ['介绍配料和口味'], confidence: 0.94, source: 'manual', status: 'verified', updatedAt: 1 } },
+      transcript: '吃这个就可以替代药物',
+    });
+
+    expect(result).toMatchObject({ risk: 'blocked', ruleId: 'product-profile:custom-food', matchedTerms: ['替代药物'], enforcement: 'block_phrase' });
+    expect(result.reason).toContain('食品饮料');
+  });
+
+  it('keeps an unverified local profile finding as a warning until a person or Doubao confirms it', async () => {
+    const result = await analyzeTranscript({
+      productId: 'custom-device',
+      product: { id: 'custom-device', name: '智能设备', category: '数码电子', price: '¥199', compliantPhrases: [], complianceProfile: { industry: '数码家电', category: '数码电子', platformRuleset: 'douyin-ecommerce-live', complianceSummary: '参数需可核验', riskKeywords: ['永久不卡'], riskBoundaries: ['性能受环境影响'], requiredDisclosures: ['参数以页面为准'], safeSellingPoints: ['介绍可核验参数'], confidence: 0.68, source: 'local-fallback', status: 'needs_review', updatedAt: 1 } },
+      transcript: '这个设备可以永久不卡',
+    });
+
+    expect(result).toMatchObject({ risk: 'warning', enforcement: 'warn', ruleId: 'product-profile:custom-device' });
+  });
 });

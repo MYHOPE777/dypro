@@ -24,10 +24,12 @@ test('keeps operator and presenter views synchronized', async ({ page, browser, 
     await page.getByRole('button', { name: '资料管理' }).click();
     await page.getByRole('button', { name: '商品资料' }).click();
     await page.getByRole('button', { name: '编辑 轻透焕亮精华' }).click();
+    await expect(page.getByText(/默认规则：抖音带货直播间/u)).toBeVisible();
+    await expect(page.getByLabel('所属行业')).toBeVisible();
     await page.getByLabel('商品名称').fill(liveProductName);
     await page.screenshot({ path: testInfo.outputPath('product-editor-form.png'), fullPage: true });
     await page.getByRole('button', { name: '保存并同步本场' }).click();
-    await expect(page.getByText('商品资料已同步到当前直播间和本场页面')).toBeVisible();
+    await expect(page.getByText(/商品(资料已同步|已保存)/u)).toBeVisible();
     await expect(presenter.locator('.v2-brand small')).toHaveText(liveProductName);
     const newProductName = `直播间新商品-${testInfo.project.name}`;
     await page.getByRole('button', { name: '新增商品' }).click();

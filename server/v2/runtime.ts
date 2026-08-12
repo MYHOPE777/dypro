@@ -4,6 +4,7 @@ import type { LiveCommand, LiveEvent, LiveSessionSnapshot, SessionReview, Sessio
 import type { Product } from '../../src/shared/types';
 import { createDoubaoAnalyzer } from '../services';
 import { createDoubaoCoach } from '../providers/doubaoCoach';
+import { DoubaoProductComplianceProfiler, localProductComplianceProfile, type ProductComplianceProfiler } from '../providers/productComplianceProfiler';
 import { buildStreamingAsrContext } from '../providers/doubaoStreamingAsr';
 import { CaptureModule } from './capture';
 import { AudioFileWriter } from './audio';
@@ -35,6 +36,7 @@ export type V2Runtime = {
   listRooms(): ReturnType<SqliteFactStore['listRooms']>;
   listProducts(roomId: string): Product[];
   upsertProduct(roomId: string, product: Product): Promise<Product>;
+  profileProduct(roomId: string, productId: string): Promise<Product>;
   removeProduct(roomId: string, productId: string): Promise<Product[]>;
   listSessions(roomId?: string): SessionSummary[];
   getReview(sessionId: string): SessionReview | null;
@@ -47,7 +49,7 @@ function validSessionId(value: string | undefined): string | undefined {
   return value && /^[a-zA-Z0-9_-]{4,96}$/u.test(value) ? value : undefined;
 }
 
-export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: string } = {}): V2Runtime {
+export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: string; productProfiler?: ProductComplianceProfiler } = {}): V2Runtime {
   const env = options.env ?? process.env;
   const rootDir = options.rootDir ?? resolve(process.cwd());
   const dbPath = env.V2_DB_PATH?.trim() || resolve(rootDir, '.data-v2/app.sqlite');
@@ -59,14 +61,25 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
   const authorization = new AuthorizationModule(env);
   const rules = new RuleModule(store);
   const presenters = new PresenterModule(store);
+  const productProfiler = options.productProfiler ?? new DoubaoProductComplianceProfiler(env);
   const deliveryTimer = setInterval(() => { void delivery.flushOnce(); }, 5_000);
   deliveryTimer.unref();
   const sessions = new Map<string, LiveSession>();
   const writers = new Map<string, { source: AudioFileWriter; asr: AudioFileWriter }>();
-  const seedProducts = PRODUCTS.map((product) => ({ ...product, updatedAt: product.updatedAt || Date.now() }));
+  const productProfileTasks = new Set<Promise<void>>();
+  const seedProducts = PRODUCTS.map((product) => {
+    const seeded = { ...product, updatedAt: product.updatedAt || Date.now() };
+    return { ...seeded, complianceProfile: product.complianceProfile ?? localProductComplianceProfile(seeded) };
+  });
   const roomId = 'room-default';
   store.ensureRoom({ id: roomId, tenantId: 'tenant-local', name: '默认直播间', accountName: '本地账号', ownerActorId: 'owner' });
   if (store.listProducts('tenant-local', roomId).length === 0) seedProducts.forEach((product) => store.upsertProduct('tenant-local', product, roomId));
+  for (const room of store.listRooms()) {
+    const tenantId = room.tenantId ?? 'tenant-local';
+    for (const product of store.listProducts(tenantId, room.id)) {
+      if (!product.complianceProfile) store.upsertProduct(tenantId, { ...product, complianceProfile: localProductComplianceProfile(product), updatedAt: Date.now() }, room.id);
+    }
+  }
   presenters.ensureDefault(roomId);
 
   const ensureRoomCatalog = (targetRoom: string, tenantId: string): Product[] => {
@@ -205,10 +218,36 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
       const room = store.listRooms().find((candidate) => candidate.id === targetRoom);
       if (!room) throw new Error('直播间不存在');
       const tenantId = room.tenantId ?? 'tenant-local';
-      const isNew = !store.listProducts(tenantId, targetRoom).some((candidate) => candidate.id === product.id);
-      const saved = { ...product, source: 'manual' as const, updatedAt: Date.now() };
+      const existing = store.listProducts(tenantId, targetRoom).find((candidate) => candidate.id === product.id);
+      const isNew = !existing;
+      const facts = (candidate: Product) => JSON.stringify({ name: candidate.name, category: candidate.category, description: candidate.description, sellingPoints: candidate.sellingPoints, sourceText: candidate.sourceText ?? '' });
+      const shouldRefreshProfile = !product.complianceProfile || (product.complianceProfile.source !== 'manual' && Boolean(existing) && facts(existing!) !== facts(product));
+      const profile = shouldRefreshProfile ? localProductComplianceProfile(product) : product.complianceProfile!;
+      const saved = { ...product, category: profile.category, complianceProfile: profile, source: 'manual' as const, updatedAt: Date.now() };
       store.upsertProduct(tenantId, saved, targetRoom);
       await syncRoomCatalog(targetRoom, isNew ? saved.id : undefined);
+      if (shouldRefreshProfile) {
+        const task = scheduler.run('model', `product-profile:${targetRoom}`, async () => {
+          const generated = await productProfiler.profile(product);
+          const current = store.listProducts(tenantId, targetRoom).find((candidate) => candidate.id === product.id);
+          if (!current || current.complianceProfile?.updatedAt !== profile.updatedAt || generated.source !== 'doubao') return;
+          store.upsertProduct(tenantId, { ...current, category: generated.category, complianceProfile: generated, updatedAt: Date.now() }, targetRoom);
+          await syncRoomCatalog(targetRoom);
+        }, { priority: 'low' }).catch((error) => console.error('[product-compliance-profile]', JSON.stringify({ roomId: targetRoom, productId: product.id, error: error instanceof Error ? error.message : String(error) })));
+        productProfileTasks.add(task);
+        void task.finally(() => productProfileTasks.delete(task));
+      }
+      return saved;
+    },
+    profileProduct: async (targetRoom, productId) => {
+      const room = store.listRooms().find((candidate) => candidate.id === targetRoom);
+      if (!room) throw new Error('直播间不存在');
+      const product = store.listProducts(room.tenantId ?? 'tenant-local', targetRoom).find((candidate) => candidate.id === productId);
+      if (!product) throw new Error('商品不存在或不属于当前直播间');
+      const profile = await scheduler.run('model', `product-profile:${targetRoom}`, () => productProfiler.profile({ ...product, complianceProfile: undefined }));
+      const saved = { ...product, category: profile.category, complianceProfile: profile, updatedAt: Date.now() };
+      store.upsertProduct(room.tenantId ?? 'tenant-local', saved, targetRoom);
+      await syncRoomCatalog(targetRoom);
       return saved;
     },
     removeProduct: async (targetRoom, productId) => {
@@ -230,6 +269,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
         if (source && source.byteLength > 0) store.registerAudioAsset({ id: `audio-source-${sessionId}`, sessionId, path: source.path, encoding: 'pcm_s16le_source', byteLength: source.byteLength, durationMs: source.durationMs, sampleRate: source.sampleRate, channels: source.channels });
         if (asr && asr.byteLength > 0) store.registerAudioAsset({ id: `audio-asr-${sessionId}`, sessionId, path: asr.path, encoding: 'pcm_s16le_asr', byteLength: asr.byteLength, durationMs: asr.durationMs, sampleRate: asr.sampleRate, channels: asr.channels });
       }));
+      await Promise.all([...productProfileTasks]);
       store.close();
     },
   };

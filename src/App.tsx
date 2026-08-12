@@ -413,9 +413,22 @@ function ProductCatalogEditor({ roomId, activeProductId, products, onSaved }: { 
     try { setItems(await client.products(roomId)); } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
   }, [client, roomId]);
   useEffect(() => { setItems(products); }, [products]);
+  useEffect(() => {
+    setDraft((current) => {
+      if (!current || current.complianceProfile?.source === 'manual') return current;
+      const updated = products.find((product) => product.id === current.id);
+      return updated && updated.updatedAt > current.updatedAt ? { ...current, category: updated.category, complianceProfile: updated.complianceProfile, updatedAt: updated.updatedAt } : current;
+    });
+  }, [products]);
   useEffect(() => { void load(); }, [load]);
 
   const updateDraft = <K extends keyof Product>(key: K, value: Product[K]) => setDraft((current) => current ? { ...current, [key]: value } : current);
+  const updateCategory = (value: string) => setDraft((current) => current ? { ...current, category: value, ...(current.complianceProfile ? { complianceProfile: { ...current.complianceProfile, category: value, source: 'manual', status: 'verified', updatedAt: Date.now() } } : {}) } : current);
+  const updateComplianceProfile = (key: 'industry' | 'complianceSummary' | 'riskKeywords' | 'riskBoundaries' | 'requiredDisclosures' | 'safeSellingPoints', value: string | string[]) => setDraft((current) => {
+    if (!current?.complianceProfile) return current;
+    const profile = { ...current.complianceProfile, [key]: value, source: 'manual' as const, status: 'verified' as const, updatedAt: Date.now() };
+    return { ...current, complianceProfile: profile };
+  });
   const save = async (event: FormEvent) => {
     event.preventDefault();
     if (!draft) return;
@@ -425,8 +438,8 @@ function ProductCatalogEditor({ roomId, activeProductId, products, onSaved }: { 
       const saved = await client.saveProduct(roomId, { ...draft, updatedAt: Date.now() });
       setItems((current) => current.some((product) => product.id === saved.id) ? current.map((product) => product.id === saved.id ? saved : product) : [...current, saved]);
       onSaved?.(saved, isNew);
-      setDraft(null);
-      setMessage('商品资料已同步到当前直播间和本场页面');
+      setDraft(saved);
+      setMessage(saved.complianceProfile?.source === 'doubao' ? '商品资料已同步，豆包已生成行业、类目和合规画像' : saved.complianceProfile ? '商品已保存，本地画像立即生效；豆包将在后台补充识别' : '商品资料已同步到当前直播间和本场页面');
     } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } finally { setBusy(false); }
   };
   const remove = async (product: Product) => {
@@ -434,19 +447,41 @@ function ProductCatalogEditor({ roomId, activeProductId, products, onSaved }: { 
     setBusy(true); setMessage('');
     try { setItems(await client.removeProduct(roomId, product.id)); if (draft?.id === product.id) setDraft(null); } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } finally { setBusy(false); }
   };
+  const generateProfile = async () => {
+    if (!draft || !items.some((product) => product.id === draft.id)) return;
+    setBusy(true); setMessage('豆包正在重新识别行业、类目和合规边界');
+    try {
+      await client.saveProduct(roomId, { ...draft, updatedAt: Date.now() });
+      const saved = await client.generateProductComplianceProfile(roomId, draft.id);
+      setDraft(saved); setItems((current) => current.map((product) => product.id === saved.id ? saved : product)); onSaved?.(saved, false);
+      setMessage(saved.complianceProfile?.source === 'doubao' ? '豆包识别完成，请确认后可继续自定义修改' : '豆包暂时不可用，已生成本地兜底画像，请人工复核');
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } finally { setBusy(false); }
+  };
+  const confirmProfile = async () => {
+    if (!draft?.complianceProfile) return;
+    setBusy(true); setMessage('');
+    try {
+      const confirmed = { ...draft, complianceProfile: { ...draft.complianceProfile, source: 'manual' as const, status: 'verified' as const, updatedAt: Date.now() }, updatedAt: Date.now() };
+      const saved = await client.saveProduct(roomId, confirmed);
+      setDraft(saved); setItems((current) => current.map((product) => product.id === saved.id ? saved : product)); onSaved?.(saved, false);
+      setMessage('商品合规画像已人工确认，并同步到本场拦截条件');
+    } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } finally { setBusy(false); }
+  };
 
   return <div className="v2-product-manager">
     <section className="v2-product-catalog">
       <header><div><strong>当前直播间商品</strong><small>{items.length} 个 · 修改后实时同步本场</small></div><button type="button" className="v2-add-product" onClick={() => setDraft(blankProduct())}><Plus size={13} />新增商品</button></header>
-      <div>{items.map((product) => <article className={product.id === activeProductId ? 'active' : ''} key={product.id}><img src={product.image} alt="" /><div><strong>{product.name}</strong><small>{product.category} · {product.price} · {product.sku}</small><p>{product.description}</p></div><div className="v2-product-actions"><button type="button" aria-label={`编辑 ${product.name}`} onClick={() => setDraft(structuredClone(product))}><Pencil size={13} /></button><button type="button" aria-label={`移除 ${product.name}`} disabled={busy || items.length <= 1} onClick={() => void remove(product)}><Trash2 size={13} /></button></div></article>)}</div>
+      <div>{items.map((product) => <article className={product.id === activeProductId ? 'active' : ''} key={product.id}><img src={product.image} alt="" /><div><strong>{product.name}</strong><small>{product.complianceProfile?.industry ?? '行业待识别'} · {product.category} · {product.price}</small><p>{product.complianceProfile?.complianceSummary ?? product.description}</p></div><div className="v2-product-actions"><button type="button" aria-label={`编辑 ${product.name}`} onClick={() => setDraft(structuredClone(product))}><Pencil size={13} /></button><button type="button" aria-label={`移除 ${product.name}`} disabled={busy || items.length <= 1} onClick={() => void remove(product)}><Trash2 size={13} /></button></div></article>)}</div>
     </section>
     <section className="v2-product-editor-panel">
       {draft ? <form onSubmit={(event) => void save(event)}>
         <header><div><strong>{items.some((product) => product.id === draft.id) ? '编辑商品资料' : '新增直播间商品'}</strong><small>{draft.id}</small></div><button type="button" aria-label="关闭商品编辑" onClick={() => setDraft(null)}><X size={14} /></button></header>
-        <div className="v2-product-fields"><label>商品名称<input value={draft.name} onChange={(event) => updateDraft('name', event.target.value)} required /></label><label>商品分类<input value={draft.category} onChange={(event) => updateDraft('category', event.target.value)} required /></label><label>实时价格<input value={draft.price} onChange={(event) => updateDraft('price', event.target.value)} required /></label><label>商品编码<input value={draft.sku} onChange={(event) => updateDraft('sku', event.target.value)} required /></label></div>
+        <div className="v2-product-fields"><label>商品名称<input value={draft.name} onChange={(event) => updateDraft('name', event.target.value)} required /></label><label>标准类目<input value={draft.category} onChange={(event) => updateCategory(event.target.value)} required /></label><label>实时价格<input value={draft.price} onChange={(event) => updateDraft('price', event.target.value)} required /></label><label>商品编码<input value={draft.sku} onChange={(event) => updateDraft('sku', event.target.value)} required /></label></div>
         <label>商品描述<textarea value={draft.description} onChange={(event) => updateDraft('description', event.target.value)} placeholder="可稍后补充" /></label>
         <label>核心卖点<textarea value={draft.sellingPoints.join('\n')} onChange={(event) => updateDraft('sellingPoints', event.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} placeholder="每行一个卖点，可稍后补充" /></label>
         <label>对应商品参考话术<textarea value={draft.compliantPhrases.join('\n')} onChange={(event) => updateDraft('compliantPhrases', event.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} placeholder="每行一段，可稍后补充" /></label>
+        {draft.complianceProfile && <section className="v2-compliance-profile"><header><div><ShieldAlert size={14} /><span><strong>商品合规画像</strong><small>默认规则：抖音带货直播间 · {draft.complianceProfile.source === 'doubao' ? `豆包识别 ${Math.round(draft.complianceProfile.confidence * 100)}%` : draft.complianceProfile.source === 'manual' ? '人工确认' : '本地兜底待复核'}</small></span></div><div className="v2-profile-actions">{draft.complianceProfile.status !== 'verified' && <button type="button" disabled={busy} onClick={() => void confirmProfile()}><CheckCircle2 size={12} />确认画像</button>}<button type="button" disabled={busy} onClick={() => void generateProfile()}><RefreshCw size={12} />重新识别</button></div></header><label>所属行业<input value={draft.complianceProfile.industry} onChange={(event) => updateComplianceProfile('industry', event.target.value)} /></label><label>合规资料描述<textarea value={draft.complianceProfile.complianceSummary} onChange={(event) => updateComplianceProfile('complianceSummary', event.target.value)} /></label><label>高风险词或短语<textarea value={draft.complianceProfile.riskKeywords.join('\n')} onChange={(event) => updateComplianceProfile('riskKeywords', event.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} placeholder="每行一个；人工确认后进入本地快速拦截" /></label><label>语义风险边界<textarea value={draft.complianceProfile.riskBoundaries.join('\n')} onChange={(event) => updateComplianceProfile('riskBoundaries', event.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} placeholder="每行一条，供豆包结合上下文判断" /></label><label>必要披露与资质<textarea value={draft.complianceProfile.requiredDisclosures.join('\n')} onChange={(event) => updateComplianceProfile('requiredDisclosures', event.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} /></label><label>合规介绍方向<textarea value={draft.complianceProfile.safeSellingPoints.join('\n')} onChange={(event) => updateComplianceProfile('safeSellingPoints', event.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} /></label></section>}
+        {!draft.complianceProfile && items.some((product) => product.id === draft.id) && <button className="v2-profile-generate" type="button" disabled={busy} onClick={() => void generateProfile()}><Sparkles size={13} />生成商品合规画像</button>}
         <button type="submit" disabled={busy || !draft.name.trim() || !draft.category.trim() || !draft.price.trim() || !draft.sku.trim()}><Save size={13} />保存并同步本场</button>
       </form> : <div className="v2-product-editor-empty"><Package size={24} /><strong>选择商品开始调整</strong><span>开播中修改会同步到中控台、主播屏和本场历史</span></div>}
     </section>

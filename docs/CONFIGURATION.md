@@ -62,6 +62,7 @@ curl http://localhost:8787/api/v2/health
 | `ARK_SERVICE_TIER` | `auto` | 只有已开通低延迟服务时才使用 `fast`。 |
 | `ARK_COMPLIANCE_MAX_OUTPUT_TOKENS` | `200` | 合规结构化输出上限。 |
 | `ARK_COACH_MAX_OUTPUT_TOKENS` | `520` | 三段提词输出上限。 |
+| `ARK_PRODUCT_PROFILE_TIMEOUT_MS` | `5000` | 商品行业、类目与合规画像识别超时；失败时使用本地兜底。 |
 | `KNOWLEDGE_RESOURCE_ID` | 空 | 可选的旗舰版知识库搜索资源 ID。 |
 
 最终转录到达后，本地规则和三段本地提词立即产生。语义合规与豆包教练使用两个独立模型任务并行运行，排队时间也计入 2 秒硬预算；超时保留本地结果，不阻塞收音。

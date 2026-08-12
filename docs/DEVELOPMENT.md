@@ -12,6 +12,7 @@
 | `server/v2/capture.ts` | 麦克风音频、ASR 连接、恢复、暂停和结束。 |
 | `server/v2/http.ts` | `/api/v2`、`/ws/v2`、权限、收音租约和连接关闭。 |
 | `server/v2/store.ts` | SQLite 事务、追加事件和本地投影。 |
+| `server/providers/productComplianceProfiler.ts` | 商品行业、标准类目和抖音直播合规画像生成及离线兜底。 |
 | `src/App.tsx` | 操作台、主播屏、资料管理和历史复核视图。 |
 | `src/clients/` | 带类型的 HTTP/WebSocket 客户端。 |
 

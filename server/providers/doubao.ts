@@ -7,6 +7,7 @@ import { getArkConfig, requestArk, type ArkConfig } from './ark';
 const severity = { safe: 0, warning: 1, blocked: 2 } as const;
 
 const SYSTEM_PROMPT = `你是抖音电商直播合规审核员。结合当前商品和主播原话判断平台直播违规风险。
+判断前先确认当前商品的行业、标准类目和商品合规画像；默认采用抖音带货直播间规则，再叠加该行业、类目的功效、资质、适用人群和宣传边界。行业或类目资料不完整时仍执行抖音直播通用红线，不得因此放宽。
 只输出 JSON，不要 Markdown，字段顺序固定：{"risk":"safe|warning|blocked","category":"appearance|health|medical|suitability|urgency|extreme|guarantee|context","title":"不超过12字","reason":"不超过45字的具体原因","alternative":"不超过60字、主播可立即照读且不保留违规承诺的替代表达","policyRef":"不超过20字的规则类别","confidence":0到1,"matchedTerms":["命中的违规词或短语"],"ruleKind":"term|sentence|context"}。
 matchedTerms 只填写原话中实际命中的词或短语，安全时返回空数组。
 term 仅用于可脱离上下文稳定复用的明确违禁词；sentence 用于单句语义；context 用于依赖多句上下文、隐喻或暗示才能成立的判断。
@@ -83,6 +84,8 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
       roomId: input.roomId,
       productId: input.productId,
       productCategory: input.product?.category,
+      productIndustry: input.product?.complianceProfile?.industry,
+      profileBoundaries: input.product?.complianceProfile?.riskBoundaries,
       transcript: input.transcript,
       contextText: input.context?.text,
       riskProfile: input.riskProfile,
@@ -127,6 +130,13 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
         name: input.product.name,
         category: input.product.category,
         price: input.product.price,
+        industry: input.product.complianceProfile?.industry,
+        platformRuleset: input.product.complianceProfile?.platformRuleset ?? 'douyin-ecommerce-live',
+        complianceSummary: input.product.complianceProfile?.complianceSummary,
+        riskKeywords: input.product.complianceProfile?.riskKeywords.slice(0, 12),
+        riskBoundaries: input.product.complianceProfile?.riskBoundaries.slice(0, 12),
+        requiredDisclosures: input.product.complianceProfile?.requiredDisclosures.slice(0, 8),
+        safeSellingPoints: input.product.complianceProfile?.safeSellingPoints.slice(0, 8),
         compliantPhrases: input.product.compliantPhrases.slice(0, 3).map((phrase) => phrase.slice(0, 80)),
       }
       : { id: input.productId };
@@ -177,10 +187,12 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
     return JSON.stringify({
       roomId: input.roomId ?? '',
       productId: input.productId,
+      productRevision: input.product?.updatedAt ?? 0,
       speakerId: input.speakerId ?? '',
       transcript: input.transcript.trim(),
       riskProfile: input.riskProfile ?? 'balanced',
       context: input.context?.text ?? '',
+      complianceProfile: input.product?.complianceProfile ? `${input.product.complianceProfile.updatedAt}:${input.product.complianceProfile.status}:${input.product.complianceProfile.source}` : '',
       rules: input.customRules?.map((rule) => `${rule.id}:${rule.version}:${rule.enabled}:${rule.status}`).join('|') ?? '',
     });
   }

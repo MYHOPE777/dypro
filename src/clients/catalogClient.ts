@@ -15,6 +15,7 @@ export class CatalogClient {
       return this.request(url, { method: 'PUT', body: JSON.stringify({ ...product, description: `${product.name}，商品资料待补充。` }) });
     }
   }
+  async generateProductComplianceProfile(roomId: string, productId: string): Promise<Product> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/products/${encodeURIComponent(productId)}/compliance-profile/generate`, { method: 'POST' }); }
   async removeProduct(roomId: string, productId: string): Promise<Product[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/products/${encodeURIComponent(productId)}`, { method: 'DELETE' }); }
   async createRule(roomId: string, input: { name: string; pattern: string; risk: 'warning' | 'blocked'; title: string; reason: string; alternative: string; policyRef: string; scope?: 'room' | 'category' | 'product'; productId?: string; category?: string }): Promise<ComplianceRule> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/rules`, { method: 'POST', body: JSON.stringify(input) }); }
   async confirmRule(roomId: string, result: ComplianceResult): Promise<ComplianceRule> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/rules/confirm`, { method: 'POST', body: JSON.stringify({ result }) }); }

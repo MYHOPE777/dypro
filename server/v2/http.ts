@@ -6,7 +6,7 @@ import express, { type Request, type Response } from 'express';
 import cors from 'cors';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { LiveCommand } from '../../src/shared/v2';
-import type { CoachPurpose, ComplianceResult, Product } from '../../src/shared/types';
+import type { CoachPurpose, ComplianceResult, Product, ProductComplianceProfile } from '../../src/shared/types';
 import type { V2ClientCommand, V2ClientFrame, V2JoinCommand, V2ServerFrame } from '../../src/shared/v2Protocol';
 import { decodeAudioFrame } from '../../src/shared/v2Audio';
 import { createRuntime, type V2Runtime } from './runtime';
@@ -59,10 +59,32 @@ function productTextList(value: unknown, name: string, maximumItems = 20): strin
   return value.map((item) => (item as string).trim());
 }
 
+function productComplianceProfile(value: unknown): ProductComplianceProfile | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!value || typeof value !== 'object') throw new Error('商品合规资料格式无效');
+  const profile = value as Record<string, unknown>;
+  const confidence = typeof profile.confidence === 'number' && Number.isFinite(profile.confidence) ? Math.max(0, Math.min(1, profile.confidence)) : 1;
+  return {
+    industry: productText(profile.industry, '所属行业', 80),
+    category: productText(profile.category, '标准类目', 80),
+    platformRuleset: 'douyin-ecommerce-live',
+    complianceSummary: productText(profile.complianceSummary, '合规资料描述', 500),
+    riskKeywords: productTextList(profile.riskKeywords, '高风险词'),
+    riskBoundaries: productTextList(profile.riskBoundaries, '语义风险边界'),
+    requiredDisclosures: productTextList(profile.requiredDisclosures, '必要披露'),
+    safeSellingPoints: productTextList(profile.safeSellingPoints, '合规介绍方向'),
+    confidence,
+    source: profile.source === 'doubao' || profile.source === 'local-fallback' ? profile.source : 'manual',
+    status: profile.status === 'generated' || profile.status === 'needs_review' ? profile.status : 'verified',
+    updatedAt: Date.now(),
+  };
+}
+
 function productInput(productId: string, value: unknown): Product {
   if (!/^[a-zA-Z0-9_-]{1,96}$/u.test(productId) || !value || typeof value !== 'object') throw new Error('商品资料格式无效');
   const product = value as Record<string, unknown>;
   const stock = product.stock === null ? null : typeof product.stock === 'number' && Number.isInteger(product.stock) && product.stock >= 0 ? product.stock : null;
+  const complianceProfile = productComplianceProfile(product.complianceProfile);
   return {
     id: productId,
     name: productText(product.name, '商品名称', 120),
@@ -73,6 +95,7 @@ function productInput(productId: string, value: unknown): Product {
     description: optionalProductText(product.description, '商品描述', 1_000),
     sellingPoints: productTextList(product.sellingPoints, '商品卖点'),
     compliantPhrases: productTextList(product.compliantPhrases, '参考话术'),
+    ...(complianceProfile ? { complianceProfile } : {}),
     image: typeof product.image === 'string' && product.image.trim().length <= 500 ? product.image.trim() : '/products/serum.svg',
     accent: typeof product.accent === 'string' && product.accent.trim().length <= 64 ? product.accent.trim() : '#8da57d',
     source: 'manual',
@@ -156,6 +179,9 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
   });
   app.put('/api/v2/rooms/:roomId/products/:productId', async (request, response) => {
     try { const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'control'); response.json(await runtime.upsertProduct(roomId, productInput(routeParam(request, 'productId'), request.body))); } catch (error) { jsonError(response, error); }
+  });
+  app.post('/api/v2/rooms/:roomId/products/:productId/compliance-profile/generate', async (request, response) => {
+    try { const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'control'); response.json(await runtime.profileProduct(roomId, routeParam(request, 'productId'))); } catch (error) { jsonError(response, error); }
   });
   app.delete('/api/v2/rooms/:roomId/products/:productId', async (request, response) => {
     try { const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'control'); response.json(await runtime.removeProduct(roomId, routeParam(request, 'productId'))); } catch (error) { jsonError(response, error); }

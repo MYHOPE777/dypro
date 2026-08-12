@@ -43,4 +43,19 @@ describe('SemanticReviewPolicy', () => {
     expect(decisions.filter((decision) => decision.shouldReview).map((decision) => decision.sampleNumber)).toEqual([8]);
     expect(policy.decide({ roomId: 'room-a', productId: 'serum', speakerId: 'speaker-2', transcript: '另一个人说话', riskProfile: 'optimized', localResult: local('safe'), localFastPath: true }).sampleNumber).toBe(1);
   });
+
+  it('samples high-risk industries more often while preserving the selected cost profile', () => {
+    const policy = new SemanticReviewPolicy();
+    const balanced = Array.from({ length: 2 }, (_, index) => policy.decide({ roomId: 'room-risk', productId: 'food', productIndustry: '食品饮料', productCategory: '食品/营养补充类', transcript: `普通介绍${index}`, riskProfile: 'balanced', localResult: local('safe'), localFastPath: true }));
+    const optimized = Array.from({ length: 4 }, (_, index) => policy.decide({ roomId: 'room-risk-2', productId: 'food', productIndustry: '食品饮料', productCategory: '食品/营养补充类', transcript: `普通介绍${index}`, riskProfile: 'optimized', localResult: local('safe'), localFastPath: true }));
+
+    expect(balanced.at(-1)).toMatchObject({ shouldReview: true, sampleNumber: 2 });
+    expect(optimized.at(-1)).toMatchObject({ shouldReview: true, sampleNumber: 4 });
+  });
+
+  it('turns product profile boundary concepts into semantic pre-review triggers', () => {
+    const decision = new SemanticReviewPolicy().decide({ productId: 'cosmetic', productIndustry: '美妆个护', productCategory: '护肤品/化妆品', profileBoundaries: ['功效宣称需与备案或商品页面一致'], transcript: '这个功效特别明显', riskProfile: 'optimized', localResult: local('safe'), localFastPath: true });
+
+    expect(decision).toMatchObject({ shouldReview: true, reason: 'semantic_trigger' });
+  });
 });
