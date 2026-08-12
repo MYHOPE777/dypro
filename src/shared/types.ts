@@ -255,6 +255,7 @@ export type ProductImportResponse = {
 /** Legacy `shared` rules are retained for persisted data; new rules should use room/category/product. */
 export type ComplianceRuleScope = 'room' | 'category' | 'product' | 'shared';
 export type ComplianceRuleStatus = 'draft' | 'pending_review' | 'published' | 'rejected' | 'rolled_back';
+export type PublicRuleStatus = 'not_submitted' | 'pending' | 'adopted' | 'deferred' | 'discarded';
 
 export type ComplianceRule = {
   id: string;
@@ -274,11 +275,22 @@ export type ComplianceRule = {
   policyRef: string;
   enabled: boolean;
   status: ComplianceRuleStatus;
+  /** Public-library governance is separate from local activation. */
+  publicStatus?: PublicRuleStatus;
+  publicSubmittedBy?: string;
+  publicSubmittedAt?: number;
+  publicReviewedBy?: string;
+  publicReviewedAt?: number;
   version: number;
-  origin?: 'manual' | 'learned' | 'synced';
+  origin?: 'manual' | 'learned' | 'confirmed' | 'synced';
   confidence?: number;
   evidenceCount?: number;
   evidenceRoomIds?: string[];
+  /** Latest full sentence retained so service operations can review the rule in context. */
+  evidenceText?: string;
+  matchedTerms?: string[];
+  ruleKind?: ComplianceRuleKind;
+  lastFindingId?: string;
   lastSeenAt?: number;
   lastSessionId?: string;
   createdBy: string;
@@ -291,7 +303,7 @@ export type RuleAuditEntry = {
   id: string;
   ruleId: string;
   roomId: string;
-  action: 'created' | 'learned' | 'observed' | 'submitted' | 'approved' | 'rejected' | 'edited' | 'rolled_back' | 'disabled' | 'enabled';
+  action: 'created' | 'learned' | 'observed' | 'submitted' | 'approved' | 'rejected' | 'edited' | 'rolled_back' | 'disabled' | 'enabled' | 'public_submitted' | 'public_adopted' | 'public_deferred' | 'public_discarded';
   actorId: string;
   occurredAt: number;
   details: Record<string, unknown>;

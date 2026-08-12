@@ -97,6 +97,40 @@ describe('v2 operator view', () => {
     expect(await screen.findByText('豆包生成 1 段 · 本地安全补足')).toBeTruthy();
   });
 
+  it('shows confidence, highlights the exact risk phrase and confirms it locally', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ id: 'rule-confirmed' }) });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({
+      type: 'ready', requestId: 'join', sessionId: 'live-risk-evidence', products: PRODUCTS,
+      snapshot: { ...snapshot(), sessionId: 'live-risk-evidence', latestCompliance: { id: 'risk-result', segmentId: 'segment-1', productId: 'serum', risk: 'blocked', title: '医疗功效', reason: '包含治疗承诺', alternative: '可以改为：日常体验因人而异。', policyRef: '广告合规', confidence: 0.97, source: 'doubao', transcript: '这个可以治疗耳聋', matchedTerms: ['治疗耳聋'], ruleKind: 'term', createdAt: 1 } },
+    });
+
+    expect(await screen.findByText('置信度 97%')).toBeTruthy();
+    expect(screen.getByText('治疗耳聋', { selector: 'mark' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '确认并加入本地规则' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v2/rooms/room-default/rules/confirm', expect.objectContaining({ method: 'POST' })));
+    expect(await screen.findByText('已保存到本地规则库')).toBeTruthy();
+  });
+
+  it('renders the service operations review queue on its separate route', async () => {
+    window.history.replaceState(null, '', '/operations');
+    const candidate = {
+      id: 'rule-pending-public', roomId: 'room-default', scope: 'product' as const, productId: 'serum', category: '护肤', name: '主播确认：治疗耳聋', matchType: 'contains' as const, pattern: '治疗耳聋', risk: 'blocked' as const, title: '医疗功效', reason: '包含治疗承诺', alternative: '描述实际使用体验', policyRef: '广告合规', enabled: true, status: 'published' as const, publicStatus: 'pending' as const, version: 2, origin: 'confirmed' as const, confidence: 0.98, evidenceCount: 2, evidenceText: '这个可以治疗耳聋', matchedTerms: ['治疗耳聋'], createdBy: 'operator', createdAt: 1, updatedAt: 2,
+    };
+    const fetchMock = vi.fn().mockImplementation(async (_input: string, init?: RequestInit) => ({ ok: true, json: async () => init?.method === 'POST' ? { ...candidate, publicStatus: 'adopted' } : [candidate] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    expect(await screen.findByText('服务运营审核')).toBeTruthy();
+    expect(screen.getByText('治疗耳聋', { selector: 'mark' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /采纳并进入公共库/u }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v2/rules/rule-pending-public/public-review', expect.objectContaining({ method: 'POST' })));
+  });
+
   it('keeps the microphone input device entry visible in the operator controls', async () => {
     render(<App />);
     const socket = FakeWebSocket.instances[0];

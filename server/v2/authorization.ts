@@ -29,4 +29,8 @@ export class AuthorizationModule {
     const canOperate = permission === 'view' || permission === 'control';
     if (!canUseRoom || !canOperate) throw new Error('无权执行此操作');
   }
+
+  assertServiceReview(identity: AuthIdentity): void {
+    if (identity.role !== 'reviewer') throw new Error('仅服务运营审核账号可执行此操作');
+  }
 }

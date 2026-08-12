@@ -6,7 +6,7 @@ import express, { type Request, type Response } from 'express';
 import cors from 'cors';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { LiveCommand } from '../../src/shared/v2';
-import type { CoachPurpose, Product } from '../../src/shared/types';
+import type { CoachPurpose, ComplianceResult, Product } from '../../src/shared/types';
 import type { V2ClientCommand, V2ClientFrame, V2JoinCommand, V2ServerFrame } from '../../src/shared/v2Protocol';
 import { decodeAudioFrame } from '../../src/shared/v2Audio';
 import { createRuntime, type V2Runtime } from './runtime';
@@ -168,8 +168,24 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
       const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'control');
       const risk = request.body?.risk === 'blocked' || request.body?.risk === 'warning' ? request.body.risk : 'safe';
       const scope = request.body?.scope === 'product' || request.body?.scope === 'category' ? request.body.scope : 'room';
-      response.status(201).json(runtime.rules.create(roomId, actorId(request), { name: bodyString(request.body?.name, '规则名称'), pattern: bodyString(request.body?.pattern, '匹配内容'), matchType: request.body?.matchType === 'regex' ? 'regex' : 'contains', risk, title: bodyString(request.body?.title, '提醒标题'), reason: bodyString(request.body?.reason, '提醒原因'), alternative: bodyString(request.body?.alternative, '替代表达'), policyRef: bodyString(request.body?.policyRef, '规则依据'), scope, ...(typeof request.body?.productId === 'string' ? { productId: request.body.productId } : {}), ...(typeof request.body?.category === 'string' ? { category: request.body.category } : {}) }));
+      const productId = typeof request.body?.productId === 'string' ? request.body.productId : undefined;
+      const product = productId ? runtime.listProducts(roomId).find((candidate) => candidate.id === productId) : undefined;
+      if (scope === 'product' && !product) return response.status(400).json({ message: '商品不属于当前直播间' });
+      response.status(201).json(runtime.rules.create(roomId, actorId(request), { name: bodyString(request.body?.name, '规则名称'), pattern: bodyString(request.body?.pattern, '匹配内容'), matchType: request.body?.matchType === 'regex' ? 'regex' : 'contains', risk, title: bodyString(request.body?.title, '提醒标题'), reason: bodyString(request.body?.reason, '提醒原因'), alternative: bodyString(request.body?.alternative, '替代表达'), policyRef: bodyString(request.body?.policyRef, '规则依据'), scope, ...(product ? { productId: product.id, category: product.category } : {}), ...(scope === 'category' && typeof request.body?.category === 'string' ? { category: request.body.category } : {}) }));
     } catch (error) { jsonError(response, error); }
+  });
+  app.post('/api/v2/rooms/:roomId/rules/confirm', (request, response) => {
+    try {
+      const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'control');
+      const body = request.body && typeof request.body === 'object' ? request.body as Record<string, unknown> : {};
+      const result = body.result && typeof body.result === 'object' ? body.result as ComplianceResult : null;
+      if (!result || (result.risk !== 'warning' && result.risk !== 'blocked')) return response.status(400).json({ message: '只能确认风险提醒或高风险结果' });
+      if (typeof result.productId !== 'string' || !result.productId.trim()) return response.status(400).json({ message: '风险结果缺少商品信息' });
+      const productId = result.productId.trim();
+      const product = runtime.listProducts(roomId).find((candidate) => candidate.id === productId);
+      if (!product) return response.status(400).json({ message: '商品不属于当前直播间' });
+      return response.status(201).json(runtime.rules.confirmFinding(roomId, actorId(request), result, product));
+    } catch (error) { return jsonError(response, error, 403); }
   });
   app.patch('/api/v2/rules/:ruleId', (request, response) => {
     try {
@@ -195,6 +211,19 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
       const version = Number(request.body?.version); if (!Number.isInteger(version) || version < 1) return response.status(400).json({ message: '目标版本无效' });
       return response.json(runtime.rules.rollback(ruleId, actorId(request), version));
     } catch (error) { return jsonError(response, error); }
+  });
+  app.post('/api/v2/rules/:ruleId/public-submit', (request, response) => {
+    try { const ruleId = routeParam(request, 'ruleId'); const rule = runtime.store.getRule(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assert(identity(request), rule.roomId, 'control'); return response.json(runtime.rules.submitPublic(ruleId, actorId(request))); } catch (error) { return jsonError(response, error); }
+  });
+  app.post('/api/v2/rules/:ruleId/public-review', (request, response) => {
+    try {
+      const ruleId = routeParam(request, 'ruleId'); const rule = runtime.store.getRule(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assertServiceReview(identity(request));
+      if (request.body?.decision !== 'adopted' && request.body?.decision !== 'deferred' && request.body?.decision !== 'discarded') return response.status(400).json({ message: '运营审核决定无效' });
+      return response.json(runtime.rules.reviewPublic(ruleId, actorId(request), request.body.decision));
+    } catch (error) { return jsonError(response, error, 403); }
+  });
+  app.get('/api/v2/operations/rules', (request, response) => {
+    try { runtime.authorization.assertServiceReview(identity(request)); return response.json(runtime.store.listPublicRuleCandidates()); } catch (error) { return jsonError(response, error, 403); }
   });
   app.get('/api/v2/rooms/:roomId/presenters', (request, response) => {
     try { const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'view'); response.json(runtime.presenters.list(roomId)); } catch (error) { jsonError(response, error, 403); }

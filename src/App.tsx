@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import {
   AlertTriangle,
   Archive,
@@ -211,6 +211,26 @@ function riskText(risk: ComplianceResult['risk'] | undefined): string {
   return risk === 'blocked' ? '高风险' : risk === 'warning' ? '需注意' : '表达安全';
 }
 
+function riskEvidence(text: string, terms: string[]): ReactNode {
+  const matches = terms
+    .map((term) => term.trim())
+    .filter((term, index, all) => term && all.indexOf(term) === index)
+    .map((term) => ({ term, index: text.indexOf(term) }))
+    .filter((match) => match.index >= 0)
+    .sort((left, right) => left.index - right.index || right.term.length - left.term.length);
+  if (matches.length === 0) return text;
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  for (const match of matches) {
+    if (match.index < cursor) continue;
+    if (match.index > cursor) parts.push(text.slice(cursor, match.index));
+    parts.push(<mark key={`${match.index}-${match.term}`} className="v2-risk-term">{match.term}</mark>);
+    cursor = match.index + match.term.length;
+  }
+  if (cursor < text.length) parts.push(text.slice(cursor));
+  return parts;
+}
+
 function SpeakerBadge({ segment }: { segment: TranscriptSegment }) {
   const automatic = segment.speakerSource === 'automatic';
   return <span className={`v2-speaker ${segment.speaker === 'other' ? 'other' : 'host'} ${automatic ? 'automatic' : ''}`}>
@@ -251,14 +271,23 @@ function CoachBoard({ snapshot, display = false }: { snapshot: LiveSessionSnapsh
   </section>;
 }
 
-function RiskPanel({ snapshot, display = false }: { snapshot: LiveSessionSnapshot; display?: boolean }) {
+function RiskPanel({ snapshot, display = false, onConfirmRule }: { snapshot: LiveSessionSnapshot; display?: boolean; onConfirmRule?: (result: ComplianceResult) => Promise<void> }) {
   const result = snapshot.latestCompliance;
   const risk = result?.risk ?? 'safe';
+  const [confirmation, setConfirmation] = useState<{ resultId: string; message: string }>({ resultId: '', message: '' });
+  const confirm = async () => {
+    if (!result || !onConfirmRule) return;
+    setConfirmation({ resultId: result.id, message: '正在保存' });
+    try { await onConfirmRule(result); setConfirmation({ resultId: result.id, message: '已保存到本地规则库' }); } catch (error) { setConfirmation({ resultId: result.id, message: error instanceof Error ? error.message : String(error) }); }
+  };
+  const terms = result?.matchedTerms?.filter((term) => term.trim()) ?? [];
   return <section className={`v2-risk-panel ${risk} ${display ? 'display' : ''}`}>
-    <header><div>{risk === 'safe' ? <CheckCircle2 size={17} /> : <ShieldAlert size={17} />}<strong>{riskText(risk)}</strong></div>{typeof result?.analysisMs === 'number' && <span>{result.analysisMs}ms</span>}</header>
+    <header><div>{risk === 'safe' ? <CheckCircle2 size={17} /> : <ShieldAlert size={17} />}<strong>{riskText(risk)}</strong></div><span>{result ? `置信度 ${Math.round(result.confidence * 100)}%` : ''}{typeof result?.analysisMs === 'number' ? ` · ${result.analysisMs}ms` : ''}</span></header>
     <h3>{result?.title ?? '当前没有风险提醒'}</h3>
     <p>{result?.reason ?? '本地规则会持续检查主播表达，模型判断完成后会在这里更新。'}</p>
+    {result && risk !== 'safe' && <div className="v2-risk-evidence"><span>具体违规原话</span><blockquote>{riskEvidence(result.transcript, terms)}</blockquote>{terms.length > 0 && <small>命中片段：{terms.join('、')}</small>}</div>}
     {result && risk !== 'safe' && <div className="v2-risk-advice"><span>建议替换</span><strong>{result.alternative.replace(/^可以改为：/u, '')}</strong></div>}
+    {!display && result && risk !== 'safe' && onConfirmRule && <div className="v2-risk-confirm"><button type="button" disabled={confirmation.resultId === result.id && confirmation.message === '正在保存'} onClick={() => void confirm()}><CheckCircle2 size={13} />确认并加入本地规则</button>{confirmation.resultId === result.id && confirmation.message && <small>{confirmation.message}</small>}</div>}
     {!display && <div className="v2-alert-log"><span>近期提醒</span>{snapshot.alerts.slice(0, 4).map((alert) => <div key={alert.id}><i className={alert.risk} /><p>{alert.title}</p><time>{formatTime(alert.createdAt)}</time></div>)}</div>}
   </section>;
 }
@@ -461,7 +490,7 @@ function LibraryWorkspace({ snapshot, products, send, onClose }: { snapshot: Liv
     <main>{tab === 'products' && <ProductCatalogEditor roomId={snapshot.roomId} activeProductId={snapshot.product.id} products={products} onSaved={(product, isNew) => {
       if (isNew) send({ type: 'set_lineup', productIds: [...new Set([...snapshot.lineup.map((candidate) => candidate.id), product.id])] });
     }} />}
-      {tab === 'rules' && <div className="v2-library-columns"><section><header><span>新增风险规则</span></header><select aria-label="规则作用域" value={ruleDraft.scope} onChange={(event) => setRuleDraft({ ...ruleDraft, scope: event.target.value as typeof ruleDraft.scope })}><option value="product">当前商品</option><option value="category">当前品类（{snapshot.product.category}）</option><option value="room">当前直播间全部商品</option></select><input value={ruleDraft.pattern} onChange={(event) => setRuleDraft({ ...ruleDraft, pattern: event.target.value })} placeholder="风险词或明确短语" /><input value={ruleDraft.title} onChange={(event) => setRuleDraft({ ...ruleDraft, title: event.target.value })} placeholder="提醒标题" /><textarea value={ruleDraft.alternative} onChange={(event) => setRuleDraft({ ...ruleDraft, alternative: event.target.value })} placeholder="主播可直接替换的安全表达" /><button type="button" disabled={busy || !ruleDraft.pattern || !ruleDraft.title || !ruleDraft.alternative} onClick={addRule}><Plus size={13} />保存规则</button></section><section className="v2-library-list">{rules.map((rule) => { const scopeText = rule.scope === 'product' ? `商品 · ${rule.productId === snapshot.product.id ? '当前商品' : rule.productId ?? '未绑定'}` : rule.scope === 'category' ? `品类 · ${rule.category ?? '未绑定'}` : '直播间通用'; return <article key={rule.id}><div><span className={rule.risk}>{rule.risk === 'blocked' ? '高风险' : '提醒'}</span><strong>{rule.name}</strong></div><p>{rule.pattern}</p><small>{scopeText} · {rule.origin === 'learned' ? `自动发现 · 证据 ${rule.evidenceCount ?? 1} 次` : '人工规则'} · v{rule.version} · {rule.status === 'pending_review' ? '待审核' : rule.status === 'rejected' ? '已驳回' : rule.enabled ? '已启用' : '已停用'}</small><div className="v2-rule-actions">{rule.status === 'pending_review' ? <><button type="button" disabled={busy} onClick={() => void run(() => client.reviewRule(rule, 'approved'))}>批准启用</button><button type="button" disabled={busy} onClick={() => void run(() => client.reviewRule(rule, 'rejected'))}>驳回</button></> : rule.status === 'rejected' ? <button type="button" disabled={busy} onClick={() => void run(() => client.reviewRule(rule, 'approved'))}>重新批准</button> : <button type="button" disabled={busy} onClick={() => void run(() => client.setRuleEnabled(rule, !rule.enabled))}>{rule.enabled ? '停用' : '启用'}</button>}{rule.version > 1 && <button type="button" disabled={busy} onClick={() => void run(() => client.rollbackRule(rule, rule.version - 1))}>回滚上一版</button>}</div></article>; })}</section></div>}
+      {tab === 'rules' && <div className="v2-library-columns"><section><header><span>新增风险规则</span></header><select aria-label="规则作用域" value={ruleDraft.scope} onChange={(event) => setRuleDraft({ ...ruleDraft, scope: event.target.value as typeof ruleDraft.scope })}><option value="product">当前商品</option><option value="category">当前品类（{snapshot.product.category}）</option><option value="room">当前直播间全部商品</option></select><input value={ruleDraft.pattern} onChange={(event) => setRuleDraft({ ...ruleDraft, pattern: event.target.value })} placeholder="风险词或明确短语" /><input value={ruleDraft.title} onChange={(event) => setRuleDraft({ ...ruleDraft, title: event.target.value })} placeholder="提醒标题" /><textarea value={ruleDraft.alternative} onChange={(event) => setRuleDraft({ ...ruleDraft, alternative: event.target.value })} placeholder="主播可直接替换的安全表达" /><button type="button" disabled={busy || !ruleDraft.pattern || !ruleDraft.title || !ruleDraft.alternative} onClick={addRule}><Plus size={13} />保存规则</button></section><section className="v2-library-list">{rules.map((rule) => { const scopeText = rule.scope === 'product' ? `商品 · ${rule.productId === snapshot.product.id ? '当前商品' : rule.productId ?? '未绑定'}` : rule.scope === 'category' ? `品类 · ${rule.category ?? '未绑定'}` : '直播间通用'; return <article key={rule.id}><div><span className={rule.risk}>{rule.risk === 'blocked' ? '高风险' : '提醒'}</span><strong>{rule.name}</strong></div><p>{rule.pattern}</p><small>{scopeText} · {rule.origin === 'learned' ? `自动发现 · 证据 ${rule.evidenceCount ?? 1} 次` : rule.origin === 'confirmed' ? '主播确认' : '人工规则'} · v{rule.version} · {rule.status === 'pending_review' ? '待审核' : rule.status === 'rejected' ? '已驳回' : rule.enabled ? '已启用' : '已停用'} · 公共库：{rule.publicStatus === 'pending' ? '运营审核中' : rule.publicStatus === 'adopted' ? '已采纳' : rule.publicStatus === 'deferred' ? '待定' : rule.publicStatus === 'discarded' ? '已舍弃' : '未提交'}</small><div className="v2-rule-actions">{rule.status === 'pending_review' ? <><button type="button" disabled={busy} onClick={() => void run(() => client.reviewRule(rule, 'approved'))}>批准启用</button><button type="button" disabled={busy} onClick={() => void run(() => client.reviewRule(rule, 'rejected'))}>驳回</button></> : rule.status === 'rejected' ? <button type="button" disabled={busy} onClick={() => void run(() => client.reviewRule(rule, 'approved'))}>重新批准</button> : <><button type="button" disabled={busy} onClick={() => void run(() => client.setRuleEnabled(rule, !rule.enabled))}>{rule.enabled ? '停用' : '启用'}</button>{rule.publicStatus !== 'pending' && rule.publicStatus !== 'adopted' && <button type="button" disabled={busy} onClick={() => void run(() => client.submitRuleToPublic(rule))}>提交运营审核</button>}</>}{rule.version > 1 && <button type="button" disabled={busy} onClick={() => void run(() => client.rollbackRule(rule, rule.version - 1))}>回滚上一版</button>}</div></article>; })}</section></div>}
       {tab === 'phrases' && <div className="v2-library-columns"><section><header><span>主播档案</span></header><select value={presenterId} onChange={(event) => setPresenterId(event.target.value)}>{presenters.map((presenter) => <option value={presenter.id} key={presenter.id}>{presenter.name}</option>)}</select><button type="button" disabled={!presenterId || presenterId === snapshot.presenterId} onClick={() => send({ type: 'select_presenter', presenterId })}><UserRound size={13} />{presenterId === snapshot.presenterId ? '本场当前主播' : '设为本场主播'}</button><div className="v2-inline-form"><input value={newPresenter} onChange={(event) => setNewPresenter(event.target.value)} placeholder="新增主播名称" /><button type="button" disabled={!newPresenter.trim() || busy} onClick={addPresenter}><Plus size={13} /></button></div><select value={purpose} onChange={(event) => setPurpose(event.target.value as CoachPurpose)}><option>塑品</option><option>憋单</option><option>逼单</option><option>转化</option><option>互动</option><option>留人</option><option>答疑</option></select><textarea value={phraseDraft} onChange={(event) => setPhraseDraft(event.target.value)} placeholder="录入头部直播间话术，或保存下一场参考表达" /><button type="button" disabled={busy || !presenterId || !phraseDraft.trim()} onClick={addPhrase}><Save size={13} />保存话术</button></section><section className="v2-library-list">{phrases.map((phrase) => <article key={phrase.id}><div><span className={phrase.status}>{phrase.status === 'reference' ? '下一场参考' : phrase.source === 'session' ? '下播归档' : '草稿'}</span><strong>{phrase.purpose ?? '通用'}</strong></div><p>{phrase.text}</p><small>{phrase.source === 'session' ? '来自历史直播' : phrase.source === 'manual' ? '人工录入' : '豆包改写'} · v{phrase.version}</small><button type="button" onClick={() => void run(() => client.updatePhrase(phrase.id, { status: phrase.status === 'reference' ? 'draft' : 'reference' }))}>{phrase.status === 'reference' ? '取消参考' : '选为参考'}</button></article>)}</section></div>}
     </main>{message && <div className="v2-review-message">{message}</div>}
   </section></div>;
@@ -531,15 +560,46 @@ function SessionAudio({ client, sessionId }: { client: SessionReviewClient; sess
   return src ? <audio controls preload="metadata" src={src} /> : <div className="v2-empty">正在读取本地音频</div>;
 }
 
+function OperationsApp() {
+  const client = useMemo(() => new CatalogClient(), []);
+  const [rules, setRules] = useState<ComplianceRule[]>([]);
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => {
+    try { setRules(await client.publicRuleCandidates()); }
+    catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+  }, [client]);
+  useEffect(() => { void load(); }, [load]);
+  const review = async (rule: ComplianceRule, decision: 'adopted' | 'deferred' | 'discarded') => {
+    setBusy(true); setMessage('');
+    try { await client.reviewPublicRule(rule, decision); await load(); }
+    catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
+    finally { setBusy(false); }
+  };
+  const statusText = (status: ComplianceRule['publicStatus']) => ({ pending: '待运营审核', adopted: '已采纳', deferred: '待定', discarded: '已舍弃', not_submitted: '未提交' }[status ?? 'not_submitted']);
+  return <div className="v2-app v2-operations-app"><section className="v2-review-workspace v2-operations-workspace">
+    <header><div><ShieldAlert size={19} /><span><strong>服务运营审核</strong><small>只有采纳的规则会进入公共规则库；待定和舍弃不会影响原直播间</small></span></div><a href="/">返回直播中控</a></header>
+    <main>{rules.length === 0 ? <div className="v2-empty">暂无已提交的直播间规则</div> : <div className="v2-operations-list">{rules.map((rule) => <article key={rule.id}>
+      <header><div><span className={rule.risk}>{rule.risk === 'blocked' ? '高风险' : '需注意'}</span><strong>{rule.name}</strong></div><small>{statusText(rule.publicStatus)}</small></header>
+      <blockquote>{riskEvidence(rule.evidenceText ?? rule.pattern, rule.matchedTerms ?? [rule.pattern])}</blockquote>
+      <p>{rule.reason}</p>
+      <div className="v2-operations-meta"><span>来源直播间：{rule.roomId}</span><span>置信度：{Math.round((rule.confidence ?? 0) * 100)}%</span><span>证据：{rule.evidenceCount ?? 1} 次</span><span>品类：{rule.category ?? '通用'}</span></div>
+      {rule.publicStatus === 'pending' && <div className="v2-operations-actions"><button type="button" disabled={busy} onClick={() => void review(rule, 'adopted')}><CheckCircle2 size={13} />采纳并进入公共库</button><button type="button" disabled={busy} onClick={() => void review(rule, 'deferred')}>待定</button><button type="button" disabled={busy} onClick={() => void review(rule, 'discarded')}><Trash2 size={13} />舍弃</button></div>}
+    </article>)}</div>}</main>
+    {message && <div className="v2-review-message">{message}</div>}
+  </section></div>;
+}
+
 function OperatorApp() {
   const live = useLive('operator');
+  const catalog = useMemo(() => new CatalogClient(), []);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
   return <div className="v2-app">
     <header className="v2-topbar"><div className="v2-brand"><span><MonitorUp size={18} /></span><div><strong>直播中控</strong><small>风险预警与主播提词</small></div></div><div className="v2-live-state"><i className={live.snapshot.lifecycle === 'live' ? 'live' : ''} /><span>{lifecycleText(live.snapshot.lifecycle)}</span><small>{live.snapshot.presenterName}</small></div><LiveControls snapshot={live.snapshot} connected={live.connected} status={live.status} send={live.send} sendAudio={live.sendAudio} /></header>
     <div className="v2-operator-grid"><ProductRail snapshot={live.snapshot} products={live.products} send={live.send} openHistory={() => setHistoryOpen(true)} openLibrary={() => setLibraryOpen(true)} />
       <main className="v2-main"><header className="v2-product-context"><div><span>当前商品</span><h1>{live.snapshot.product.name}</h1></div><strong>{live.snapshot.product.price}</strong></header><CoachBoard snapshot={live.snapshot} /><TranscriptFeed snapshot={live.snapshot} compact /><DemoInput snapshot={live.snapshot} send={live.send} /></main>
-      <aside className="v2-right-rail"><RiskPanel snapshot={live.snapshot} /><section className="v2-session-stats"><div><Clock3 size={14} /><span>直播时长</span><strong>{Math.floor(live.snapshot.stats.speakingSeconds / 60).toString().padStart(2, '0')}:{(live.snapshot.stats.speakingSeconds % 60).toString().padStart(2, '0')}</strong></div><div><AlertTriangle size={14} /><span>风险提醒</span><strong>{live.snapshot.stats.warningCount + live.snapshot.stats.blockedCount}</strong></div></section><DisplayLinkPanel sessionId={live.snapshot.sessionId} /></aside>
+      <aside className="v2-right-rail"><RiskPanel snapshot={live.snapshot} onConfirmRule={(result) => catalog.confirmRule(live.snapshot.roomId, result).then(() => undefined)} /><section className="v2-session-stats"><div><Clock3 size={14} /><span>直播时长</span><strong>{Math.floor(live.snapshot.stats.speakingSeconds / 60).toString().padStart(2, '0')}:{(live.snapshot.stats.speakingSeconds % 60).toString().padStart(2, '0')}</strong></div><div><AlertTriangle size={14} /><span>风险提醒</span><strong>{live.snapshot.stats.warningCount + live.snapshot.stats.blockedCount}</strong></div></section><DisplayLinkPanel sessionId={live.snapshot.sessionId} /></aside>
     </div>{historyOpen && <ReviewWorkspace roomId={live.snapshot.roomId} onClose={() => setHistoryOpen(false)} />}{libraryOpen && <LibraryWorkspace snapshot={live.snapshot} products={live.products} send={live.send} onClose={() => setLibraryOpen(false)} />}
   </div>;
 }
@@ -564,7 +624,7 @@ function LoginScreen({ onLoggedIn }: { onLoggedIn: () => void }) {
   return <main className="v2-login"><form onSubmit={(event) => void submit(event)}><div className="v2-brand"><span><MonitorUp size={20} /></span><div><strong>直播中控</strong><small>多人协作模式</small></div></div><h1>登录直播中控</h1><label>账号<input autoFocus autoComplete="username" value={actorId} onChange={(event) => setActorId(event.target.value)} /></label><label>密码<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>{message && <p>{message}</p>}<button className="primary" type="submit" disabled={busy || !actorId.trim() || !password}>{busy ? '正在登录' : '登录'}</button></form></main>;
 }
 
-function OperatorGate() {
+function AuthGate({ children }: { children: ReactNode }) {
   const [loginRequired, setLoginRequired] = useState(false);
   const [generation, setGeneration] = useState(0);
   useEffect(() => {
@@ -573,9 +633,11 @@ function OperatorGate() {
     return () => window.removeEventListener(V2_AUTH_REQUIRED_EVENT, requireLogin);
   }, []);
   if (loginRequired) return <LoginScreen onLoggedIn={() => { setLoginRequired(false); setGeneration((value) => value + 1); }} />;
-  return <OperatorApp key={generation} />;
+  return <div key={generation}>{children}</div>;
 }
 
 export default function App() {
-  return window.location.pathname.startsWith('/screen/') ? <DisplayApp /> : <OperatorGate />;
+  if (window.location.pathname.startsWith('/screen/')) return <DisplayApp />;
+  if (window.location.pathname.startsWith('/operations')) return <AuthGate><OperationsApp /></AuthGate>;
+  return <AuthGate><OperatorApp /></AuthGate>;
 }

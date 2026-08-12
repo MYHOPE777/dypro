@@ -54,6 +54,7 @@ describe('DoubaoCoach', () => {
 
     expect(userPayload.templateMode).toBe('generate');
     expect(userPayload.templateInstruction).toContain('没有主播模板话术');
+    expect(userPayload.templateInstruction).toContain('主播当前原话作为第一优先级');
     expect(userPayload.referencePhrases).toEqual([]);
     expect(suggestions).toHaveLength(3);
     expect(suggestions.every((suggestion) => suggestion.source === 'doubao')).toBe(true);
@@ -67,6 +68,17 @@ describe('DoubaoCoach', () => {
     expect(suggestions).toHaveLength(3);
     expect(suggestions.every((suggestion) => suggestion.source === 'local-fallback')).toBe(true);
     expect(new Set(suggestions.map((suggestion) => suggestion.text)).size).toBe(3);
+  });
+
+  it('continues from the presenter transcript before using product material', async () => {
+    const suggestions = await new DoubaoCoach({}).suggestMany({
+      ...input,
+      transcript: '刚才有朋友问这个适不适合通勤',
+      referencePhrases: [{ text: '这是商品资料里预设的固定模板话术', purpose: '塑品' }],
+    });
+
+    expect(suggestions[0]?.text).toContain('朋友问这个适不适合通勤');
+    expect(suggestions[0]?.text).not.toBe('这是商品资料里预设的固定模板话术');
   });
 
   it('removes locally detectable risk from model-generated alternatives', async () => {
@@ -98,5 +110,14 @@ describe('DoubaoCoach', () => {
     });
 
     expect(suggestion).toMatchObject({ purpose: '转化', source: 'local-fallback' });
+    expect(suggestion.text).toBe('活动以页面为准。');
+  });
+
+  it('does not trust a risk alternative that repeats its matched phrase', () => {
+    const suggestion = localSuggestion({
+      ...input,
+      compliance: { id: 'risk', productId: 'serum', risk: 'blocked', title: '风险', reason: '测试', alternative: '可以改为：继续治疗耳聋。', policyRef: '测试', confidence: 0.99, source: 'doubao', transcript: '治疗耳聋', matchedTerms: ['治疗耳聋'], ruleKind: 'term', createdAt: 1 },
+    });
+    expect(suggestion.text).not.toContain('治疗耳聋');
   });
 });

@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { DEFAULT_PRODUCT, PRODUCTS } from '../../src/shared/products';
 import type { ComplianceResult } from '../../src/shared/types';
+import type { CoachInput } from '../providers/doubaoCoach';
 import { SqliteFactStore } from './store';
 import { BoundedScheduler } from './scheduler';
 import { LiveSession, type CapturePort, type ReviewAnalyzer } from './liveSession';
@@ -219,6 +220,38 @@ describe('LiveSession', () => {
     await session.dispatch({ type: 'select_presenter', presenterId: 'presenter-xiaotang' });
 
     expect(session.snapshot()).toMatchObject({ presenterId: 'presenter-xiaotang', presenterName: '主播小唐' });
+    store.close();
+  });
+
+  it('auto-switches from presenter speech before predicting the next line from that speech', async () => {
+    const coachInputs: CoachInput[] = [];
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    const session = new LiveSession({
+      store,
+      scheduler: new BoundedScheduler({ modelGlobal: 4, modelPerSession: 2, background: 1 }),
+      products: PRODUCTS,
+      capture: new FakeCapture(),
+      analyzer: { analyze: async (analysisInput) => result(analysisInput.productId, 'safe') },
+      coach: {
+        suggest: async () => ({ id: 'unused', purpose: '塑品', text: 'unused', reason: 'unused', source: 'doubao', createdAt: 1 }),
+        suggestMany: async (coachInput) => {
+          coachInputs.push(coachInput);
+          return [1, 2, 3].map((index) => ({ id: `coach-${index}`, purpose: '塑品' as const, text: `${coachInput.transcript}-${index}`, reason: '承接主播原话', source: 'doubao' as const, createdAt: index }));
+        },
+      },
+      session: { sessionId: 'session-auto-product-coach', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '测试主播', product: DEFAULT_PRODUCT, lineup: PRODUCTS },
+    });
+    await session.dispatch({ type: 'start' });
+
+    await session.dispatch({ type: 'demo_transcript', text: '接下来给大家看云感降噪耳机的通勤体验' });
+    await vi.waitFor(() => {
+      expect(session.snapshot().coachPending).toBe(false);
+      expect(session.snapshot().coachSuggestions).toHaveLength(3);
+      expect(session.snapshot().coachSuggestions.every((suggestion) => suggestion.source === 'doubao')).toBe(true);
+    });
+
+    expect(session.snapshot().product.id).toBe('headphones');
+    expect(coachInputs).toContainEqual(expect.objectContaining({ product: expect.objectContaining({ id: 'headphones' }), transcript: '接下来给大家看云感降噪耳机的通勤体验' }));
     store.close();
   });
 });

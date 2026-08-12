@@ -58,4 +58,40 @@ describe('SQLite catalog modules', () => {
     expect(rules.review(learned.id, 'owner', 'approved')).toMatchObject({ status: 'published', enabled: true, approvedBy: 'owner' });
     store.close();
   });
+
+  it('confirms live findings locally before separately governing public rules', () => {
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    const rules = new RuleModule(store, (() => { let now = 100; return () => now += 1; })());
+    const termFinding: ComplianceResult = { id: 'term-finding', segmentId: 'segment-1', productId: DEFAULT_PRODUCT.id, risk: 'blocked', title: '医疗功效', reason: '包含治疗承诺', alternative: '只描述使用体验', policyRef: '广告合规', confidence: 0.97, source: 'doubao', transcript: '这个可以治疗耳聋', createdAt: 1, matchedTerms: ['治疗耳聋'], ruleKind: 'term' };
+
+    const local = rules.confirmFinding('room-default', 'operator', termFinding, DEFAULT_PRODUCT);
+    expect(local).toMatchObject({ pattern: '治疗耳聋', status: 'published', enabled: true, publicStatus: 'not_submitted', origin: 'confirmed', evidenceCount: 1, evidenceText: termFinding.transcript });
+    expect(rules.confirmFinding('room-default', 'operator', termFinding, DEFAULT_PRODUCT)).toMatchObject({ id: local.id, version: 1, evidenceCount: 1 });
+    expect(rules.submitPublic(local.id, 'operator')).toMatchObject({ publicStatus: 'pending' });
+    expect(rules.active('room-default', DEFAULT_PRODUCT).some((rule) => rule.id === local.id)).toBe(true);
+
+    const reviewed = rules.reviewPublic(local.id, 'service-reviewer', 'adopted');
+    expect(reviewed).toMatchObject({ publicStatus: 'adopted', enabled: true, roomId: 'room-default' });
+    expect(store.listRules('public-library')).toContainEqual(expect.objectContaining({ pattern: '治疗耳聋', scope: 'shared', publicStatus: 'adopted' }));
+    const edited = rules.update(local.id, 'operator', { alternative: '新的安全表达' });
+    expect(edited).toMatchObject({ publicStatus: 'not_submitted', alternative: '新的安全表达' });
+    store.close();
+  });
+
+  it('keeps sentence and contextual evidence intact instead of banning one ordinary term', () => {
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    const rules = new RuleModule(store, () => 100);
+    const contextual: ComplianceResult = { id: 'context-finding', productId: DEFAULT_PRODUCT.id, risk: 'warning', title: '隐喻暗示', reason: '跨词组合表达健康功效', alternative: '直接描述商品使用场景', policyRef: '健康宣传', confidence: 0.91, source: 'doubao', transcript: '给发动机加满汽油身体就有劲了', createdAt: 1, matchedTerms: ['发动机', '汽油'], ruleKind: 'context' };
+
+    const rule = rules.confirmFinding('room-default', 'operator', contextual, DEFAULT_PRODUCT);
+    expect(rule.pattern).toBe(contextual.transcript);
+    expect(rule.matchedTerms).toEqual(['发动机', '汽油']);
+    rules.submitPublic(rule.id, 'operator');
+    const discarded = rules.reviewPublic(rule.id, 'service-reviewer', 'discarded');
+    expect(discarded).toMatchObject({ publicStatus: 'discarded', enabled: true, roomId: 'room-default' });
+    expect(store.listRules('public-library')).toHaveLength(0);
+    expect(rules.active('room-default', DEFAULT_PRODUCT).some((candidate) => candidate.id === rule.id)).toBe(true);
+    expect(rules.submitPublic(rule.id, 'operator')).toMatchObject({ publicStatus: 'pending', publicReviewedBy: undefined, publicReviewedAt: undefined });
+    store.close();
+  });
 });

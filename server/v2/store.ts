@@ -403,6 +403,12 @@ export class SqliteFactStore {
     return activeOnly ? rules.filter((rule) => rule.enabled && rule.status === 'published') : rules;
   }
 
+  listPublicRuleCandidates(): ComplianceRule[] {
+    return this.db.prepare('SELECT rule_json FROM compliance_rules ORDER BY updated_at DESC').all()
+      .map((row) => parseJson<ComplianceRule>(row.rule_json, {} as ComplianceRule))
+      .filter((rule) => rule.roomId !== 'public-library' && rule.publicStatus && rule.publicStatus !== 'not_submitted');
+  }
+
   listRuleAudits(roomId: string): RuleAuditEntry[] {
     return this.db.prepare('SELECT a.* FROM rule_audits a JOIN compliance_rules r ON r.id = a.rule_id WHERE r.room_id = ? ORDER BY a.occurred_at DESC').all(roomId).map((row) => ({ id: stringValue(row.id), ruleId: stringValue(row.rule_id), roomId, action: stringValue(row.action) as RuleAuditEntry['action'], actorId: stringValue(row.actor_id), occurredAt: numberValue(row.occurred_at), details: parseJson<Record<string, unknown>>(row.details_json, {}) }));
   }

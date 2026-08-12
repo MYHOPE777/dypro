@@ -446,6 +446,24 @@ describe('v2 HTTP/WebSocket runtime', () => {
     operator.send(JSON.stringify({ requestId: 'join-authenticated', command: { type: 'session.join', roomId: 'room-default', role: 'operator', token: login.token } }));
     const ready = await inbox.until((frame) => frame.type === 'ready');
     expect(ready.type).toBe('ready');
+
+    const finding: Parameters<typeof runtime.rules.confirmFinding>[2] = {
+      id: 'operator-confirmed-risk', segmentId: 'segment-1', productId: PRODUCTS[0].id, risk: 'blocked', title: '医疗功效', reason: '包含治疗承诺', alternative: '只描述实际使用体验', policyRef: '广告合规', confidence: 0.98, source: 'doubao', transcript: '这个可以治疗耳聋', matchedTerms: ['治疗耳聋'], ruleKind: 'term', createdAt: 1,
+    };
+    const localRule = runtime.rules.confirmFinding('room-default', 'operator-1', finding, PRODUCTS[0]);
+    runtime.rules.submitPublic(localRule.id, 'operator-1');
+    const operatorReview = await fetch(`http://127.0.0.1:${port}/api/v2/rules/${localRule.id}/public-review`, { method: 'POST', headers: { Authorization: `Bearer ${login.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ decision: 'adopted' }) });
+    expect(operatorReview.status).toBe(403);
+    expect(runtime.store.getRule(localRule.id)?.publicStatus).toBe('pending');
+
+    const reviewerLogin = await (await fetch(`http://127.0.0.1:${port}/api/v2/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ actorId: 'owner', password: 'review-pass' }) })).json() as { token: string };
+    const candidates = await fetch(`http://127.0.0.1:${port}/api/v2/operations/rules`, { headers: { Authorization: `Bearer ${reviewerLogin.token}` } });
+    expect(candidates.status).toBe(200);
+    expect(await candidates.json()).toContainEqual(expect.objectContaining({ id: localRule.id, publicStatus: 'pending', evidenceText: finding.transcript }));
+    const reviewerReview = await fetch(`http://127.0.0.1:${port}/api/v2/rules/${localRule.id}/public-review`, { method: 'POST', headers: { Authorization: `Bearer ${reviewerLogin.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ decision: 'adopted' }) });
+    expect(reviewerReview.status).toBe(200);
+    expect(runtime.store.getRule(localRule.id)?.publicStatus).toBe('adopted');
+    expect(runtime.store.listRules('public-library')).toContainEqual(expect.objectContaining({ pattern: '治疗耳聋', scope: 'shared' }));
     operator.close();
   });
 });

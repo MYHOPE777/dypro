@@ -1,5 +1,5 @@
-import type { ComplianceRule, CoachPurpose, PresenterPhrase, PresenterProfile, Product, RuleAuditEntry } from '../shared/types';
-import { authenticatedHeaders } from './authHeaders';
+import type { ComplianceResult, ComplianceRule, CoachPurpose, PresenterPhrase, PresenterProfile, Product, RuleAuditEntry } from '../shared/types';
+import { authenticatedHeaders, clearAuthToken, V2_AUTH_REQUIRED_EVENT } from './authHeaders';
 
 export class CatalogClient {
   constructor(private readonly actorId = 'local-operator') {}
@@ -17,9 +17,13 @@ export class CatalogClient {
   }
   async removeProduct(roomId: string, productId: string): Promise<Product[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/products/${encodeURIComponent(productId)}`, { method: 'DELETE' }); }
   async createRule(roomId: string, input: { name: string; pattern: string; risk: 'warning' | 'blocked'; title: string; reason: string; alternative: string; policyRef: string; scope?: 'room' | 'category' | 'product'; productId?: string; category?: string }): Promise<ComplianceRule> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/rules`, { method: 'POST', body: JSON.stringify(input) }); }
+  async confirmRule(roomId: string, result: ComplianceResult): Promise<ComplianceRule> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/rules/confirm`, { method: 'POST', body: JSON.stringify({ result }) }); }
   async setRuleEnabled(rule: ComplianceRule, enabled: boolean): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }); }
   async reviewRule(rule: ComplianceRule, decision: 'approved' | 'rejected'): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}/review`, { method: 'POST', body: JSON.stringify({ decision }) }); }
   async rollbackRule(rule: ComplianceRule, version: number): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}/rollback`, { method: 'POST', body: JSON.stringify({ version }) }); }
+  async submitRuleToPublic(rule: ComplianceRule): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}/public-submit`, { method: 'POST' }); }
+  async reviewPublicRule(rule: ComplianceRule, decision: 'adopted' | 'deferred' | 'discarded'): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}/public-review`, { method: 'POST', body: JSON.stringify({ decision }) }); }
+  async publicRuleCandidates(): Promise<ComplianceRule[]> { return this.request('/api/v2/operations/rules'); }
   async presenters(roomId: string): Promise<PresenterProfile[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/presenters`); }
   async createPresenter(roomId: string, name: string): Promise<PresenterProfile> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/presenters`, { method: 'POST', body: JSON.stringify({ name }) }); }
   async phrases(presenterId: string, productId?: string): Promise<PresenterPhrase[]> { return this.request(`/api/v2/presenters/${encodeURIComponent(presenterId)}/phrases${productId ? `?productId=${encodeURIComponent(productId)}` : ''}`); }
@@ -29,6 +33,7 @@ export class CatalogClient {
   private async request<T>(url: string, init: RequestInit = {}): Promise<T> {
     const headers = authenticatedHeaders(init.headers, this.actorId); if (init.body) headers.set('Content-Type', 'application/json');
     const response = await fetch(url, { ...init, headers }); const body = await response.json().catch(() => ({})) as T & { message?: string };
+    if (response.status === 401 && typeof window !== 'undefined') { clearAuthToken(); window.dispatchEvent(new Event(V2_AUTH_REQUIRED_EVENT)); }
     if (!response.ok) throw new Error(body.message ?? '请求失败'); return body as T;
   }
 }
