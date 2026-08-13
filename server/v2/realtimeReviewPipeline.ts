@@ -32,7 +32,8 @@ const MODEL_BUDGET_MS = 2_000;
 const RISK_SEVERITY = { safe: 0, warning: 1, blocked: 2 } as const;
 
 function normalized(result: ComplianceResult, segment: TranscriptSegment, product: Product, now: number): ComplianceResult {
-  return { ...result, id: result.id || `compliance-${now}`, segmentId: segment.id, productId: product.id, transcript: segment.text, createdAt: now };
+  const sourceId = result.id || 'compliance';
+  return { ...result, id: `${sourceId}:${segment.id}`, segmentId: segment.id, productId: product.id, transcript: segment.text, createdAt: now };
 }
 
 export class RealtimeReviewPipeline {
@@ -111,9 +112,11 @@ export class RealtimeReviewPipeline {
       const semanticCompletedAt = this.monotonicNow();
       const resolved = { ...normalized(remote.value.value, segment, product, this.now()), analysisMs: this.elapsed(processStartedAt, semanticCompletedAt) };
       this.logTiming(input, 'semantic_review', processStartedAt, semanticStartedAt ?? semanticCompletedAt, semanticCompletedAt, semanticQueuedAt, remote.timedOut || remote.value.expired, resolved.analysisTiming);
-      if (!this.options.isProductSegmentCurrent(token) || !this.options.isLatest(token)) return;
-      this.options.onCompliance(resolved, true);
+      if (!this.options.isProductSegmentCurrent(token)) return;
+      const latest = this.options.isLatest(token);
+      this.options.onCompliance(resolved, latest);
       if (RISK_SEVERITY[resolved.risk] <= RISK_SEVERITY[local.risk]) return;
+      if (!latest) return;
       semanticOverrideActive = true;
       const safeFallback = fallbackFor(resolved);
       if (!this.options.coach?.suggestMany) {

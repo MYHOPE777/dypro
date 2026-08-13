@@ -131,7 +131,7 @@ describe('LiveSession', () => {
     store.close();
   });
 
-  it('drops a delayed semantic result after a newer transcript arrives', async () => {
+  it('records a delayed semantic risk without replacing the newer transcript result', async () => {
     const pending: Array<(value: ComplianceResult) => void> = [];
     const analyzer: ReviewAnalyzer = { analyze: () => new Promise((resolve) => pending.push(resolve)) };
     const { store, session } = makeSession({ analyzer });
@@ -142,9 +142,42 @@ describe('LiveSession', () => {
     pending[0](result('serum', 'blocked'));
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(session.snapshot().alerts).toEqual([]);
-    expect(session.snapshot().stats.blockedCount).toBe(0);
+    expect(session.snapshot().alerts).toHaveLength(1);
+    expect(session.snapshot().stats.blockedCount).toBe(1);
+    expect(session.snapshot().latestCompliance?.risk).toBe('safe');
     pending[1](result('serum', 'safe'));
+    store.close();
+  });
+
+  it('records repeated identical violations as separate alert occurrences', async () => {
+    const pending: Array<(value: ComplianceResult) => void> = [];
+    const cachedResult: ComplianceResult = {
+      id: 'cached-doubao-result',
+      productId: DEFAULT_PRODUCT.id,
+      risk: 'blocked',
+      title: '医疗功效',
+      reason: '包含疾病治疗承诺',
+      alternative: '只介绍页面可核验的使用体验',
+      policyRef: '抖音带货直播',
+      confidence: 0.98,
+      source: 'doubao',
+      transcript: '人的发动机清一清，循环就顺了',
+      matchedTerms: ['发动机', '循环'],
+      ruleKind: 'context',
+      createdAt: 1,
+    };
+    const { store, session } = makeSession({ analyzer: { analyze: () => new Promise((resolve) => pending.push(resolve)) } });
+    await session.dispatch({ type: 'start' });
+
+    await session.dispatch({ type: 'demo_transcript', text: cachedResult.transcript });
+    await session.dispatch({ type: 'demo_transcript', text: cachedResult.transcript });
+    pending[0](cachedResult);
+    pending[1](cachedResult);
+    await vi.waitFor(() => expect(session.snapshot().alerts.filter((alert) => alert.risk === 'blocked')).toHaveLength(2));
+
+    const alerts = session.snapshot().alerts.filter((alert) => alert.risk === 'blocked');
+    expect(new Set(alerts.map((alert) => alert.segmentId)).size).toBe(2);
+    expect(new Set(alerts.map((alert) => alert.id)).size).toBe(2);
     store.close();
   });
 
