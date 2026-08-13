@@ -11,8 +11,9 @@
   -> 立即生成 safe / warning / blocked 和主播替代表达
   -> 按风险档位决定豆包语义复核
   -> 豆包结果与本地结果择高
-  -> 风险证据卡展示置信度、完整原话和命中片段
-  -> 中控确认后写入直播间本地规则，随后可提交服务运营审核
+  -> 当前风险卡即时提醒，同时将每次非安全结果追加到待处置风险
+  -> 中控确认成规则或标记误判，处置记录继续保留
+  -> 确认后的本地规则可提交服务运营审核
   -> 运营采纳后复制到公共规则库；待定/舍弃不影响本地规则
 ```
 
@@ -74,10 +75,15 @@ learned / pending_review
 
 ## 人工复核入口
 
+- `GET /api/v2/rooms/:roomId/compliance-findings`：按 `pending | confirmed | dismissed | all` 查看风险处置队列。
+- `POST /api/v2/sessions/:sessionId/compliance-findings/:segmentId/confirm`：使用服务端证据确认成当前直播间规则。
+- `POST /api/v2/sessions/:sessionId/compliance-findings/:segmentId/dismiss`：标记误判并保留处置依据。
 - `POST /api/v2/rules/:ruleId/review`：批准或驳回待审核规则。
 - `POST /api/v2/rules/:ruleId/rollback`：指定历史版本生成新的当前版本。
 - `GET /api/v2/rooms/:roomId/rules`：查看规则、状态和审计记录。
 
-规则治理和场次复核是两条独立流程：场次转录修改必须人工批准后上传；中控确认的规则只写入当前直播间并立即生效，之后通过 `public-submit` 进入服务运营队列。运营审核台可选择采纳、待定或舍弃，只有采纳才创建 `public-library` 公共规则；待定和舍弃不会删除或停用原直播间规则。规则证据同时保存完整原话、命中片段、置信度、证据次数和最后一次 finding ID，重复确认同一 finding 幂等。
+实时展示、风险处置、规则治理和场次复核是四条独立流程。当前风险卡只展示最新结果；每个非安全片段都写入 SQLite 待处置队列，新话术、刷新、断线、商品切换和下播不会移除旧待办。确认接口只接收 `sessionId + segmentId`，从服务端读取原始结果和风险发生时的商品快照；即使商品后来改名、切换或移出直播间，仍按当时品类生成规则。重复确认和重复误判幂等，已确认与已误判状态不能互相覆盖。
 
-公共审核入口：`GET /api/v2/operations/rules`、`POST /api/v2/rules/:ruleId/public-review`，仅 `reviewer` 身份可用；商家中控只使用 `POST /api/v2/rooms/:roomId/rules/confirm` 和 `POST /api/v2/rules/:ruleId/public-submit`。
+场次转录修改必须人工批准后上传；中控确认的规则只写入当前直播间并立即生效，之后通过 `public-submit` 进入服务运营队列。运营审核台可选择采纳、待定或舍弃，只有采纳才创建 `public-library` 公共规则；待定和舍弃不会删除或停用原直播间规则。规则证据同时保存完整原话、命中片段、置信度、证据次数和最后一次 finding ID。
+
+公共审核入口：`GET /api/v2/operations/rules`、`POST /api/v2/rules/:ruleId/public-review`，仅 `reviewer` 身份可用；商家中控使用 finding 确认接口和 `POST /api/v2/rules/:ruleId/public-submit`。旧的 `POST /api/v2/rooms/:roomId/rules/confirm` 保留兼容，但新页面不再提交客户端拼装的风险对象。

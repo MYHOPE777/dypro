@@ -1,4 +1,4 @@
-import type { ComplianceResult, ComplianceRule, CoachPurpose, PresenterPhrase, PresenterProfile, Product, RuleAuditEntry } from '../shared/types';
+import type { ComplianceFinding, ComplianceResult, ComplianceRule, CoachPurpose, PresenterPhrase, PresenterProfile, Product, RuleAuditEntry } from '../shared/types';
 import { authenticatedHeaders, clearAuthToken, V2_AUTH_REQUIRED_EVENT } from './authHeaders';
 
 export class CatalogClient {
@@ -19,6 +19,9 @@ export class CatalogClient {
   async removeProduct(roomId: string, productId: string): Promise<Product[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/products/${encodeURIComponent(productId)}`, { method: 'DELETE' }); }
   async createRule(roomId: string, input: { name: string; pattern: string; risk: 'warning' | 'blocked'; title: string; reason: string; alternative: string; policyRef: string; scope?: 'room' | 'category' | 'product'; productId?: string; category?: string }): Promise<ComplianceRule> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/rules`, { method: 'POST', body: JSON.stringify(input) }); }
   async confirmRule(roomId: string, result: ComplianceResult): Promise<ComplianceRule> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/rules/confirm`, { method: 'POST', body: JSON.stringify({ result }) }); }
+  async complianceFindings(roomId: string, disposition: 'pending' | 'confirmed' | 'dismissed' | 'all' = 'pending'): Promise<ComplianceFinding[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/compliance-findings?disposition=${disposition}`); }
+  async confirmComplianceFinding(finding: ComplianceFinding, note?: string): Promise<{ finding: ComplianceFinding; rule: ComplianceRule }> { return this.request(`/api/v2/sessions/${encodeURIComponent(finding.sessionId)}/compliance-findings/${encodeURIComponent(finding.segmentId)}/confirm`, { method: 'POST', body: JSON.stringify({ note: note ?? '' }) }); }
+  async dismissComplianceFinding(finding: ComplianceFinding, note = '中控标记为误判'): Promise<ComplianceFinding> { return this.request(`/api/v2/sessions/${encodeURIComponent(finding.sessionId)}/compliance-findings/${encodeURIComponent(finding.segmentId)}/dismiss`, { method: 'POST', body: JSON.stringify({ note }) }); }
   async setRuleEnabled(rule: ComplianceRule, enabled: boolean): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }); }
   async reviewRule(rule: ComplianceRule, decision: 'approved' | 'rejected'): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}/review`, { method: 'POST', body: JSON.stringify({ decision }) }); }
   async rollbackRule(rule: ComplianceRule, version: number): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}/rollback`, { method: 'POST', body: JSON.stringify({ version }) }); }

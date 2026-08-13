@@ -136,6 +136,59 @@ describe('v2 HTTP/WebSocket runtime', () => {
     expect(runtime.rules.active('room-rule-governance', PRODUCTS[0]).some((rule) => rule.id === learned!.id)).toBe(true);
   });
 
+  it('disposes persisted compliance findings after later product changes', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-compliance-findings-'));
+    const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });
+    const roomId = 'room-finding-disposition';
+    const sessionId = 'live-finding-disposition';
+    const session = runtime.getOrCreateSession({ sessionId, roomId });
+    const originalProduct = session.snapshot().product;
+    const risk = {
+      id: 'finding-risk-original', segmentId: 'segment-original', productId: originalProduct.id, risk: 'blocked' as const,
+      title: '医疗功效', reason: '包含治疗承诺', alternative: '只描述日常使用体验', policyRef: '广告合规', confidence: 0.98,
+      source: 'doubao' as const, transcript: '这个可以治疗耳聋', matchedTerms: ['治疗耳聋'], ruleKind: 'term' as const, createdAt: 2,
+    };
+    runtime.store.appendSessionEvent(sessionId, { type: 'compliance.updated', occurredAt: 2, payload: { result: JSON.stringify(risk), segmentId: risk.segmentId, latest: true } });
+    expect(runtime.store.getComplianceFinding(sessionId, risk.segmentId!)?.product).toEqual(originalProduct);
+
+    await runtime.removeProduct(roomId, originalProduct.id);
+    expect(runtime.listProducts(roomId).some((product) => product.id === originalProduct.id)).toBe(false);
+    expect(runtime.snapshot(sessionId)?.lineup.some((product) => product.id === originalProduct.id)).toBe(false);
+
+    const secondProduct = runtime.snapshot(sessionId)!.product;
+    const dismissedRisk = { ...risk, id: 'finding-risk-dismissed', segmentId: 'segment-dismissed', productId: secondProduct.id, transcript: '这句模型判断需要人工复核', matchedTerms: ['人工复核'], createdAt: 3 };
+    runtime.store.appendSessionEvent(sessionId, { type: 'compliance.updated', occurredAt: 3, payload: { result: JSON.stringify(dismissedRisk), segmentId: dismissedRisk.segmentId, latest: true } });
+
+    const http = createV2Http(runtime, { clientDir: join(directory, 'missing-client') });
+    await new Promise<void>((resolve) => http.server.listen(0, '127.0.0.1', resolve));
+    const port = (http.server.address() as AddressInfo).port;
+    const base = `http://127.0.0.1:${port}/api/v2/sessions/${sessionId}/compliance-findings`;
+    cleanups.push(async () => { await new Promise<void>((resolve) => http.server.close(() => resolve())); await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+
+    const confirm = () => fetch(`${base}/${risk.segmentId}/confirm`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const confirmedResponse = await confirm();
+    const confirmed = await confirmedResponse.json() as { finding: { disposition: string; ruleId?: string }; rule: { id: string; productId?: string; category?: string } };
+    expect(confirmedResponse.status).toBe(201);
+    expect(confirmed.finding).toMatchObject({ disposition: 'confirmed', ruleId: confirmed.rule.id });
+    expect(confirmed.rule).toMatchObject({ productId: originalProduct.id, category: originalProduct.category });
+
+    const repeated = await confirm();
+    expect(repeated.status).toBe(200);
+    expect((await repeated.json() as { rule: { id: string } }).rule.id).toBe(confirmed.rule.id);
+    expect((await fetch(`${base}/${risk.segmentId}/dismiss`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status).toBe(409);
+
+    const dismiss = () => fetch(`${base}/${dismissedRisk.segmentId}/dismiss`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: '人工确认属于误判' }) });
+    const dismissedResponse = await dismiss();
+    expect(dismissedResponse.status).toBe(200);
+    expect(await dismissedResponse.json()).toMatchObject({ disposition: 'dismissed', resolutionNote: '人工确认属于误判' });
+    expect((await dismiss()).status).toBe(200);
+    expect((await fetch(`${base}/${dismissedRisk.segmentId}/confirm`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status).toBe(409);
+
+    const pending = await fetch(`http://127.0.0.1:${port}/api/v2/rooms/${roomId}/compliance-findings?disposition=pending`);
+    expect(pending.status).toBe(200);
+    expect(await pending.json()).toEqual([]);
+  });
+
   it('keeps product details isolated per live room through the public API', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'dypro-room-products-'));
     const runtime = createRuntime({ rootDir: directory, env: { V2_DB_PATH: join(directory, 'app.sqlite'), V2_AUDIO_DIR: join(directory, 'audio') } });

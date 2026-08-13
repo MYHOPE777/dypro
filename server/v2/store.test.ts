@@ -164,4 +164,21 @@ describe('SqliteFactStore', () => {
     expect(review.approval).toBe('approved');
     expect(review.delivery).toBe('queued');
   });
+
+  it('keeps unresolved compliance findings after newer results and records their disposition', () => {
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    stores.push(store);
+    store.createSession({ sessionId: 'session-risk-inbox', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '测试主播', product: DEFAULT_PRODUCT, lineup: [DEFAULT_PRODUCT], createdAt: 1 });
+    const blocked = { id: 'finding-old', segmentId: 'segment-old', productId: DEFAULT_PRODUCT.id, risk: 'blocked' as const, title: '医疗功效', reason: '包含治疗承诺', alternative: '只描述实际体验', policyRef: '广告合规', confidence: 0.98, source: 'doubao' as const, transcript: '这个可以治疗耳聋', matchedTerms: ['治疗耳聋'], ruleKind: 'term' as const, createdAt: 2 };
+    store.appendSessionEvent('session-risk-inbox', { type: 'compliance.updated', occurredAt: 2, payload: { result: JSON.stringify(blocked), product: JSON.stringify(DEFAULT_PRODUCT), segmentId: blocked.segmentId, latest: true } });
+    store.appendSessionEvent('session-risk-inbox', { type: 'compliance.updated', occurredAt: 3, payload: { result: JSON.stringify({ ...blocked, id: 'finding-new-safe', segmentId: 'segment-new', risk: 'safe', title: '当前安全', transcript: '正常介绍商品', matchedTerms: [] }), segmentId: 'segment-new', latest: true } });
+
+    expect(store.listComplianceFindings('room-default', 'pending')).toContainEqual(expect.objectContaining({ sessionId: 'session-risk-inbox', segmentId: 'segment-old', productId: DEFAULT_PRODUCT.id, product: DEFAULT_PRODUCT, disposition: 'pending', result: expect.objectContaining({ transcript: blocked.transcript }) }));
+    const resolved = store.resolveComplianceFinding('session-risk-inbox', 'segment-old', 'dismissed', 'operator-1', undefined, '确认属于误判', 4);
+    expect(resolved).toMatchObject({ disposition: 'dismissed', disposedBy: 'operator-1', resolutionNote: '确认属于误判' });
+    store.appendSessionEvent('session-risk-inbox', { type: 'compliance.updated', occurredAt: 5, payload: { result: JSON.stringify({ ...blocked, reason: '模型补充证据' }), segmentId: blocked.segmentId, latest: false } });
+    store.rebuildSessionProjections('session-risk-inbox');
+    expect(store.getComplianceFinding('session-risk-inbox', 'segment-old')).toMatchObject({ disposition: 'dismissed', resolutionNote: '确认属于误判', result: expect.objectContaining({ reason: '模型补充证据' }) });
+    expect(store.listComplianceFindings('room-default', 'pending')).toEqual([]);
+  });
 });

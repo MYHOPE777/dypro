@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import type { ComplianceResult, ComplianceRule, CoachSuggestion, LiveRoom, PresenterPhrase, PresenterProfile, Product, RiskProfile, RuleAuditEntry, SessionStats, SpeechCorrectionEntry, TranscriptSegment } from '../../src/shared/types';
+import type { ComplianceFinding, ComplianceFindingDisposition, ComplianceResult, ComplianceRule, CoachSuggestion, LiveRoom, PresenterPhrase, PresenterProfile, Product, RiskProfile, RuleAuditEntry, SessionStats, SpeechCorrectionEntry, TranscriptSegment } from '../../src/shared/types';
 import type { DeliveryJob, DeliveryStatus, LiveEvent, LiveEventType, LiveSessionSnapshot, LiveLifecycle, ResourceDeliveryJob, ResourceDeliveryType, ReviewApproval, ReviewTranscript, SessionReview, SessionSummary } from '../../src/shared/v2';
 
 export type SessionCreation = {
@@ -153,6 +153,25 @@ CREATE TABLE IF NOT EXISTS compliance_projections (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (session_id, segment_id)
 );
+CREATE TABLE IF NOT EXISTS compliance_findings (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  room_id TEXT NOT NULL,
+  segment_id TEXT NOT NULL,
+  product_id TEXT NOT NULL,
+  product_name TEXT NOT NULL,
+  product_json TEXT,
+  result_json TEXT NOT NULL,
+  disposition TEXT NOT NULL DEFAULT 'pending',
+  rule_id TEXT,
+  disposed_by TEXT,
+  disposed_at INTEGER,
+  resolution_note TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(session_id, segment_id)
+);
+CREATE INDEX IF NOT EXISTS compliance_findings_room_status ON compliance_findings(room_id, disposition, updated_at DESC);
 CREATE TABLE IF NOT EXISTS coach_projections (
   session_id TEXT NOT NULL,
   segment_id TEXT NOT NULL,
@@ -274,6 +293,8 @@ export class SqliteFactStore {
     const roomProductColumns = this.db.prepare('PRAGMA table_info(room_products)').all().map((row) => stringValue(row.name));
     if (!roomProductColumns.includes('product_json')) this.db.exec('ALTER TABLE room_products ADD COLUMN product_json TEXT');
     this.db.exec('UPDATE room_products SET product_json = (SELECT products.product_json FROM products WHERE products.id = room_products.product_id) WHERE product_json IS NULL');
+    const findingColumns = this.db.prepare('PRAGMA table_info(compliance_findings)').all().map((row) => stringValue(row.name));
+    if (!findingColumns.includes('product_json')) this.db.exec('ALTER TABLE compliance_findings ADD COLUMN product_json TEXT');
     this.getSessionStatement = this.db.prepare('SELECT * FROM live_sessions WHERE id = ?');
   }
 
@@ -411,6 +432,27 @@ export class SqliteFactStore {
 
   listRuleAudits(roomId: string): RuleAuditEntry[] {
     return this.db.prepare('SELECT a.* FROM rule_audits a JOIN compliance_rules r ON r.id = a.rule_id WHERE r.room_id = ? ORDER BY a.occurred_at DESC').all(roomId).map((row) => ({ id: stringValue(row.id), ruleId: stringValue(row.rule_id), roomId, action: stringValue(row.action) as RuleAuditEntry['action'], actorId: stringValue(row.actor_id), occurredAt: numberValue(row.occurred_at), details: parseJson<Record<string, unknown>>(row.details_json, {}) }));
+  }
+
+  listComplianceFindings(roomId: string, disposition?: ComplianceFindingDisposition | 'all'): ComplianceFinding[] {
+    const rows = !disposition || disposition === 'all'
+      ? this.db.prepare('SELECT * FROM compliance_findings WHERE room_id = ? ORDER BY updated_at DESC').all(roomId)
+      : this.db.prepare('SELECT * FROM compliance_findings WHERE room_id = ? AND disposition = ? ORDER BY updated_at DESC').all(roomId, disposition);
+    return rows.map((row) => this.complianceFindingFromRow(row));
+  }
+
+  getComplianceFinding(sessionId: string, segmentId: string): ComplianceFinding | null {
+    const row = this.db.prepare('SELECT * FROM compliance_findings WHERE session_id = ? AND segment_id = ?').get(sessionId, segmentId);
+    return row ? this.complianceFindingFromRow(row) : null;
+  }
+
+  resolveComplianceFinding(sessionId: string, segmentId: string, disposition: Exclude<ComplianceFindingDisposition, 'pending'>, actorId: string, ruleId?: string, note?: string, now = Date.now()): ComplianceFinding {
+    const existing = this.getComplianceFinding(sessionId, segmentId);
+    if (!existing) throw new Error('待处置风险不存在');
+    if (existing.disposition === disposition && (!ruleId || existing.ruleId === ruleId)) return existing;
+    if (existing.disposition !== 'pending') throw new Error('该风险已完成处置');
+    this.db.prepare('UPDATE compliance_findings SET disposition = ?, rule_id = ?, disposed_by = ?, disposed_at = ?, resolution_note = ?, updated_at = ? WHERE session_id = ? AND segment_id = ?').run(disposition, ruleId ?? null, actorId, now, note?.trim() || null, now, sessionId, segmentId);
+    return this.getComplianceFinding(sessionId, segmentId)!;
   }
 
   registerAudioAsset(input: { sessionId: string; id?: string; path: string; encoding?: string; sampleRate?: number; channels?: number; byteLength: number; durationMs: number; now?: number }): void {
@@ -936,7 +978,24 @@ export class SqliteFactStore {
     }
     if (event.type === 'compliance.updated') {
       const result = parseJson<ComplianceResult | null>(event.payload.result, null);
-      if (result?.segmentId) this.db.prepare('INSERT INTO compliance_projections (session_id, segment_id, result_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id, segment_id) DO UPDATE SET result_json=excluded.result_json, updated_at=excluded.updated_at').run(sessionId, result.segmentId, json(result), event.occurredAt);
+      if (result?.segmentId) {
+        this.db.prepare('INSERT INTO compliance_projections (session_id, segment_id, result_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id, segment_id) DO UPDATE SET result_json=excluded.result_json, updated_at=excluded.updated_at').run(sessionId, result.segmentId, json(result), event.occurredAt);
+        if (result.risk !== 'safe') {
+          const session = this.getSessionStatement.get(sessionId);
+          const lineup = parseJson<Product[]>(session?.lineup_json, []);
+          const active = parseJson<Product | null>(session?.product_json, null);
+          const eventProduct = parseJson<Product | null>(event.payload.product, null);
+          const product = (eventProduct?.id === result.productId ? eventProduct : null) ?? lineup.find((candidate) => candidate.id === result.productId) ?? (active?.id === result.productId ? active : null);
+          this.db.prepare(`
+            INSERT INTO compliance_findings (id, session_id, room_id, segment_id, product_id, product_name, product_json, result_json, disposition, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            ON CONFLICT(session_id, segment_id) DO UPDATE SET
+              product_json = COALESCE(compliance_findings.product_json, excluded.product_json),
+              result_json = excluded.result_json,
+              updated_at = excluded.updated_at
+          `).run(`finding-${sessionId}-${result.segmentId}`, sessionId, stringValue(session?.room_id), result.segmentId, result.productId, product?.name ?? result.productId, product ? json(product) : null, json(result), event.occurredAt, event.occurredAt);
+        }
+      }
     }
     if (event.type === 'coach.updated') {
       const segmentId = stringValue(event.payload.segmentId, 'latest');
@@ -952,6 +1011,16 @@ export class SqliteFactStore {
       transcriptHistory: parseJson<TranscriptSegment[]>(row.transcript_json, []), latestCompliance: parseJson<ComplianceResult | null>(row.latest_compliance_json, null), alerts: parseJson<ComplianceResult[]>(row.alerts_json, []),
       coachSuggestions: parseJson<CoachSuggestion[]>(row.coach_json, []), coachPending: boolValue(row.coach_pending), riskProfile: stringValue(row.risk_profile, 'balanced') as RiskProfile,
       stats: parseJson<SessionStats>(row.stats_json, emptyStats()), contentRevision: numberValue(row.content_revision), latestSequence: numberValue(row.latest_sequence), createdAt: numberValue(row.created_at), updatedAt: numberValue(row.updated_at),
+    };
+  }
+
+  private complianceFindingFromRow(row: SqlRow): ComplianceFinding {
+    return {
+      id: stringValue(row.id), sessionId: stringValue(row.session_id), roomId: stringValue(row.room_id), segmentId: stringValue(row.segment_id), productId: stringValue(row.product_id), productName: stringValue(row.product_name),
+      ...(row.product_json ? { product: parseJson<Product>(row.product_json, {} as Product) } : {}),
+      result: parseJson<ComplianceResult>(row.result_json, {} as ComplianceResult), disposition: stringValue(row.disposition, 'pending') as ComplianceFindingDisposition,
+      ...(row.rule_id ? { ruleId: stringValue(row.rule_id) } : {}), ...(row.disposed_by ? { disposedBy: stringValue(row.disposed_by) } : {}), ...(row.disposed_at ? { disposedAt: numberValue(row.disposed_at) } : {}), ...(row.resolution_note ? { resolutionNote: stringValue(row.resolution_note) } : {}),
+      createdAt: numberValue(row.created_at), updatedAt: numberValue(row.updated_at),
     };
   }
 

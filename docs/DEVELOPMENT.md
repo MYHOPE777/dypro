@@ -12,6 +12,7 @@
 | `server/v2/capture.ts` | 麦克风音频、ASR 连接、恢复、暂停和结束。 |
 | `server/v2/http.ts` | `/api/v2`、`/ws/v2`、权限、收音租约和连接关闭。 |
 | `server/v2/store.ts` | SQLite 事务、追加事件和本地投影。 |
+| `server/v2/rules.ts` | 待处置风险确认后的本地规则、版本、审计和公共规则提交。 |
 | `server/providers/productComplianceProfiler.ts` | 商品行业、标准类目和抖音直播合规画像生成及离线兜底。 |
 | `src/App.tsx` | 操作台、主播屏、资料管理和历史复核视图。 |
 | `src/clients/` | 带类型的 HTTP/WebSocket 客户端。 |
@@ -77,6 +78,8 @@ git push origin <当前分支> --follow-tags
 Git 提交保持单一目的，提交信息使用 `fix:`、`feat:`、`docs:`、`refactor:` 或 `release:` 前缀。禁止将密钥、`.env`、`.data-v2`、音频或运行日志提交到仓库。
 
 服务端关键错误使用结构化单行日志，必须包含 `sessionId`、事件类型和错误信息。实时耗时继续使用 `[realtime-review]`，事件订阅异常使用 `[live-session-listener]`。日志不得包含 API Key、Access Token 或原始鉴权头。
+
+风险处置回归至少覆盖：后续安全结果不清除旧待办、重复违规独立保留、确认和误判幂等、已处置状态不被晚到模型结果重开，以及商品切换或移除后仍按风险发生时商品快照确认规则。
 
 ## 5. 本地数据备份
 

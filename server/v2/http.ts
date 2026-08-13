@@ -211,7 +211,42 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
       const product = runtime.listProducts(roomId).find((candidate) => candidate.id === productId);
       if (!product) return response.status(400).json({ message: '商品不属于当前直播间' });
       return response.status(201).json(runtime.rules.confirmFinding(roomId, actorId(request), result, product));
+    } catch (error) { return jsonError(response, error); }
+  });
+  app.get('/api/v2/rooms/:roomId/compliance-findings', (request, response) => {
+    try {
+      const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'view');
+      const disposition = request.query.disposition === 'confirmed' || request.query.disposition === 'dismissed' || request.query.disposition === 'all' ? request.query.disposition : 'pending';
+      return response.json(runtime.store.listComplianceFindings(roomId, disposition));
     } catch (error) { return jsonError(response, error, 403); }
+  });
+  app.post('/api/v2/sessions/:sessionId/compliance-findings/:segmentId/confirm', (request, response) => {
+    try {
+      const sessionId = routeParam(request, 'sessionId'); const segmentId = routeParam(request, 'segmentId');
+      const finding = runtime.store.getComplianceFinding(sessionId, segmentId); if (!finding) return response.status(404).json({ message: '待处置风险不存在' });
+      runtime.authorization.assert(identity(request), finding.roomId, 'control');
+      if (finding.disposition === 'confirmed' && finding.ruleId) return response.json({ finding, rule: runtime.store.getRule(finding.ruleId) });
+      if (finding.disposition !== 'pending') return response.status(409).json({ message: '该风险已完成处置' });
+      const snapshot = runtime.snapshot(sessionId);
+      const product = (finding.product?.id === finding.productId ? finding.product : undefined)
+        ?? runtime.listProducts(finding.roomId).find((candidate) => candidate.id === finding.productId)
+        ?? snapshot?.lineup.find((candidate) => candidate.id === finding.productId)
+        ?? (snapshot?.product.id === finding.productId ? snapshot.product : undefined);
+      if (!product) return response.status(409).json({ message: '无法找到风险发生时的商品资料，请先恢复该商品后再确认' });
+      const rule = runtime.rules.confirmFinding(finding.roomId, actorId(request), finding.result, product);
+      const resolved = runtime.store.resolveComplianceFinding(sessionId, segmentId, 'confirmed', actorId(request), rule.id, typeof request.body?.note === 'string' ? request.body.note : undefined);
+      return response.status(201).json({ finding: resolved, rule });
+    } catch (error) { return jsonError(response, error); }
+  });
+  app.post('/api/v2/sessions/:sessionId/compliance-findings/:segmentId/dismiss', (request, response) => {
+    try {
+      const sessionId = routeParam(request, 'sessionId'); const segmentId = routeParam(request, 'segmentId');
+      const finding = runtime.store.getComplianceFinding(sessionId, segmentId); if (!finding) return response.status(404).json({ message: '待处置风险不存在' });
+      runtime.authorization.assert(identity(request), finding.roomId, 'control');
+      if (finding.disposition === 'dismissed') return response.json(finding);
+      if (finding.disposition !== 'pending') return response.status(409).json({ message: '该风险已完成处置' });
+      return response.json(runtime.store.resolveComplianceFinding(sessionId, segmentId, 'dismissed', actorId(request), undefined, typeof request.body?.note === 'string' ? request.body.note : undefined));
+    } catch (error) { return jsonError(response, error); }
   });
   app.patch('/api/v2/rules/:ruleId', (request, response) => {
     try {

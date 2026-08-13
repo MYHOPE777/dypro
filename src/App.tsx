@@ -37,7 +37,7 @@ import { DisplayLinkClient, type DisplayLink } from './clients/displayLinkClient
 import { AuthClient } from './clients/authClient';
 import { V2_AUTH_REQUIRED_EVENT } from './clients/authHeaders';
 import { DEFAULT_PRODUCT, PRODUCTS } from './shared/products';
-import type { ComplianceResult, ComplianceRule, CoachPurpose, PresenterPhrase, PresenterProfile, Product, TranscriptSegment } from './shared/types';
+import type { ComplianceFinding, ComplianceResult, ComplianceRule, CoachPurpose, PresenterPhrase, PresenterProfile, Product, TranscriptSegment } from './shared/types';
 import type { LiveCommand, LiveSessionSnapshot, SessionReview, SessionSummary } from './shared/v2';
 import type { AudioTrack } from './shared/v2Audio';
 
@@ -271,14 +271,15 @@ function CoachBoard({ snapshot, display = false }: { snapshot: LiveSessionSnapsh
   </section>;
 }
 
-function RiskPanel({ snapshot, display = false, onConfirmRule }: { snapshot: LiveSessionSnapshot; display?: boolean; onConfirmRule?: (result: ComplianceResult) => Promise<void> }) {
+function RiskPanel({ snapshot, display = false, findings = [], onConfirmFinding, onDismissFinding, onOpenInbox }: { snapshot: LiveSessionSnapshot; display?: boolean; findings?: ComplianceFinding[]; onConfirmFinding?: (finding: ComplianceFinding) => Promise<void>; onDismissFinding?: (finding: ComplianceFinding) => Promise<void>; onOpenInbox?: () => void }) {
   const result = snapshot.latestCompliance;
   const risk = result?.risk ?? 'safe';
   const [confirmation, setConfirmation] = useState<{ resultId: string; message: string }>({ resultId: '', message: '' });
-  const confirm = async () => {
-    if (!result || !onConfirmRule) return;
-    setConfirmation({ resultId: result.id, message: '正在保存' });
-    try { await onConfirmRule(result); setConfirmation({ resultId: result.id, message: '已保存到本地规则库' }); } catch (error) { setConfirmation({ resultId: result.id, message: error instanceof Error ? error.message : String(error) }); }
+  const handle = async (finding: ComplianceFinding, action: 'confirm' | 'dismiss') => {
+    const task = action === 'confirm' ? onConfirmFinding : onDismissFinding;
+    if (!task) return;
+    setConfirmation({ resultId: finding.id, message: action === 'confirm' ? '正在生成本地规则' : '正在标记误判' });
+    try { await task(finding); setConfirmation({ resultId: finding.id, message: action === 'confirm' ? '已保存到本地规则库' : '已标记误判' }); } catch (error) { setConfirmation({ resultId: finding.id, message: error instanceof Error ? error.message : String(error) }); }
   };
   const terms = result?.matchedTerms?.filter((term) => term.trim()) ?? [];
   return <section className={`v2-risk-panel ${risk} ${display ? 'display' : ''}`}>
@@ -287,8 +288,7 @@ function RiskPanel({ snapshot, display = false, onConfirmRule }: { snapshot: Liv
     <p>{result?.reason ?? '本地规则会持续检查主播表达，模型判断完成后会在这里更新。'}</p>
     {result && risk !== 'safe' && <div className="v2-risk-evidence"><span>具体违规原话</span><blockquote>{riskEvidence(result.transcript, terms)}</blockquote>{terms.length > 0 && <small>命中片段：{terms.join('、')}</small>}</div>}
     {result && risk !== 'safe' && <div className="v2-risk-advice"><span>建议替换</span><strong>{result.alternative.replace(/^可以改为：/u, '')}</strong></div>}
-    {!display && result && risk !== 'safe' && onConfirmRule && <div className="v2-risk-confirm"><button type="button" disabled={confirmation.resultId === result.id && confirmation.message === '正在保存'} onClick={() => void confirm()}><CheckCircle2 size={13} />确认并加入本地规则</button>{confirmation.resultId === result.id && confirmation.message && <small>{confirmation.message}</small>}</div>}
-    {!display && <div className="v2-alert-log"><span>近期提醒</span>{snapshot.alerts.slice(0, 4).map((alert) => <div key={alert.id}><i className={alert.risk} /><p>{alert.title}</p><time>{formatTime(alert.createdAt)}</time></div>)}</div>}
+    {!display && <div className="v2-risk-inbox"><header><span>待处置风险</span><strong>待处置 {findings.length}</strong></header>{findings.slice(0, 4).map((finding) => <article key={finding.id}><div><i className={finding.result.risk} /><strong>{finding.result.title}</strong><time>{formatTime(finding.createdAt)}</time></div><p>{finding.result.transcript}</p><small>{finding.productName} · 置信度 {Math.round(finding.result.confidence * 100)}%</small><footer><button type="button" disabled={confirmation.resultId === finding.id && confirmation.message.startsWith('正在')} onClick={() => void handle(finding, 'confirm')}><CheckCircle2 size={12} />确认成规则</button><button type="button" disabled={confirmation.resultId === finding.id && confirmation.message.startsWith('正在')} onClick={() => void handle(finding, 'dismiss')}>标记误判</button></footer>{confirmation.resultId === finding.id && confirmation.message && <em>{confirmation.message}</em>}</article>)}{confirmation.message && !findings.some((finding) => finding.id === confirmation.resultId) && <p className="v2-risk-inbox-result">{confirmation.message}</p>}{findings.length === 0 && <p className="v2-risk-inbox-empty">当前没有等待处理的风险</p>}{onOpenInbox && <button type="button" className="v2-risk-inbox-open" onClick={onOpenInbox}>打开风险规则控制台</button>}</div>}
   </section>;
 }
 
@@ -489,13 +489,14 @@ function ProductCatalogEditor({ roomId, activeProductId, products, onSaved }: { 
   </div>;
 }
 
-function LibraryWorkspace({ snapshot, products, send, onClose }: { snapshot: LiveSessionSnapshot; products: Product[]; send: (command: LiveCommand) => boolean; onClose: () => void }) {
+function LibraryWorkspace({ snapshot, products, send, onClose, initialTab = 'phrases', findings = [], onConfirmFinding, onDismissFinding }: { snapshot: LiveSessionSnapshot; products: Product[]; send: (command: LiveCommand) => boolean; onClose: () => void; initialTab?: 'products' | 'rules' | 'phrases'; findings?: ComplianceFinding[]; onConfirmFinding?: (finding: ComplianceFinding) => Promise<void>; onDismissFinding?: (finding: ComplianceFinding) => Promise<void> }) {
   const client = useMemo(() => new CatalogClient(), []);
-  const [tab, setTab] = useState<'products' | 'rules' | 'phrases'>('phrases');
+  const [tab, setTab] = useState<'products' | 'rules' | 'phrases'>(initialTab);
   const [rules, setRules] = useState<ComplianceRule[]>([]);
   const [presenters, setPresenters] = useState<PresenterProfile[]>([]);
   const [presenterId, setPresenterId] = useState(snapshot.presenterId);
   const [phrases, setPhrases] = useState<PresenterPhrase[]>([]);
+  const [findingHistory, setFindingHistory] = useState<ComplianceFinding[]>([]);
   const [ruleDraft, setRuleDraft] = useState<{ pattern: string; title: string; alternative: string; scope: 'room' | 'category' | 'product' }>({ pattern: '', title: '', alternative: '', scope: 'product' });
   const [phraseDraft, setPhraseDraft] = useState('');
   const [purpose, setPurpose] = useState<CoachPurpose>('塑品');
@@ -505,8 +506,13 @@ function LibraryWorkspace({ snapshot, products, send, onClose }: { snapshot: Liv
 
   const load = useCallback(async () => {
     try {
-      const [ruleData, presenterData] = await Promise.all([client.rules(snapshot.roomId), client.presenters(snapshot.roomId)]);
+      const [ruleData, presenterData, findingData] = await Promise.all([
+        client.rules(snapshot.roomId),
+        client.presenters(snapshot.roomId),
+        client.complianceFindings(snapshot.roomId, 'all').catch(() => []),
+      ]);
       setRules(ruleData.rules); setPresenters(presenterData);
+      setFindingHistory(Array.isArray(findingData) ? findingData.filter((finding) => finding.disposition !== 'pending') : []);
       const selected = presenterData.some((presenter) => presenter.id === presenterId) ? presenterId : presenterData[0]?.id ?? '';
       setPresenterId(selected);
       setPhrases(selected ? await client.phrases(selected) : []);
@@ -525,7 +531,7 @@ function LibraryWorkspace({ snapshot, products, send, onClose }: { snapshot: Liv
     <main>{tab === 'products' && <ProductCatalogEditor roomId={snapshot.roomId} activeProductId={snapshot.product.id} products={products} onSaved={(product, isNew) => {
       if (isNew) send({ type: 'set_lineup', productIds: [...new Set([...snapshot.lineup.map((candidate) => candidate.id), product.id])] });
     }} />}
-      {tab === 'rules' && <div className="v2-library-columns"><section><header><span>新增风险规则</span></header><select aria-label="规则作用域" value={ruleDraft.scope} onChange={(event) => setRuleDraft({ ...ruleDraft, scope: event.target.value as typeof ruleDraft.scope })}><option value="product">当前商品</option><option value="category">当前品类（{snapshot.product.category}）</option><option value="room">当前直播间全部商品</option></select><input value={ruleDraft.pattern} onChange={(event) => setRuleDraft({ ...ruleDraft, pattern: event.target.value })} placeholder="风险词或明确短语" /><input value={ruleDraft.title} onChange={(event) => setRuleDraft({ ...ruleDraft, title: event.target.value })} placeholder="提醒标题" /><textarea value={ruleDraft.alternative} onChange={(event) => setRuleDraft({ ...ruleDraft, alternative: event.target.value })} placeholder="主播可直接替换的安全表达" /><button type="button" disabled={busy || !ruleDraft.pattern || !ruleDraft.title || !ruleDraft.alternative} onClick={addRule}><Plus size={13} />保存规则</button></section><section className="v2-library-list">{rules.map((rule) => { const scopeText = rule.scope === 'product' ? `商品 · ${rule.productId === snapshot.product.id ? '当前商品' : rule.productId ?? '未绑定'}` : rule.scope === 'category' ? `品类 · ${rule.category ?? '未绑定'}` : '直播间通用'; return <article key={rule.id}><div><span className={rule.risk}>{rule.risk === 'blocked' ? '高风险' : '提醒'}</span><strong>{rule.name}</strong></div><p>{rule.pattern}</p><small>{scopeText} · {rule.origin === 'learned' ? `自动发现 · 证据 ${rule.evidenceCount ?? 1} 次` : rule.origin === 'confirmed' ? '主播确认' : '人工规则'} · v{rule.version} · {rule.status === 'pending_review' ? '待审核' : rule.status === 'rejected' ? '已驳回' : rule.enabled ? '已启用' : '已停用'} · 公共库：{rule.publicStatus === 'pending' ? '运营审核中' : rule.publicStatus === 'adopted' ? '已采纳' : rule.publicStatus === 'deferred' ? '待定' : rule.publicStatus === 'discarded' ? '已舍弃' : '未提交'}</small><div className="v2-rule-actions">{rule.status === 'pending_review' ? <><button type="button" disabled={busy} onClick={() => void run(() => client.reviewRule(rule, 'approved'))}>批准启用</button><button type="button" disabled={busy} onClick={() => void run(() => client.reviewRule(rule, 'rejected'))}>驳回</button></> : rule.status === 'rejected' ? <button type="button" disabled={busy} onClick={() => void run(() => client.reviewRule(rule, 'approved'))}>重新批准</button> : <><button type="button" disabled={busy} onClick={() => void run(() => client.setRuleEnabled(rule, !rule.enabled))}>{rule.enabled ? '停用' : '启用'}</button>{rule.publicStatus !== 'pending' && rule.publicStatus !== 'adopted' && <button type="button" disabled={busy} onClick={() => void run(() => client.submitRuleToPublic(rule))}>提交运营审核</button>}</>}{rule.version > 1 && <button type="button" disabled={busy} onClick={() => void run(() => client.rollbackRule(rule, rule.version - 1))}>回滚上一版</button>}</div></article>; })}</section></div>}
+      {tab === 'rules' && <div className="v2-rule-console"><section className="v2-finding-console"><header><span>待处置风险</span><strong>{findings.length} 条</strong></header>{findings.length === 0 ? <div className="v2-empty">当前没有等待处理的风险</div> : findings.map((finding) => <article key={finding.id}><header><div><span className={finding.result.risk}>{finding.result.risk === 'blocked' ? '高风险' : '提醒'}</span><strong>{finding.result.title}</strong></div><time>{formatTime(finding.createdAt)}</time></header><blockquote>{riskEvidence(finding.result.transcript, finding.result.matchedTerms ?? [])}</blockquote><p>{finding.result.reason}</p><small>{finding.productName} · 置信度 {Math.round(finding.result.confidence * 100)}% · {finding.result.ruleKind === 'term' ? '词级' : finding.result.ruleKind === 'sentence' ? '句级' : '上下文'}</small><div className="v2-rule-actions"><button type="button" disabled={busy} onClick={() => void run(() => onConfirmFinding?.(finding) ?? Promise.resolve())}><CheckCircle2 size={12} />确认成规则</button><button type="button" disabled={busy} onClick={() => void run(() => onDismissFinding?.(finding) ?? Promise.resolve())}>标记误判</button></div></article>)}</section><div className="v2-library-columns"><section><header><span>新增风险规则</span></header><select aria-label="规则作用域" value={ruleDraft.scope} onChange={(event) => setRuleDraft({ ...ruleDraft, scope: event.target.value as typeof ruleDraft.scope })}><option value="product">当前商品</option><option value="category">当前品类（{snapshot.product.category}）</option><option value="room">当前直播间全部商品</option></select><input value={ruleDraft.pattern} onChange={(event) => setRuleDraft({ ...ruleDraft, pattern: event.target.value })} placeholder="风险词或明确短语" /><input value={ruleDraft.title} onChange={(event) => setRuleDraft({ ...ruleDraft, title: event.target.value })} placeholder="提醒标题" /><textarea value={ruleDraft.alternative} onChange={(event) => setRuleDraft({ ...ruleDraft, alternative: event.target.value })} placeholder="主播可直接替换的安全表达" /><button type="button" disabled={busy || !ruleDraft.pattern || !ruleDraft.title || !ruleDraft.alternative} onClick={addRule}><Plus size={13} />保存规则</button></section><section className="v2-library-list">{rules.map((rule) => { const scopeText = rule.scope === 'product' ? `商品 · ${rule.productId === snapshot.product.id ? '当前商品' : rule.productId ?? '未绑定'}` : rule.scope === 'category' ? `品类 · ${rule.category ?? '未绑定'}` : '直播间通用'; return <article key={rule.id}><div><span className={rule.risk}>{rule.risk === 'blocked' ? '高风险' : '提醒'}</span><strong>{rule.name}</strong></div><p>{rule.pattern}</p><small>{scopeText} · {rule.origin === 'learned' ? `自动发现 · 证据 ${rule.evidenceCount ?? 1} 次` : rule.origin === 'confirmed' ? '主播确认' : '人工规则'} · v{rule.version} · {rule.status === 'pending_review' ? '待审核' : rule.status === 'rejected' ? '已驳回' : rule.enabled ? '已启用' : '已停用'} · 公共库：{rule.publicStatus === 'pending' ? '运营审核中' : rule.publicStatus === 'adopted' ? '已采纳' : rule.publicStatus === 'deferred' ? '待定' : rule.publicStatus === 'discarded' ? '已舍弃' : '未提交'}</small><div className="v2-rule-actions">{rule.status === 'pending_review' ? <><button type="button" disabled={busy} onClick={() => void run(() => client.reviewRule(rule, 'approved'))}>批准启用</button><button type="button" disabled={busy} onClick={() => void run(() => client.reviewRule(rule, 'rejected'))}>驳回</button></> : rule.status === 'rejected' ? <button type="button" disabled={busy} onClick={() => void run(() => client.reviewRule(rule, 'approved'))}>重新批准</button> : <><button type="button" disabled={busy} onClick={() => void run(() => client.setRuleEnabled(rule, !rule.enabled))}>{rule.enabled ? '停用' : '启用'}</button>{rule.publicStatus !== 'pending' && rule.publicStatus !== 'adopted' && <button type="button" disabled={busy} onClick={() => void run(() => client.submitRuleToPublic(rule))}>提交运营审核</button>}</>}{rule.version > 1 && <button type="button" disabled={busy} onClick={() => void run(() => client.rollbackRule(rule, rule.version - 1))}>回滚上一版</button>}</div></article>; })}</section></div>{findingHistory.length > 0 && <details className="v2-finding-history"><summary>已处置记录 {findingHistory.length}</summary><div>{findingHistory.slice(0, 20).map((finding) => <article key={finding.id}><span className={finding.disposition}>{finding.disposition === 'confirmed' ? '已转规则' : '已标记误判'}</span><p>{finding.result.transcript}</p><small>{finding.productName} · {formatTime(finding.disposedAt ?? finding.updatedAt)}{finding.resolutionNote ? ` · ${finding.resolutionNote}` : ''}</small></article>)}</div></details>}</div>}
       {tab === 'phrases' && <div className="v2-library-columns"><section><header><span>主播档案</span></header><select value={presenterId} onChange={(event) => setPresenterId(event.target.value)}>{presenters.map((presenter) => <option value={presenter.id} key={presenter.id}>{presenter.name}</option>)}</select><button type="button" disabled={!presenterId || presenterId === snapshot.presenterId} onClick={() => send({ type: 'select_presenter', presenterId })}><UserRound size={13} />{presenterId === snapshot.presenterId ? '本场当前主播' : '设为本场主播'}</button><div className="v2-inline-form"><input value={newPresenter} onChange={(event) => setNewPresenter(event.target.value)} placeholder="新增主播名称" /><button type="button" disabled={!newPresenter.trim() || busy} onClick={addPresenter}><Plus size={13} /></button></div><select value={purpose} onChange={(event) => setPurpose(event.target.value as CoachPurpose)}><option>塑品</option><option>憋单</option><option>逼单</option><option>转化</option><option>互动</option><option>留人</option><option>答疑</option></select><textarea value={phraseDraft} onChange={(event) => setPhraseDraft(event.target.value)} placeholder="录入头部直播间话术，或保存下一场参考表达" /><button type="button" disabled={busy || !presenterId || !phraseDraft.trim()} onClick={addPhrase}><Save size={13} />保存话术</button></section><section className="v2-library-list">{phrases.map((phrase) => <article key={phrase.id}><div><span className={phrase.status}>{phrase.status === 'reference' ? '下一场参考' : phrase.source === 'session' ? '下播归档' : '草稿'}</span><strong>{phrase.purpose ?? '通用'}</strong></div><p>{phrase.text}</p><small>{phrase.source === 'session' ? '来自历史直播' : phrase.source === 'manual' ? '人工录入' : '豆包改写'} · v{phrase.version}</small><button type="button" onClick={() => void run(() => client.updatePhrase(phrase.id, { status: phrase.status === 'reference' ? 'draft' : 'reference' }))}>{phrase.status === 'reference' ? '取消参考' : '选为参考'}</button></article>)}</section></div>}
     </main>{message && <div className="v2-review-message">{message}</div>}
   </section></div>;
@@ -630,12 +636,32 @@ function OperatorApp() {
   const catalog = useMemo(() => new CatalogClient(), []);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [libraryTab, setLibraryTab] = useState<'products' | 'rules' | 'phrases'>('phrases');
+  const [findings, setFindings] = useState<ComplianceFinding[]>([]);
+  const findingsRequest = useRef(0);
+  const loadFindings = useCallback(async () => {
+    const requestSequence = ++findingsRequest.current;
+    const next = await catalog.complianceFindings(live.snapshot.roomId);
+    if (requestSequence === findingsRequest.current) setFindings(Array.isArray(next) ? next : []);
+  }, [catalog, live.snapshot.roomId]);
+  useEffect(() => { void loadFindings().catch(() => undefined); }, [loadFindings, live.snapshot.latestCompliance?.id]);
+  const confirmFinding = async (finding: ComplianceFinding) => {
+    await catalog.confirmComplianceFinding(finding);
+    setFindings((current) => current.filter((candidate) => candidate.id !== finding.id));
+    await loadFindings();
+  };
+  const dismissFinding = async (finding: ComplianceFinding) => {
+    await catalog.dismissComplianceFinding(finding);
+    setFindings((current) => current.filter((candidate) => candidate.id !== finding.id));
+    await loadFindings();
+  };
+  const openLibrary = (tab: 'products' | 'rules' | 'phrases' = 'phrases') => { setLibraryTab(tab); setLibraryOpen(true); };
   return <div className="v2-app">
     <header className="v2-topbar"><div className="v2-brand"><span><MonitorUp size={18} /></span><div><strong>直播中控</strong><small>风险预警与主播提词</small></div></div><div className="v2-live-state"><i className={live.snapshot.lifecycle === 'live' ? 'live' : ''} /><span>{lifecycleText(live.snapshot.lifecycle)}</span><small>{live.snapshot.presenterName}</small></div><LiveControls snapshot={live.snapshot} connected={live.connected} status={live.status} send={live.send} sendAudio={live.sendAudio} /></header>
-    <div className="v2-operator-grid"><ProductRail snapshot={live.snapshot} products={live.products} send={live.send} openHistory={() => setHistoryOpen(true)} openLibrary={() => setLibraryOpen(true)} />
+    <div className="v2-operator-grid"><ProductRail snapshot={live.snapshot} products={live.products} send={live.send} openHistory={() => setHistoryOpen(true)} openLibrary={() => openLibrary()} />
       <main className="v2-main"><header className="v2-product-context"><div><span>当前商品</span><h1>{live.snapshot.product.name}</h1></div><strong>{live.snapshot.product.price}</strong></header><CoachBoard snapshot={live.snapshot} /><TranscriptFeed snapshot={live.snapshot} compact /><DemoInput snapshot={live.snapshot} send={live.send} /></main>
-      <aside className="v2-right-rail"><RiskPanel snapshot={live.snapshot} onConfirmRule={(result) => catalog.confirmRule(live.snapshot.roomId, result).then(() => undefined)} /><section className="v2-session-stats"><div><Clock3 size={14} /><span>直播时长</span><strong>{Math.floor(live.snapshot.stats.speakingSeconds / 60).toString().padStart(2, '0')}:{(live.snapshot.stats.speakingSeconds % 60).toString().padStart(2, '0')}</strong></div><div><AlertTriangle size={14} /><span>风险提醒</span><strong>{live.snapshot.stats.warningCount + live.snapshot.stats.blockedCount}</strong></div></section><DisplayLinkPanel sessionId={live.snapshot.sessionId} /></aside>
-    </div>{historyOpen && <ReviewWorkspace roomId={live.snapshot.roomId} onClose={() => setHistoryOpen(false)} />}{libraryOpen && <LibraryWorkspace snapshot={live.snapshot} products={live.products} send={live.send} onClose={() => setLibraryOpen(false)} />}
+      <aside className="v2-right-rail"><RiskPanel snapshot={live.snapshot} findings={findings} onConfirmFinding={confirmFinding} onDismissFinding={dismissFinding} onOpenInbox={() => openLibrary('rules')} /><section className="v2-session-stats"><div><Clock3 size={14} /><span>直播时长</span><strong>{Math.floor(live.snapshot.stats.speakingSeconds / 60).toString().padStart(2, '0')}:{(live.snapshot.stats.speakingSeconds % 60).toString().padStart(2, '0')}</strong></div><div><AlertTriangle size={14} /><span>风险提醒</span><strong>{live.snapshot.stats.warningCount + live.snapshot.stats.blockedCount}</strong></div></section><DisplayLinkPanel sessionId={live.snapshot.sessionId} /></aside>
+    </div>{historyOpen && <ReviewWorkspace roomId={live.snapshot.roomId} onClose={() => setHistoryOpen(false)} />}{libraryOpen && <LibraryWorkspace snapshot={live.snapshot} products={live.products} send={live.send} onClose={() => setLibraryOpen(false)} initialTab={libraryTab} findings={findings} onConfirmFinding={confirmFinding} onDismissFinding={dismissFinding} />}
   </div>;
 }
 

@@ -139,7 +139,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
         const candidate = presenters.get(activePresenterId);
         return candidate?.roomId === targetRoom ? { id: candidate.id, name: candidate.name } : null;
       },
-      onComplianceResult: (result) => { rules.learn(targetRoom, sessionId, result, liveSession.snapshot().product); },
+      onComplianceResult: (result, analyzedProduct) => { rules.learn(targetRoom, sessionId, result, analyzedProduct); },
       onReviewTiming: (timing) => console.info('[realtime-review]', JSON.stringify(timing)),
       session: { sessionId, tenantId, roomId: targetRoom, presenterId, presenterName, product: persisted?.product ?? roomProducts[0], lineup: persisted?.lineup?.length ? persisted.lineup : roomProducts },
     });

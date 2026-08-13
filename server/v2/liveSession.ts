@@ -36,7 +36,7 @@ export type LiveSessionOptions = {
   rules?: (product: Product) => ComplianceRule[];
   referencePhrases?: (presenterId: string, productId: string) => Array<{ text: string; purpose?: CoachPurpose }>;
   resolvePresenter?: (presenterId: string) => { id: string; name: string } | null;
-  onComplianceResult?: (result: ComplianceResult) => void;
+  onComplianceResult?: (result: ComplianceResult, product: Product) => void;
   onReviewTiming?: (timing: RealtimeReviewTiming) => void;
 };
 
@@ -112,7 +112,7 @@ export class LiveSession {
       now: this.now,
       isProductSegmentCurrent: (token) => token.productRevision === this.productRevision && token.segmentRevision === (this.segmentRevisions.get(token.segmentId) ?? 0),
       isLatest: (token) => token.requestSequence === this.requestSequence && token.productRevision === this.productRevision && token.segmentRevision === (this.segmentRevisions.get(token.segmentId) ?? 0),
-      onCompliance: (result, latest) => { this.commit('compliance.updated', { result: JSON.stringify(result), segmentId: result.segmentId, latest }); options.onComplianceResult?.(result); },
+      onCompliance: (result, latest, product) => { this.commit('compliance.updated', { result: JSON.stringify(result), product: JSON.stringify(product), segmentId: result.segmentId, latest }); options.onComplianceResult?.(result, product); },
       onCoach: (segmentIdValue, suggestions, pending) => this.commit('coach.updated', { segmentId: segmentIdValue, suggestions: JSON.stringify(suggestions), pending }),
       onTiming: options.onReviewTiming,
     });

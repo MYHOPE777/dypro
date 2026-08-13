@@ -47,7 +47,7 @@ export class RealtimeReviewPipeline {
     now?: () => number;
     isProductSegmentCurrent: (token: ReviewToken) => boolean;
     isLatest: (token: ReviewToken) => boolean;
-    onCompliance: (result: ComplianceResult, latest: boolean) => void;
+    onCompliance: (result: ComplianceResult, latest: boolean, product: Product) => void;
     onCoach: (segmentId: string, suggestions: CoachSuggestion[], pending: boolean) => void;
     onTiming?: (timing: RealtimeReviewTiming) => void;
     monotonicNow?: () => number;
@@ -63,7 +63,7 @@ export class RealtimeReviewPipeline {
     const local = { ...normalized(localResult, segment, product, this.now()), analysisMs: this.elapsed(processStartedAt, localCompletedAt) };
     this.logTiming(input, 'local_rule', processStartedAt, localStartedAt, localCompletedAt);
     if (!this.options.isProductSegmentCurrent(token) || !this.options.isLatest(token)) return;
-    this.options.onCompliance(local, true);
+    this.options.onCompliance(local, true, product);
     const references = input.referencePhrases?.filter((phrase) => phrase.text.trim()) ?? [];
     const coachInput = (compliance: ComplianceResult): CoachInput => ({
       product,
@@ -114,7 +114,7 @@ export class RealtimeReviewPipeline {
       this.logTiming(input, 'semantic_review', processStartedAt, semanticStartedAt ?? semanticCompletedAt, semanticCompletedAt, semanticQueuedAt, remote.timedOut || remote.value.expired, resolved.analysisTiming);
       if (!this.options.isProductSegmentCurrent(token)) return;
       const latest = this.options.isLatest(token);
-      this.options.onCompliance(resolved, latest);
+      this.options.onCompliance(resolved, latest, product);
       if (RISK_SEVERITY[resolved.risk] <= RISK_SEVERITY[local.risk]) return;
       if (!latest) return;
       semanticOverrideActive = true;

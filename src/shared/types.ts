@@ -184,6 +184,27 @@ export type ComplianceResult = {
   ruleKind?: ComplianceRuleKind;
 };
 
+export type ComplianceFindingDisposition = 'pending' | 'confirmed' | 'dismissed';
+
+export type ComplianceFinding = {
+  id: string;
+  sessionId: string;
+  roomId: string;
+  segmentId: string;
+  productId: string;
+  productName: string;
+  /** Product data captured when the risk occurred; later catalog edits must not change the evidence. */
+  product?: Product;
+  result: ComplianceResult;
+  disposition: ComplianceFindingDisposition;
+  ruleId?: string;
+  disposedBy?: string;
+  disposedAt?: number;
+  resolutionNote?: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type CoachSuggestion = {
   id: string;
   purpose: CoachPurpose;

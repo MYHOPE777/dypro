@@ -98,21 +98,55 @@ describe('v2 operator view', () => {
   });
 
   it('shows confidence, highlights the exact risk phrase and confirms it locally', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ id: 'rule-confirmed' }) });
+    const result = { id: 'risk-result', segmentId: 'segment-1', productId: 'serum', risk: 'blocked' as const, title: '医疗功效', reason: '包含治疗承诺', alternative: '可以改为：日常体验因人而异。', policyRef: '广告合规', confidence: 0.97, source: 'doubao' as const, transcript: '这个可以治疗耳聋', matchedTerms: ['治疗耳聋'], ruleKind: 'term' as const, createdAt: 1 };
+    const finding = { id: 'finding-live-risk-segment-1', sessionId: 'live-risk-evidence', roomId: 'room-default', segmentId: 'segment-1', productId: 'serum', productName: '轻透焕亮精华', product: PRODUCTS[0], result, disposition: 'pending' as const, createdAt: 1, updatedAt: 1 };
+    let pending = true;
+    const fetchMock = vi.fn().mockImplementation(async (input: string, init?: RequestInit) => ({
+      ok: true,
+      json: async () => {
+        if (input.includes('/compliance-findings/segment-1/confirm') && init?.method === 'POST') { pending = false; return { finding: { ...finding, disposition: 'confirmed' }, rule: { id: 'rule-confirmed' } }; }
+        if (input.includes('/compliance-findings?')) return pending ? [finding] : [];
+        return {};
+      },
+    }));
     vi.stubGlobal('fetch', fetchMock);
     render(<App />);
     const socket = FakeWebSocket.instances[0];
     socket.open();
     socket.receive({
       type: 'ready', requestId: 'join', sessionId: 'live-risk-evidence', products: PRODUCTS,
-      snapshot: { ...snapshot(), sessionId: 'live-risk-evidence', latestCompliance: { id: 'risk-result', segmentId: 'segment-1', productId: 'serum', risk: 'blocked', title: '医疗功效', reason: '包含治疗承诺', alternative: '可以改为：日常体验因人而异。', policyRef: '广告合规', confidence: 0.97, source: 'doubao', transcript: '这个可以治疗耳聋', matchedTerms: ['治疗耳聋'], ruleKind: 'term', createdAt: 1 } },
+      snapshot: { ...snapshot(), sessionId: 'live-risk-evidence', latestCompliance: result },
     });
 
     expect(await screen.findByText('置信度 97%')).toBeTruthy();
     expect(screen.getByText('治疗耳聋', { selector: 'mark' })).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: '确认并加入本地规则' }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v2/rooms/room-default/rules/confirm', expect.objectContaining({ method: 'POST' })));
+    fireEvent.click(await screen.findByRole('button', { name: '确认成规则' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v2/sessions/live-risk-evidence/compliance-findings/segment-1/confirm', expect.objectContaining({ method: 'POST' })));
     expect(await screen.findByText('已保存到本地规则库')).toBeTruthy();
+  });
+
+  it('keeps an older unresolved violation actionable after the latest result changes', async () => {
+    const oldRisk = { id: 'risk-old', segmentId: 'segment-old', productId: 'serum', risk: 'blocked' as const, title: '医疗功效', reason: '包含治疗承诺', alternative: '可以改为：只介绍日常使用体验。', policyRef: '广告合规', confidence: 0.97, source: 'doubao' as const, transcript: '这个可以治疗耳聋', matchedTerms: ['治疗耳聋'], ruleKind: 'term' as const, createdAt: 1 };
+    const finding = { id: 'finding-live-risk-segment-old', sessionId: 'live-risk-inbox', roomId: 'room-default', segmentId: 'segment-old', productId: 'serum', productName: '轻透焕亮精华', result: oldRisk, disposition: 'pending', createdAt: 1, updatedAt: 1 };
+    let pending = true;
+    const fetchMock = vi.fn().mockImplementation(async (input: string, init?: RequestInit) => ({
+      ok: true,
+      json: async () => {
+        if (input.includes('/compliance-findings/segment-old/confirm') && init?.method === 'POST') { pending = false; return { finding: { ...finding, disposition: 'confirmed' }, rule: { id: 'rule-confirmed' } }; }
+        return pending ? [finding] : [];
+      },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ type: 'ready', requestId: 'join', sessionId: 'live-risk-inbox', products: PRODUCTS, snapshot: { ...snapshot(), sessionId: 'live-risk-inbox', latestCompliance: { ...oldRisk, id: 'latest-safe', segmentId: 'segment-new', risk: 'safe', title: '当前安全', transcript: '正常介绍商品', matchedTerms: [] }, alerts: [oldRisk] } });
+
+    expect(await screen.findByText('待处置 1')).toBeTruthy();
+    expect(screen.getByText('这个可以治疗耳聋')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '确认成规则' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v2/sessions/live-risk-inbox/compliance-findings/segment-old/confirm', expect.objectContaining({ method: 'POST' })));
+    await waitFor(() => expect(screen.queryByText('待处置 1')).toBeNull());
   });
 
   it('renders the service operations review queue on its separate route', async () => {
@@ -268,10 +302,10 @@ describe('v2 operator view', () => {
   });
 
   it('loads a folded presenter link and QR code only after the operator opens it', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
+    const fetchMock = vi.fn().mockImplementation(async (input: string) => ({
       ok: true,
-      json: async () => ({ alias: 'QR12ABCD', sessionId: 'live-client-test', expiresAt: Date.now() + 60_000, path: '/screen/QR12ABCD' }),
-    });
+      json: async () => input.includes('/compliance-findings?') ? [] : ({ alias: 'QR12ABCD', sessionId: 'live-client-test', expiresAt: Date.now() + 60_000, path: '/screen/QR12ABCD' }),
+    }));
     vi.stubGlobal('fetch', fetchMock);
 
     render(<App />);
