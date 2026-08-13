@@ -27,7 +27,7 @@ function snapshot(sequence: number, words = 0): LiveSessionSnapshot {
   return {
     sessionId: 'live-reconnect', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '测试主播', lifecycle: 'live',
     product: PRODUCTS[0], lineup: PRODUCTS, partialTranscript: '', transcriptHistory: [], latestCompliance: null, alerts: [], coachSuggestions: [], coachPending: false,
-    riskProfile: 'balanced', stats: { speakingSeconds: 0, words, blockedCount: 0, warningCount: 0, safeCount: 0 }, contentRevision: 0, latestSequence: sequence, createdAt: 1, updatedAt: sequence,
+    riskProfile: 'strict', stats: { speakingSeconds: 0, words, blockedCount: 0, warningCount: 0, safeCount: 0 }, contentRevision: 0, latestSequence: sequence, createdAt: 1, updatedAt: sequence,
   };
 }
 

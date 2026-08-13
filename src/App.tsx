@@ -44,7 +44,7 @@ import type { AudioTrack } from './shared/v2Audio';
 const EMPTY: LiveSessionSnapshot = {
   sessionId: '', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '默认主播', lifecycle: 'idle',
   product: DEFAULT_PRODUCT, lineup: PRODUCTS, partialTranscript: '', transcriptHistory: [], latestCompliance: null, alerts: [], coachSuggestions: [], coachPending: false,
-  riskProfile: 'balanced', stats: { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 }, contentRevision: 0, latestSequence: 0, createdAt: Date.now(), updatedAt: Date.now(),
+  riskProfile: 'strict', stats: { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 }, contentRevision: 0, latestSequence: 0, createdAt: Date.now(), updatedAt: Date.now(),
 };
 
 function currentDisplayAlias(): string | undefined {
@@ -295,7 +295,7 @@ function RiskPanel({ snapshot, display = false, findings = [], onConfirmFinding,
 function ProductRail({ snapshot, products, send, openHistory, openLibrary }: { snapshot: LiveSessionSnapshot; products: Product[]; send: (command: LiveCommand) => boolean; openHistory: () => void; openLibrary: () => void }) {
   return <aside className="v2-left-rail">
     <section><header><Package size={15} /><span>本场商品</span></header><div className="v2-product-list">{products.map((product) => <button type="button" className={snapshot.product.id === product.id ? 'active' : ''} key={product.id} onClick={() => send({ type: 'select_product', productId: product.id })}><img src={product.image} alt="" /><span><strong>{product.name}</strong><small>{product.category} · {product.price}</small></span></button>)}</div></section>
-    <section className="v2-risk-profile"><header><ShieldAlert size={15} /><span>风控等级</span></header><div>{(['strict', 'balanced', 'optimized'] as const).map((profile) => <button type="button" className={snapshot.riskProfile === profile ? 'active' : ''} key={profile} onClick={() => send({ type: 'set_risk_profile', profile })}>{profile === 'strict' ? '严格' : profile === 'balanced' ? '均衡' : '优化'}</button>)}</div></section>
+    <section className="v2-risk-profile"><header><ShieldAlert size={15} /><span>风控等级</span></header><div><button type="button" className="active" aria-pressed="true" disabled>严格</button></div><small>全场统一严格审核</small></section>
     <button type="button" className="v2-history-button" onClick={openLibrary}><BookOpen size={15} />资料管理</button>
     <button type="button" className="v2-history-button secondary" onClick={openHistory}><History size={15} />历史复核</button>
   </aside>;

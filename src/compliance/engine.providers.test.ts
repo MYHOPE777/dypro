@@ -50,18 +50,20 @@ describe('DoubaoComplianceAnalyzer', () => {
     expect(request.input[1]?.content[0]?.text).toContain('本直播间相关规则');
   });
 
-  it('returns a high-confidence local warning without waiting for the model', async () => {
-    const fetchMock = vi.fn();
+  it('sends an uncertain local warning to Doubao for semantic review', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      output_text: JSON.stringify({ risk: 'warning', title: '语义提醒', reason: '适用人群需要核验', alternative: '请按商品页面适用范围介绍', policyRef: '适用范围宣传', confidence: 0.86 }),
+    }), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
     const analyzer = new DoubaoComplianceAnalyzer({ ARK_API_KEY: 'key', ARK_MODEL: 'model' });
 
     const result = await analyzer.analyze({ productId: 'serum', transcript: '这款商品适合所有肤质' });
 
-    expect(result).toMatchObject({ risk: 'warning', source: 'local-fallback' });
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ risk: 'warning', source: 'doubao' });
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
-  it('samples ordinary safe speech in optimized mode while keeping local checks on every sentence', async () => {
+  it('sends every ordinary safe sentence to Doubao even with a legacy optimized input', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       output_text: JSON.stringify({ risk: 'safe', title: '可继续', reason: '未发现风险', alternative: '继续介绍', policyRef: '平台规则', confidence: 0.9, matchedTerms: [], ruleKind: 'sentence' }),
     }), { status: 200 }));
@@ -70,10 +72,10 @@ describe('DoubaoComplianceAnalyzer', () => {
 
     for (const transcript of ['这款面料触感柔软', '日常通勤搭配很方便', '现在看一下它的细节', '再看一下包装设计', '触感比较轻薄', '适合日常通勤', '大家可以看细节', '我们继续介绍规格']) await analyzer.analyze({ roomId: 'room-default', productId: 'serum', transcript, riskProfile: 'optimized' });
 
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(8);
   });
 
-  it('reviews every fourth ordinary safe sentence in balanced mode', async () => {
+  it('sends every ordinary safe sentence to Doubao even with a legacy balanced input', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       output_text: JSON.stringify({ risk: 'safe', category: 'context', title: '可继续', reason: '未发现风险', alternative: '继续介绍', policyRef: '平台规则', confidence: 0.9, matchedTerms: [], ruleKind: 'sentence' }),
     }), { status: 200 }));
@@ -82,7 +84,7 @@ describe('DoubaoComplianceAnalyzer', () => {
 
     for (const transcript of ['先看一下瓶身设计', '再看一下使用方式', '我们看一下规格', '最后看一下包装']) await analyzer.analyze({ roomId: 'room-default', productId: 'serum', transcript, riskProfile: 'balanced' });
 
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it('immediately reviews euphemistic product context even in optimized mode', async () => {

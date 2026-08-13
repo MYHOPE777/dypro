@@ -31,7 +31,7 @@ function snapshot(): LiveSessionSnapshot {
       { id: 'one', purpose: '塑品', text: '第一段建议', reason: '建立价值', source: 'local-fallback', createdAt: 1 },
       { id: 'two', purpose: '互动', text: '第二段建议', reason: '引导互动', source: 'local-fallback', createdAt: 1 },
       { id: 'three', purpose: '转化', text: '第三段建议', reason: '承接转化', source: 'local-fallback', createdAt: 1 },
-    ], coachPending: false, riskProfile: 'balanced', stats: { speakingSeconds: 12, words: 20, blockedCount: 0, warningCount: 0, safeCount: 1 }, contentRevision: 0, latestSequence: 3, createdAt: 1, updatedAt: 2,
+    ], coachPending: false, riskProfile: 'strict', stats: { speakingSeconds: 12, words: 20, blockedCount: 0, warningCount: 0, safeCount: 1 }, contentRevision: 0, latestSequence: 3, createdAt: 1, updatedAt: 2,
   };
 }
 
@@ -52,6 +52,7 @@ describe('v2 operator view', () => {
     expect(await screen.findByText('第一段建议')).toBeTruthy();
     expect(screen.getByText('第二段建议')).toBeTruthy();
     expect(screen.getByText('第三段建议')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '严格' }).hasAttribute('disabled')).toBe(true);
     fireEvent.click(screen.getByRole('button', { name: /云感降噪耳机/ }));
     await waitFor(() => {
       const frame = JSON.parse(socket.sent.at(-1) as string) as { command: { type: string; productId?: string } };

@@ -54,6 +54,35 @@ describe('analyzeTranscript', () => {
     expect(result.matchedTerms?.[0]).toBeTruthy();
   });
 
+  it.each(['治疗喉咙痛', '治喉咙痛', '一定能治喉咙痛'])('blocks colloquial treatment claims for throat pain: %s', async (transcript) => {
+    const result = await analyzeTranscript({ productId: 'headphones', transcript });
+
+    expect(result.risk).toBe('blocked');
+    expect(result.category).toBe('medical');
+    expect(result.title).toContain('医疗');
+    expect(result.matchedTerms?.[0]).toContain('喉咙痛');
+  });
+
+  it('does not treat a symptom mention or an unrelated certainty word as a medical claim', async () => {
+    const symptomMention = await analyzeTranscript({ productId: 'headphones', transcript: '喉咙痛人群请先查看商品适用范围' });
+    const ordinaryCertainty = await analyzeTranscript({ productId: 'mug', transcript: '这个杯子一定能装下页面标注的容量' });
+
+    expect(symptomMention.risk).toBe('safe');
+    expect(ordinaryCertainty.risk).toBe('safe');
+  });
+
+  it.each(['政治话题里提到了喉咙痛人群', '自治区域有人喉咙痛', '他在整治环境时头痛', '法治节目谈到失眠'])('does not read a non-medical compound containing 治 as treatment: %s', async (transcript) => {
+    const result = await analyzeTranscript({ productId: 'headphones', transcript });
+
+    expect(result.risk).toBe('safe');
+  });
+
+  it('downgrades a quoted colloquial treatment claim to a context warning', async () => {
+    const result = await analyzeTranscript({ productId: 'headphones', transcript: '不要说一定能治喉咙痛，这是违规话术' });
+
+    expect(result).toMatchObject({ risk: 'warning', category: 'context', ruleId: 'sensitive-claim-reference' });
+  });
+
   it('allows a medical condition mention without a treatment claim', async () => {
     const result = await analyzeTranscript({ productId: 'headphones', transcript: '关注耳聋人士的日常佩戴体验，具体以产品页面为准' });
 

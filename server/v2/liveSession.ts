@@ -164,7 +164,10 @@ export class LiveSession {
         this.commit('catalog.updated', { products: JSON.stringify(command.products) });
         return;
       case 'set_risk_profile':
-        if (this.snapshotValue.riskProfile !== command.profile) this.commit('risk_profile.changed', { profile: command.profile });
+        // Risk is intentionally fixed at strict. Ignore stale clients that try
+        // to restore the removed balanced/optimized modes.
+        if (command.profile !== 'strict') return;
+        if (this.snapshotValue.riskProfile !== 'strict') this.commit('risk_profile.changed', { profile: 'strict' });
         return;
       case 'select_presenter':
         {

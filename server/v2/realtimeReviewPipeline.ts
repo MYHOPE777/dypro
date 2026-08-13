@@ -56,7 +56,7 @@ export class RealtimeReviewPipeline {
   async process(input: { token: ReviewToken; segment: TranscriptSegment; product: Product; roomId?: string; riskProfile: RiskProfile; context: AnalysisInput['context']; stats: SessionStats; customRules?: ComplianceRule[]; referencePhrases?: Array<{ text: string; purpose?: CoachPurpose }> }): Promise<void> {
     const { token, segment, product } = input;
     const processStartedAt = this.monotonicNow();
-    const analysisInput: AnalysisInput = { roomId: input.roomId, productId: product.id, transcript: segment.text, product, speaker: segment.speaker, speakerId: segment.speakerId, riskProfile: input.riskProfile, context: input.context, customRules: input.customRules };
+    const analysisInput: AnalysisInput = { roomId: input.roomId, productId: product.id, transcript: segment.text, product, speaker: segment.speaker, speakerId: segment.speakerId, riskProfile: 'strict', context: input.context, customRules: input.customRules };
     const localStartedAt = this.monotonicNow();
     const localResult = await this.options.scheduler.run('realtime', this.options.sessionId, () => this.localAnalyzer.analyze(analysisInput));
     const localCompletedAt = this.monotonicNow();

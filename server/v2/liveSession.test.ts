@@ -62,6 +62,17 @@ describe('LiveSession', () => {
     store.close();
   });
 
+  it('keeps the risk profile fixed at strict', async () => {
+    const { store, session } = makeSession();
+
+    expect(session.snapshot().riskProfile).toBe('strict');
+    await session.dispatch({ type: 'set_risk_profile', profile: 'optimized' });
+
+    expect(session.snapshot().riskProfile).toBe('strict');
+    expect(store.listSessionEvents(session.id).some((event) => event.type === 'risk_profile.changed')).toBe(false);
+    store.close();
+  });
+
   it('coalesces repeated end commands while capture is draining', async () => {
     const capture = new FakeCapture();
     capture.holdEnd();

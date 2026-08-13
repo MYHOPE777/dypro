@@ -88,7 +88,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
       profileBoundaries: input.product?.complianceProfile?.riskBoundaries,
       transcript: input.transcript,
       contextText: input.context?.text,
-      riskProfile: input.riskProfile,
+      riskProfile: 'strict',
       localResult,
       speakerId: input.speakerId,
       localFastPath: this.localFastPath,
@@ -145,7 +145,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
       const content = await requestArk(
         this.config,
         SYSTEM_PROMPT,
-        `当前商品：${JSON.stringify(product)}\n当前风险档位：${input.riskProfile ?? 'balanced'}\n当前说话人：${input.speaker === 'other' ? '其他人' : '主播'}\n主播当前原话：${input.transcript}\n同一商品最近上下文：${input.context?.text ?? '无'}\n本直播间相关规则：${JSON.stringify(compactRules)}`,
+        `当前商品：${JSON.stringify(product)}\n当前风险档位：严格（所有直播场次统一）\n当前说话人：${input.speaker === 'other' ? '其他人' : '主播'}\n主播当前原话：${input.transcript}\n同一商品最近上下文：${input.context?.text ?? '无'}\n本直播间相关规则：${JSON.stringify(compactRules)}`,
         this.maxOutputTokens,
         true,
       );
@@ -190,7 +190,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
       productRevision: input.product?.updatedAt ?? 0,
       speakerId: input.speakerId ?? '',
       transcript: input.transcript.trim(),
-      riskProfile: input.riskProfile ?? 'balanced',
+      riskProfile: 'strict',
       context: input.context?.text ?? '',
       complianceProfile: input.product?.complianceProfile ? `${input.product.complianceProfile.updatedAt}:${input.product.complianceProfile.status}:${input.product.complianceProfile.source}` : '',
       rules: input.customRules?.map((rule) => `${rule.id}:${rule.version}:${rule.enabled}:${rule.status}`).join('|') ?? '',

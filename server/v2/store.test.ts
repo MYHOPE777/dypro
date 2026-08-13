@@ -40,6 +40,29 @@ describe('SqliteFactStore', () => {
     expect(store.getSessionSnapshot(sessionId)?.latestSequence).toBe(2);
   });
 
+  it('uses strict risk for new sessions while preserving ended-session audit history', () => {
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    stores.push(store);
+    const sessionId = 'session-strict-risk';
+    store.createSession({
+      sessionId,
+      tenantId: 'tenant-local',
+      roomId: 'room-default',
+      presenterId: 'presenter-default',
+      presenterName: '测试主播',
+      product: DEFAULT_PRODUCT,
+      lineup: [DEFAULT_PRODUCT],
+    });
+
+    expect(store.getSessionSnapshot(sessionId)?.riskProfile).toBe('strict');
+    store.appendSessionEvent(sessionId, { type: 'risk_profile.changed', occurredAt: 2, payload: { profile: 'strict' } });
+    expect(store.getSessionSnapshot(sessionId)?.riskProfile).toBe('strict');
+
+    store.appendSessionEvent(sessionId, { type: 'risk_profile.changed', occurredAt: 3, payload: { profile: 'optimized' } });
+    store.appendSessionEvent(sessionId, { type: 'lifecycle.changed', occurredAt: 4, payload: { lifecycle: 'ended' } });
+    expect(store.getSessionSnapshot(sessionId)?.riskProfile).toBe('optimized');
+  });
+
   it('reopens a file database with the same ordered event stream', () => {
     const filename = `${process.env.TMPDIR ?? '/tmp'}/dypro-v2-store-${Date.now()}.sqlite`;
     const first = new SqliteFactStore({ filename });

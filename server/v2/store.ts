@@ -293,6 +293,9 @@ export class SqliteFactStore {
     const roomProductColumns = this.db.prepare('PRAGMA table_info(room_products)').all().map((row) => stringValue(row.name));
     if (!roomProductColumns.includes('product_json')) this.db.exec('ALTER TABLE room_products ADD COLUMN product_json TEXT');
     this.db.exec('UPDATE room_products SET product_json = (SELECT products.product_json FROM products WHERE products.id = room_products.product_id) WHERE product_json IS NULL');
+    // Current sessions use one safety policy. Ended sessions retain their
+    // original risk profile as part of the historical audit record.
+    this.db.exec("UPDATE live_sessions SET risk_profile = 'strict' WHERE lifecycle <> 'ended' AND risk_profile <> 'strict'");
     const findingColumns = this.db.prepare('PRAGMA table_info(compliance_findings)').all().map((row) => stringValue(row.name));
     if (!findingColumns.includes('product_json')) this.db.exec('ALTER TABLE compliance_findings ADD COLUMN product_json TEXT');
     this.getSessionStatement = this.db.prepare('SELECT * FROM live_sessions WHERE id = ?');
@@ -312,10 +315,10 @@ export class SqliteFactStore {
       this.db.prepare('INSERT OR IGNORE INTO tenants (id, name, created_at) VALUES (?, ?, ?)').run(input.tenantId, input.tenantId, now);
       this.db.prepare('INSERT OR IGNORE INTO rooms (id, tenant_id, name, account_name, owner_actor_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(input.roomId, input.tenantId, input.roomId, input.roomId, 'owner', now, now);
       this.db.prepare('INSERT OR REPLACE INTO live_sessions (id, tenant_id, room_id, presenter_id, presenter_name, lifecycle, product_json, lineup_json, partial_transcript, transcript_json, latest_compliance_json, alerts_json, coach_json, coach_pending, risk_profile, stats_json, content_revision, latest_sequence, created_at, updated_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
-        input.sessionId, input.tenantId, input.roomId, input.presenterId, input.presenterName, 'idle', json(input.product), json(input.lineup), '', '[]', null, '[]', '[]', 0, 'balanced', json(stats), 0, 0, now, now, null,
+        input.sessionId, input.tenantId, input.roomId, input.presenterId, input.presenterName, 'idle', json(input.product), json(input.lineup), '', '[]', null, '[]', '[]', 0, 'strict', json(stats), 0, 0, now, now, null,
       );
       this.db.prepare('INSERT OR REPLACE INTO session_reviews (session_id, note, approval, delivery, updated_at) VALUES (?, ?, ?, ?, ?)').run(input.sessionId, '', 'approval_required', 'not_queued', now);
-      this.appendInsideTransaction(input.sessionId, { type: 'session.created', occurredAt: now, payload: { roomId: input.roomId, tenantId: input.tenantId, presenterId: input.presenterId, presenterName: input.presenterName, productId: input.product.id, product: json(input.product), lineup: json(input.lineup) } });
+      this.appendInsideTransaction(input.sessionId, { type: 'session.created', occurredAt: now, payload: { roomId: input.roomId, tenantId: input.tenantId, presenterId: input.presenterId, presenterName: input.presenterName, productId: input.product.id, product: json(input.product), lineup: json(input.lineup), riskProfile: 'strict' } });
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -543,7 +546,7 @@ export class SqliteFactStore {
       this.db.prepare('DELETE FROM compliance_projections WHERE session_id = ?').run(sessionId);
       this.db.prepare('DELETE FROM coach_projections WHERE session_id = ?').run(sessionId);
       this.db.prepare('UPDATE live_sessions SET presenter_id = ?, presenter_name = ?, lifecycle = ?, product_json = ?, lineup_json = ?, partial_transcript = ?, transcript_json = ?, latest_compliance_json = NULL, alerts_json = ?, coach_json = ?, coach_pending = 0, risk_profile = ?, stats_json = ?, content_revision = 0, latest_sequence = 0, created_at = ?, updated_at = ?, ended_at = NULL WHERE id = ?').run(
-        stringValue(created.payload.presenterId, current.presenterId), stringValue(created.payload.presenterName, current.presenterName), 'idle', json(initialProduct), json(initialLineup), '', '[]', '[]', '[]', 'balanced', json(emptyStats()), created.occurredAt, created.occurredAt, sessionId,
+        stringValue(created.payload.presenterId, current.presenterId), stringValue(created.payload.presenterName, current.presenterName), 'idle', json(initialProduct), json(initialLineup), '', '[]', '[]', '[]', stringValue(created.payload.riskProfile, current.riskProfile), json(emptyStats()), created.occurredAt, created.occurredAt, sessionId,
       );
 
       for (const event of events) {
@@ -1009,7 +1012,7 @@ export class SqliteFactStore {
       presenterId: stringValue(row.presenter_id), presenterName: stringValue(row.presenter_name), lifecycle: stringValue(row.lifecycle, 'idle') as LiveLifecycle,
       product: parseJson<Product>(row.product_json, {} as Product), lineup: parseJson<Product[]>(row.lineup_json, []), partialTranscript: stringValue(row.partial_transcript),
       transcriptHistory: parseJson<TranscriptSegment[]>(row.transcript_json, []), latestCompliance: parseJson<ComplianceResult | null>(row.latest_compliance_json, null), alerts: parseJson<ComplianceResult[]>(row.alerts_json, []),
-      coachSuggestions: parseJson<CoachSuggestion[]>(row.coach_json, []), coachPending: boolValue(row.coach_pending), riskProfile: stringValue(row.risk_profile, 'balanced') as RiskProfile,
+      coachSuggestions: parseJson<CoachSuggestion[]>(row.coach_json, []), coachPending: boolValue(row.coach_pending), riskProfile: stringValue(row.risk_profile, 'strict') as RiskProfile,
       stats: parseJson<SessionStats>(row.stats_json, emptyStats()), contentRevision: numberValue(row.content_revision), latestSequence: numberValue(row.latest_sequence), createdAt: numberValue(row.created_at), updatedAt: numberValue(row.updated_at),
     };
   }

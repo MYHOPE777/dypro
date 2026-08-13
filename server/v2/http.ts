@@ -120,7 +120,7 @@ function isLiveCommand(value: unknown): value is LiveCommand {
     case 'start': case 'pause': case 'resume': case 'end': case 'stop': return true;
     case 'select_product': return typeof command.productId === 'string' && command.productId.length <= 96 && (command.source === undefined || command.source === 'operator' || command.source === 'speech');
     case 'set_lineup': return Array.isArray(command.productIds) && command.productIds.length <= 100 && command.productIds.every((id) => typeof id === 'string' && id.length <= 96);
-    case 'set_risk_profile': return command.profile === 'strict' || command.profile === 'balanced' || command.profile === 'optimized';
+    case 'set_risk_profile': return command.profile === 'strict';
     case 'select_presenter': return typeof command.presenterId === 'string' && command.presenterId.length <= 96;
     case 'demo_transcript': return typeof command.text === 'string' && command.text.trim().length > 0 && command.text.length <= 4_000 && (command.isFinal === undefined || typeof command.isFinal === 'boolean');
     case 'transcript_correct': return typeof command.segmentId === 'string' && command.segmentId.length <= 160 && typeof command.text === 'string' && command.text.trim().length > 0 && command.text.length <= 4_000;
