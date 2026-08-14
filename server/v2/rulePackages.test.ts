@@ -30,6 +30,20 @@ describe('RulePackageRegistry', () => {
     store.close();
   });
 
+  it('requires scoped package fields and keeps semantic public review separate', () => {
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    const registry = new RulePackageRegistry(store, () => 100);
+    expect(() => registry.createPackage('reviewer', { name: '缺平台', layer: 'platform' })).toThrow('平台规则包必须指定平台');
+    expect(() => registry.createPackage('reviewer', { name: '缺直播间', layer: 'product', productId: DEFAULT_PRODUCT.id })).toThrow('商品规则包必须同时指定直播间和商品');
+    const unit = registry.confirmSemanticFinding('room-default', 'operator', { ruleKind: 'sentence', productId: DEFAULT_PRODUCT.id, risk: 'blocked', title: '医疗承诺', reason: '需要结合上下文判断', alternative: '改为介绍页面信息', policyRef: '抖音规则', confidence: 0.96, transcript: '一定能治好喉咙痛' }, DEFAULT_PRODUCT);
+    const active = registry.reviewUnit(unit.id, 'operator', 'approved');
+    expect(registry.submitPublicUnit(active.id, 'operator')).toMatchObject({ publicStatus: 'pending' });
+    expect(registry.listPublicCandidates()).toHaveLength(1);
+    expect(registry.reviewPublicUnit(active.id, 'reviewer', 'adopted')).toMatchObject({ publicStatus: 'adopted' });
+    expect(registry.semanticInstructions({ roomId: 'another-room', product: DEFAULT_PRODUCT, platform: 'douyin-ecommerce-live', industry: DEFAULT_PRODUCT.complianceProfile?.industry })).toContainEqual(expect.objectContaining({ title: '医疗承诺' }));
+    store.close();
+  });
+
   it('requires both document and unit approval before a document rule can activate', () => {
     const store = new SqliteFactStore({ filename: ':memory:' });
     const registry = new RulePackageRegistry(store, () => 100);

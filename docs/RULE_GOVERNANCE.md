@@ -48,6 +48,7 @@ URL 抓取有 8 秒超时和 2MB 大小限制。抓取的新版本会进入 `pen
 |规则包与单元|`GET /api/v2/rule-packages`、`POST /api/v2/rule-packages/:packageId/units`|
 |规则单元审核|`POST /api/v2/rule-units/:unitId/review`|
 |规则同步|`POST /api/v2/rules/:ruleId/sync`、`POST /api/v2/rule-units/:unitId/sync`|
+|语义规则公共审核|`POST /api/v2/rule-units/:unitId/public-submit`、`POST /api/v2/rule-units/:unitId/public-review`|
 |话术同步|`POST /api/v2/phrases/:phraseId/sync`|
 |同步任务|`GET /api/v2/sync-jobs`|
 

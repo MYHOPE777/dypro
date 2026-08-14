@@ -28,7 +28,9 @@ export class DurableDelivery {
       return this.runSessionJob(job.idempotencyKey, review, sessionGateways);
     }
     const resourceGateways = this.gateways.filter((gateway) => gateway.configured && gateway.deliverResource);
-    const resourceJob = resourceGateways.length ? this.store.listResourceDeliveryJobs('queued')[0] : undefined;
+    const resourceJob = resourceGateways.length
+      ? this.store.listResourceDeliveryJobs('queued').find((candidate) => candidate.approvalStatus === 'approved')
+      : undefined;
     if (!resourceJob) return 0;
     return this.runResourceJob(resourceJob, resourceGateways);
   }

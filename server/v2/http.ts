@@ -7,6 +7,7 @@ import cors from 'cors';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { LiveCommand } from '../../src/shared/v2';
 import type { CoachPurpose, CommercePlatformRuleset, ComplianceResult, Product, ProductComplianceProfile, SyncTarget } from '../../src/shared/types';
+import type { ResourceDeliveryJob } from '../../src/shared/v2';
 import type { V2ClientCommand, V2ClientFrame, V2JoinCommand, V2ServerFrame } from '../../src/shared/v2Protocol';
 import { decodeAudioFrame } from '../../src/shared/v2Audio';
 import { createRuntime, type V2Runtime } from './runtime';
@@ -67,7 +68,7 @@ function productComplianceProfile(value: unknown): ProductComplianceProfile | un
   return {
     industry: productText(profile.industry, '所属行业', 80),
     category: productText(profile.category, '标准类目', 80),
-    platformRuleset: 'douyin-ecommerce-live',
+    platformRuleset: profile.platformRuleset === 'pinduoduo-ecommerce-live' ? 'pinduoduo-ecommerce-live' : 'douyin-ecommerce-live',
     complianceSummary: productText(profile.complianceSummary, '合规资料描述', 500),
     riskKeywords: productTextList(profile.riskKeywords, '高风险词'),
     riskBoundaries: productTextList(profile.riskBoundaries, '语义风险边界'),
@@ -107,6 +108,16 @@ function productInput(productId: string, value: unknown): Product {
 function syncTargets(value: unknown): Exclude<SyncTarget, 'local'>[] {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.filter((target): target is Exclude<SyncTarget, 'local'> => target === 'merchant_database' || target === 'private_knowledge_base'))];
+}
+
+function resourceRoomId(job: ResourceDeliveryJob): string | undefined {
+  if (!job.payload || typeof job.payload !== 'object') return undefined;
+  const payload = job.payload as Record<string, unknown>;
+  if (typeof payload.roomId === 'string') return payload.roomId;
+  if (payload.package && typeof payload.package === 'object' && typeof (payload.package as Record<string, unknown>).roomId === 'string') {
+    return (payload.package as Record<string, unknown>).roomId as string;
+  }
+  return undefined;
 }
 
 function routeParam(request: Request, name: string): string {
@@ -226,6 +237,23 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
   });
   app.post('/api/v2/rule-units/:unitId/review', (request, response) => {
     try { const unit = runtime.store.getRuleUnit(routeParam(request, 'unitId')); if (!unit) return response.status(404).json({ message: '规则单元不存在' }); const pkg = runtime.store.getRulePackage(unit.packageId); if (!pkg) return response.status(404).json({ message: '规则包不存在' }); if (pkg.roomId) runtime.authorization.assert(identity(request), pkg.roomId, 'control'); else runtime.authorization.assertServiceReview(identity(request)); const decision = ['approved', 'rejected', 'deferred', 'discarded'].includes(request.body?.decision) ? request.body.decision : null; if (!decision) return response.status(400).json({ message: '规则单元审核决定无效' }); response.json(runtime.rulePackages.reviewUnit(routeParam(request, 'unitId'), actorId(request), decision, typeof request.body?.note === 'string' ? request.body.note : undefined)); } catch (error) { jsonError(response, error, 403); }
+  });
+  app.post('/api/v2/rule-units/:unitId/public-submit', (request, response) => {
+    try {
+      const unit = runtime.store.getRuleUnit(routeParam(request, 'unitId')); if (!unit) return response.status(404).json({ message: '规则单元不存在' });
+      const pkg = runtime.store.getRulePackage(unit.packageId); if (!pkg) return response.status(404).json({ message: '规则包不存在' });
+      if (!pkg.roomId) return response.status(403).json({ message: '只有商家直播间规则单元可以提交公共审核' });
+      runtime.authorization.assert(identity(request), pkg.roomId, 'control');
+      return response.json(runtime.rulePackages.submitPublicUnit(unit.id, actorId(request)));
+    } catch (error) { return jsonError(response, error, 403); }
+  });
+  app.post('/api/v2/rule-units/:unitId/public-review', (request, response) => {
+    try {
+      runtime.authorization.assertServiceReview(identity(request));
+      const decision = request.body?.decision === 'adopted' || request.body?.decision === 'deferred' || request.body?.decision === 'discarded' ? request.body.decision : null;
+      if (!decision) return response.status(400).json({ message: '运营审核决定无效' });
+      return response.json(runtime.rulePackages.reviewPublicUnit(routeParam(request, 'unitId'), actorId(request), decision, typeof request.body?.note === 'string' ? request.body.note : undefined));
+    } catch (error) { return jsonError(response, error, 403); }
   });
   app.get('/api/v2/rooms/:roomId/rules', (request, response) => {
     try { const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'view'); response.json({ rules: runtime.rules.list(roomId), audits: runtime.rules.audits(roomId) }); } catch (error) { jsonError(response, error, 403); }
@@ -348,10 +376,25 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
     } catch (error) { jsonError(response, error); }
   });
   app.get('/api/v2/sync-jobs', (request, response) => {
-    try { const current = identity(request); if (current.role !== 'reviewer') { const roomId = typeof request.query.roomId === 'string' ? request.query.roomId : current.roomIds[0]; if (!roomId) return response.json([]); runtime.authorization.assert(current, roomId, 'view'); } response.json(runtime.store.listResourceDeliveryJobs(typeof request.query.status === 'string' ? request.query.status as never : undefined)); } catch (error) { jsonError(response, error, 403); }
+    try {
+      const current = identity(request);
+      const status = typeof request.query.status === 'string' ? request.query.status as never : undefined;
+      const jobs = runtime.store.listResourceDeliveryJobs(status);
+      if (current.role === 'reviewer') return response.json(jobs);
+      const requestedRoomId = typeof request.query.roomId === 'string' ? request.query.roomId : undefined;
+      if (requestedRoomId) runtime.authorization.assert(current, requestedRoomId, 'view');
+      const allowedRooms = new Set(requestedRoomId ? [requestedRoomId] : current.roomIds);
+      return response.json(jobs.filter((job) => {
+        const roomId = resourceRoomId(job);
+        return roomId !== undefined && allowedRooms.has(roomId);
+      }));
+    } catch (error) { jsonError(response, error, 403); }
   });
   app.get('/api/v2/operations/rules', (request, response) => {
     try { runtime.authorization.assertServiceReview(identity(request)); return response.json(runtime.store.listPublicRuleCandidates()); } catch (error) { return jsonError(response, error, 403); }
+  });
+  app.get('/api/v2/operations/rule-units', (request, response) => {
+    try { runtime.authorization.assertServiceReview(identity(request)); return response.json(runtime.rulePackages.listPublicCandidates()); } catch (error) { return jsonError(response, error, 403); }
   });
   app.get('/api/v2/rooms/:roomId/presenters', (request, response) => {
     try { const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'view'); response.json(runtime.presenters.list(roomId)); } catch (error) { jsonError(response, error, 403); }

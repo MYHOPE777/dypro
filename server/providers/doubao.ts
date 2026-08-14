@@ -194,6 +194,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
       context: input.context?.text ?? '',
       complianceProfile: input.product?.complianceProfile ? `${input.product.complianceProfile.updatedAt}:${input.product.complianceProfile.status}:${input.product.complianceProfile.source}` : '',
       rules: input.customRules?.map((rule) => `${rule.id}:${rule.version}:${rule.enabled}:${rule.status}`).join('|') ?? '',
+      semanticRules: input.semanticRules?.map((rule) => `${rule.title}:${rule.risk}:${rule.policyRef}:${rule.instruction ?? ''}:${rule.contextWindow ?? ''}`).join('|') ?? '',
     });
   }
 }

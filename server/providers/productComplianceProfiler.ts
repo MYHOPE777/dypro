@@ -4,10 +4,10 @@ import { parseArkJson } from './doubao';
 
 export type ProductComplianceProfiler = { profile(product: Product): Promise<ProductComplianceProfile> };
 
-const SYSTEM_PROMPT = `你是抖音电商带货直播商品合规资料专员。根据商品名称、已有分类、描述和卖点，识别所属行业和标准商品类目，并生成直播前置合规画像。
+const SYSTEM_PROMPT = `你是抖音电商带货直播商品合规资料专员，也可按指定平台适配规则。根据指定平台、商品名称、已有分类、描述和卖点，识别所属行业和标准商品类目，并生成直播前置合规画像。
 只输出 JSON，不要 Markdown：{"industry":"行业","category":"标准类目","complianceSummary":"不超过120字的合规资料描述","riskKeywords":["可直接词审的高风险词或短语"],"riskBoundaries":["需要结合语义审核的宣传边界"],"requiredDisclosures":["需要资质、证据或页面披露的事项"],"safeSellingPoints":["可安全介绍且仍需真实可核验的方向"],"confidence":0到1}。
 riskKeywords 只放稳定、明确、可直接匹配的高风险宣传短语，不要放宽泛单字；riskBoundaries 描述行业和类目特有的语义风险。
-默认规则环境是抖音带货直播间，同时遵守广告法、平台营销宣传、价格促销、资质和商品信息真实性要求。不要编造商品功效、资质、成分或检测数据。`;
+优先遵守输入指定的平台规则，同时遵守广告法、平台营销宣传、价格促销、资质和商品信息真实性要求。不要编造商品功效、资质、成分或检测数据。`;
 
 type ProfileSeed = Omit<ProductComplianceProfile, 'platformRuleset' | 'confidence' | 'source' | 'status' | 'updatedAt'>;
 
@@ -38,14 +38,14 @@ function normalizeList(value: unknown, limit: number, fallback: string[]): strin
 export function localProductComplianceProfile(product: Product, now = Date.now()): ProductComplianceProfile {
   const source = [product.name, product.category, product.description, ...product.sellingPoints].join(' ');
   const seed = PROFILES.find((candidate) => candidate.pattern.test(source))?.value ?? { ...GENERIC, category: product.category && product.category !== '其他' ? product.category : GENERIC.category };
-  return { ...seed, platformRuleset: 'douyin-ecommerce-live', confidence: 0.68, source: 'local-fallback', status: 'needs_review', updatedAt: now };
+  return { ...seed, platformRuleset: product.complianceProfile?.platformRuleset ?? 'douyin-ecommerce-live', confidence: 0.68, source: 'local-fallback', status: 'needs_review', updatedAt: now };
 }
 
 function profileFromPayload(payload: Record<string, unknown>, fallback: ProductComplianceProfile): ProductComplianceProfile {
   const text = (value: unknown, backup: string, maximum: number) => typeof value === 'string' && value.trim() ? value.trim().slice(0, maximum) : backup;
   const confidence = typeof payload.confidence === 'number' ? Math.max(0, Math.min(1, payload.confidence)) : 0.85;
   return {
-    industry: text(payload.industry, fallback.industry, 80), category: text(payload.category, fallback.category, 80), platformRuleset: 'douyin-ecommerce-live',
+    industry: text(payload.industry, fallback.industry, 80), category: text(payload.category, fallback.category, 80), platformRuleset: fallback.platformRuleset,
     complianceSummary: text(payload.complianceSummary, fallback.complianceSummary, 500),
     riskKeywords: normalizeList(payload.riskKeywords, 20, fallback.riskKeywords), riskBoundaries: normalizeList(payload.riskBoundaries, 20, fallback.riskBoundaries),
     requiredDisclosures: normalizeList(payload.requiredDisclosures, 20, fallback.requiredDisclosures), safeSellingPoints: normalizeList(payload.safeSellingPoints, 20, fallback.safeSellingPoints),
@@ -61,7 +61,9 @@ export class DoubaoProductComplianceProfiler implements ProductComplianceProfile
     if (!this.config) return fallback;
     try {
       const source = { name: product.name, currentCategory: product.category, description: product.description, sellingPoints: product.sellingPoints, sourceText: product.sourceText?.slice(0, 2_000) };
-      const content = await requestArk(this.config, SYSTEM_PROMPT, `默认平台规则：抖音带货直播间\n商品资料：${JSON.stringify(source)}`, 700);
+      const platform = product.complianceProfile?.platformRuleset === 'pinduoduo-ecommerce-live' ? '拼多多带货直播间' : '抖音带货直播间';
+      const defaultHint = platform === '抖音带货直播间' ? '；默认平台规则：抖音带货直播间' : '';
+      const content = await requestArk(this.config, SYSTEM_PROMPT, `指定平台规则：${platform}${defaultHint}\n商品资料：${JSON.stringify(source)}`, 700);
       return profileFromPayload(parseArkJson(content), fallback);
     } catch { return fallback; }
   }

@@ -272,6 +272,8 @@ CREATE TABLE IF NOT EXISTS resource_delivery_jobs (
   resource_version INTEGER NOT NULL,
   target TEXT NOT NULL DEFAULT 'merchant_database',
   approval_status TEXT NOT NULL DEFAULT 'awaiting_approval',
+  approved_by TEXT,
+  approved_at INTEGER,
   idempotency_key TEXT NOT NULL UNIQUE,
   payload_json TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -343,9 +345,23 @@ export class SqliteFactStore {
     this.db.exec("UPDATE live_sessions SET risk_profile = 'strict' WHERE lifecycle <> 'ended' AND risk_profile <> 'strict'");
     const findingColumns = this.db.prepare('PRAGMA table_info(compliance_findings)').all().map((row) => stringValue(row.name));
     if (!findingColumns.includes('product_json')) this.db.exec('ALTER TABLE compliance_findings ADD COLUMN product_json TEXT');
-    const deliveryColumns = this.db.prepare('PRAGMA table_info(resource_delivery_jobs)').all().map((row) => stringValue(row.name));
+    const deliveryInfo = this.db.prepare('PRAGMA table_info(resource_delivery_jobs)').all();
+    const deliveryColumns = deliveryInfo.map((row) => stringValue(row.name));
     if (!deliveryColumns.includes('target')) this.db.exec("ALTER TABLE resource_delivery_jobs ADD COLUMN target TEXT NOT NULL DEFAULT 'merchant_database'");
-    if (!deliveryColumns.includes('approval_status')) this.db.exec("ALTER TABLE resource_delivery_jobs ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'approved'");
+    if (!deliveryColumns.includes('approval_status')) {
+      // Jobs written by pre-manual-sync versions must never bypass the new
+      // approval gate after a restart or schema migration.
+      this.db.exec("ALTER TABLE resource_delivery_jobs ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'awaiting_approval'");
+      this.db.exec("UPDATE resource_delivery_jobs SET approval_status = 'awaiting_approval' WHERE approval_status = 'approved'");
+    } else if (deliveryInfo.some((row) => stringValue(row.name) === 'approval_status' && /approved/u.test(stringValue(row.dflt_value)))) {
+      // A short-lived v0.3 migration added this column with an approved
+      // default. Treat those persisted rows as legacy, even if the column
+      // already exists.
+      this.db.exec("UPDATE resource_delivery_jobs SET approval_status = 'awaiting_approval' WHERE approval_status = 'approved'");
+    }
+    const deliveryColumnsAfterApproval = this.db.prepare('PRAGMA table_info(resource_delivery_jobs)').all().map((row) => stringValue(row.name));
+    if (!deliveryColumnsAfterApproval.includes('approved_by')) this.db.exec('ALTER TABLE resource_delivery_jobs ADD COLUMN approved_by TEXT');
+    if (!deliveryColumnsAfterApproval.includes('approved_at')) this.db.exec('ALTER TABLE resource_delivery_jobs ADD COLUMN approved_at INTEGER');
     this.getSessionStatement = this.db.prepare('SELECT * FROM live_sessions WHERE id = ?');
   }
 
@@ -909,7 +925,9 @@ export class SqliteFactStore {
     return rows.map((row) => ({
       id: stringValue(row.id), resourceType: stringValue(row.resource_type) as ResourceDeliveryType, resourceId: stringValue(row.resource_id), resourceVersion: numberValue(row.resource_version),
       target: stringValue(row.target, 'merchant_database') as SyncTarget,
-      approvalStatus: stringValue(row.approval_status, 'approved') as 'awaiting_approval' | 'approved',
+      approvalStatus: stringValue(row.approval_status, 'awaiting_approval') as 'awaiting_approval' | 'approved',
+      ...(typeof row.approved_by === 'string' ? { approvedBy: row.approved_by } : {}),
+      ...(typeof row.approved_at === 'number' ? { approvedAt: row.approved_at } : {}),
       status: stringValue(row.status, 'queued') as DeliveryStatus, idempotencyKey: stringValue(row.idempotency_key), payload: parseJson<unknown>(row.payload_json, null),
       attemptCount: numberValue(row.attempt_count), lastError: row.last_error === null || row.last_error === undefined ? null : stringValue(row.last_error), createdAt: numberValue(row.created_at), updatedAt: numberValue(row.updated_at),
     }));
@@ -924,7 +942,7 @@ export class SqliteFactStore {
       for (const target of [...new Set(input.targets)]) {
         const idempotencyKey = `${input.resourceType}:${input.resourceId}:${input.resourceVersion}:${target}`;
         this.db.prepare("UPDATE resource_delivery_jobs SET status = 'superseded', updated_at = ? WHERE resource_type = ? AND resource_id = ? AND resource_version < ? AND target = ? AND status IN ('queued', 'uploading', 'failed')").run(now, input.resourceType, input.resourceId, input.resourceVersion, target);
-        this.db.prepare('INSERT INTO resource_delivery_jobs (id, resource_type, resource_id, resource_version, target, approval_status, idempotency_key, payload_json, status, attempt_count, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?) ON CONFLICT(idempotency_key) DO NOTHING').run(`resource-delivery-${randomUUID()}`, input.resourceType, input.resourceId, input.resourceVersion, target, 'approved', idempotencyKey, json(input.payload), 'queued', now, now);
+        this.db.prepare('INSERT INTO resource_delivery_jobs (id, resource_type, resource_id, resource_version, target, approval_status, approved_by, approved_at, idempotency_key, payload_json, status, attempt_count, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?) ON CONFLICT(idempotency_key) DO NOTHING').run(`resource-delivery-${randomUUID()}`, input.resourceType, input.resourceId, input.resourceVersion, target, 'approved', input.actorId, now, idempotencyKey, json(input.payload), 'queued', now, now);
         jobs.push(this.listResourceDeliveryJobs().find((job) => job.idempotencyKey === idempotencyKey)!);
       }
       this.db.exec('COMMIT');

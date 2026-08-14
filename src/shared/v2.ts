@@ -139,6 +139,8 @@ export type ResourceDeliveryJob = {
   resourceVersion: number;
   target?: SyncTarget;
   approvalStatus?: 'awaiting_approval' | 'approved';
+  approvedBy?: string;
+  approvedAt?: number;
   status: DeliveryStatus;
   idempotencyKey: string;
   payload: unknown;

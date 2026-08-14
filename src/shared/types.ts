@@ -370,7 +370,12 @@ export type RuleUnit = {
   matchedTerms?: string[];
   status: RuleUnitStatus;
   enabled: boolean;
-  source: 'built_in' | 'document' | 'doubao' | 'manual';
+  source: 'built_in' | 'document' | 'doubao' | 'manual' | 'synced';
+  publicStatus?: PublicRuleStatus;
+  publicSubmittedBy?: string;
+  publicSubmittedAt?: number;
+  publicReviewedBy?: string;
+  publicReviewedAt?: number;
   createdAt: number;
   updatedAt: number;
 };

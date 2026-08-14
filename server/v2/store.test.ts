@@ -84,6 +84,43 @@ describe('SqliteFactStore', () => {
     expect(second.getSessionSnapshot('session-reopen')?.lifecycle).toBe('live');
   });
 
+  it('moves pre-manual-sync resource jobs into approval-required state during migration', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-delivery-migration-'));
+    const filename = join(directory, 'app.sqlite');
+    const legacy = new DatabaseSync(filename);
+    legacy.exec(`CREATE TABLE resource_delivery_jobs (
+      id TEXT PRIMARY KEY, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL,
+      resource_version INTEGER NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
+      payload_json TEXT NOT NULL, status TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    )`);
+    legacy.prepare('INSERT INTO resource_delivery_jobs (id, resource_type, resource_id, resource_version, idempotency_key, payload_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run('legacy-job', 'rule', 'legacy-rule', 1, 'rule:legacy-rule:1:merchant_database', '{}', 'queued', 1, 1);
+    legacy.close();
+    const store = new SqliteFactStore({ filename });
+    stores.push(store);
+    expect(store.listResourceDeliveryJobs('queued')).toMatchObject([{ approvalStatus: 'awaiting_approval', target: 'merchant_database' }]);
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it('demotes jobs from the short-lived approved-default migration', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dypro-delivery-approval-default-'));
+    const filename = join(directory, 'app.sqlite');
+    const legacy = new DatabaseSync(filename);
+    legacy.exec(`CREATE TABLE resource_delivery_jobs (
+      id TEXT PRIMARY KEY, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL,
+      resource_version INTEGER NOT NULL, target TEXT NOT NULL DEFAULT 'merchant_database',
+      approval_status TEXT NOT NULL DEFAULT 'approved', idempotency_key TEXT NOT NULL UNIQUE,
+      payload_json TEXT NOT NULL, status TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    )`);
+    legacy.prepare('INSERT INTO resource_delivery_jobs (id, resource_type, resource_id, resource_version, idempotency_key, payload_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run('approved-default-job', 'rule', 'legacy-rule', 1, 'rule:legacy-rule:1:merchant_database', '{}', 'queued', 1, 1);
+    legacy.close();
+    const store = new SqliteFactStore({ filename });
+    stores.push(store);
+    expect(store.listResourceDeliveryJobs('queued')[0]?.approvalStatus).toBe('awaiting_approval');
+    rmSync(directory, { recursive: true, force: true });
+  });
+
   it('reuses an active presenter link and resolves it to the original session', () => {
     const store = new SqliteFactStore({ filename: ':memory:' });
     stores.push(store);

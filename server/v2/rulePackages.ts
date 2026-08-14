@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { ComplianceRule, Product, RuleDocument, RulePackage, RuleReview, RuleUnit, RuleUnitKind, RiskLevel } from '../../src/shared/types';
+import type { ComplianceRule, Product, PublicRuleStatus, RuleDocument, RulePackage, RuleReview, RuleUnit, RuleUnitKind, RiskLevel } from '../../src/shared/types';
 import { SqliteFactStore } from './store';
 
 const layerWeight: Record<RulePackage['layer'], number> = { legal: 5, platform: 4, industry: 3, room: 2, product: 1 };
@@ -37,6 +37,7 @@ export class RulePackageRegistry {
 
   listPackages(status?: RulePackage['status']): RulePackage[] { return this.store.listRulePackages(status); }
   listUnits(status?: RuleUnit['status']): RuleUnit[] { return this.store.listRuleUnits(status); }
+  listPublicCandidates(): RuleUnit[] { return this.store.listRuleUnits().filter((unit) => unit.publicStatus === 'pending'); }
   listUnitsForRoom(roomId: string, status?: RuleUnit['status']): RuleUnit[] {
     const packageIds = new Set(this.store.listRulePackages().filter((pkg) => pkg.roomId === roomId).map((pkg) => pkg.id));
     return this.store.listRuleUnits(status).filter((unit) => packageIds.has(unit.packageId));
@@ -75,6 +76,10 @@ export class RulePackageRegistry {
   }
 
   createPackage(actorId: string, draft: RulePackageDraft): RulePackage {
+    if (draft.layer === 'platform' && !draft.platform) throw new Error('平台规则包必须指定平台');
+    if (draft.layer === 'industry' && !draft.industry?.trim()) throw new Error('行业规则包必须指定行业');
+    if (draft.layer === 'room' && !draft.roomId) throw new Error('直播间规则包必须指定直播间');
+    if (draft.layer === 'product' && (!draft.roomId || !draft.productId)) throw new Error('商品规则包必须同时指定直播间和商品');
     const now = this.now();
     const pkg: RulePackage = { id: `rule-package-${randomUUID()}`, ...draft, version: 1, status: draft.layer === 'legal' && draft.immutable ? 'active' : 'pending_review', enabled: draft.layer === 'legal' && draft.immutable === true, immutable: draft.immutable, createdBy: actorId, createdAt: now, updatedAt: now };
     return this.store.saveRulePackage(pkg);
@@ -85,7 +90,7 @@ export class RulePackageRegistry {
     if (!pkg) throw new Error('规则包不存在');
     if (pkg.immutable) throw new Error('内置法律基线不可编辑');
     const now = this.now();
-    const unit: RuleUnit = { id: `rule-unit-${randomUUID()}`, packageId, version: 1, kind: draft.kind, pattern: draft.pattern?.trim() || undefined, instruction: draft.instruction?.trim() || undefined, contextWindow: draft.contextWindow?.trim() || undefined, title: draft.title.trim(), reason: draft.reason.trim(), alternative: draft.alternative.trim(), policyRef: draft.policyRef.trim(), risk: draft.risk, confidence: draft.confidence ?? 1, evidenceText: draft.evidenceText?.trim() || undefined, matchedTerms: draft.matchedTerms, status: 'pending_review', enabled: false, source: draft.source ?? 'manual', createdAt: now, updatedAt: now };
+    const unit: RuleUnit = { id: `rule-unit-${randomUUID()}`, packageId, version: 1, kind: draft.kind, pattern: draft.pattern?.trim() || undefined, instruction: draft.instruction?.trim() || undefined, contextWindow: draft.contextWindow?.trim() || undefined, title: draft.title.trim(), reason: draft.reason.trim(), alternative: draft.alternative.trim(), policyRef: draft.policyRef.trim(), risk: draft.risk, confidence: draft.confidence ?? 1, evidenceText: draft.evidenceText?.trim() || undefined, matchedTerms: draft.matchedTerms, status: 'pending_review', enabled: false, source: draft.source ?? 'manual', publicStatus: 'not_submitted', createdAt: now, updatedAt: now };
     if (!unit.title || (!unit.pattern && !unit.instruction)) throw new Error('规则单元必须包含匹配内容或语义指令');
     return this.store.saveRuleUnit(unit);
   }
@@ -130,10 +135,70 @@ export class RulePackageRegistry {
     return next;
   }
 
+  submitPublicUnit(unitId: string, actorId: string): RuleUnit {
+    const current = this.store.getRuleUnit(unitId);
+    if (!current) throw new Error('规则单元不存在');
+    const pkg = this.store.getRulePackage(current.packageId);
+    if (!pkg) throw new Error('规则包不存在');
+    if (!pkg.roomId) throw new Error('只有商家直播间规则单元可以提交公共审核');
+    if (!current.enabled || current.status !== 'active') throw new Error('只有已激活的本地规则单元才能提交运营审核');
+    if (current.publicStatus === 'pending' || current.publicStatus === 'adopted') return current;
+    const now = this.now();
+    const next: RuleUnit = { ...current, publicStatus: 'pending', publicSubmittedBy: actorId, publicSubmittedAt: now, publicReviewedBy: undefined, publicReviewedAt: undefined, version: current.version + 1, updatedAt: now };
+    this.store.saveRuleUnit(next);
+    this.store.saveRuleReview({ id: `rule-review-${randomUUID()}`, resourceType: 'public_rule', resourceId: unitId, decision: 'deferred', actorId, note: '提交公共运营审核', createdAt: now });
+    return next;
+  }
+
+  reviewPublicUnit(unitId: string, actorId: string, decision: Exclude<PublicRuleStatus, 'not_submitted' | 'pending'>, note?: string): RuleUnit {
+    const current = this.store.getRuleUnit(unitId);
+    if (!current) throw new Error('规则单元不存在');
+    if (current.publicStatus !== 'pending') throw new Error('规则单元当前不在运营审核队列');
+    const pkg = this.store.getRulePackage(current.packageId);
+    if (!pkg) throw new Error('规则包不存在');
+    const now = this.now();
+    const reviewed: RuleUnit = { ...current, publicStatus: decision, publicReviewedBy: actorId, publicReviewedAt: now, version: current.version + 1, updatedAt: now };
+    this.store.saveRuleUnit(reviewed);
+    this.store.saveRuleReview({ id: `rule-review-${randomUUID()}`, resourceType: 'public_rule', resourceId: unitId, decision: decision === 'adopted' ? 'approved' : decision, actorId, note, createdAt: now });
+    if (decision === 'adopted') this.publishPublicUnit(pkg, reviewed, actorId, now);
+    return reviewed;
+  }
+
+  private publishPublicUnit(sourcePackage: RulePackage, unit: RuleUnit, actorId: string, now: number): void {
+    const layer: RulePackage['layer'] = sourcePackage.platform && sourcePackage.platform !== 'general'
+      ? 'platform'
+      : sourcePackage.industry
+        ? 'industry'
+        : 'legal';
+    const publicPackageId = `public-package-${sourcePackage.id}`;
+    const existingPackage = this.store.getRulePackage(publicPackageId);
+    const publicPackage: RulePackage = {
+      id: publicPackageId,
+      tenantId: sourcePackage.tenantId,
+      layer,
+      name: `公共规则包：${sourcePackage.name}`,
+      ...(sourcePackage.platform ? { platform: sourcePackage.platform } : {}),
+      ...(sourcePackage.industry ? { industry: sourcePackage.industry } : {}),
+      documentId: sourcePackage.documentId,
+      documentVersion: sourcePackage.documentVersion,
+      version: (existingPackage?.version ?? 0) + 1,
+      status: 'active',
+      enabled: true,
+      immutable: false,
+      createdBy: existingPackage?.createdBy ?? actorId,
+      approvedBy: actorId,
+      createdAt: existingPackage?.createdAt ?? now,
+      updatedAt: now,
+    };
+    this.store.saveRulePackage(publicPackage);
+    const publicUnit: RuleUnit = { ...unit, id: `public-unit-${unit.id}`, packageId: publicPackageId, version: 1, status: 'active', enabled: true, source: 'synced', publicStatus: 'adopted', publicSubmittedBy: undefined, publicSubmittedAt: undefined, publicReviewedBy: actorId, publicReviewedAt: now, createdAt: existingPackage?.createdAt ?? now, updatedAt: now };
+    this.store.saveRuleUnit(publicUnit);
+  }
+
   activeUnits(input: { roomId: string; product?: Product; platform?: RulePackage['platform']; industry?: string }): RuleUnit[] {
     const packages = this.store.listRulePackages('active').filter((pkg) => {
       if (!pkg.enabled) return false;
-      if (pkg.platform && pkg.platform !== input.platform) return false;
+      if (pkg.platform && pkg.platform !== 'general' && pkg.platform !== input.platform) return false;
       if (pkg.industry && pkg.industry !== input.industry) return false;
       if (pkg.layer === 'room' && pkg.roomId !== input.roomId) return false;
       if (pkg.layer === 'product' && pkg.productId !== input.product?.id) return false;
@@ -145,7 +210,7 @@ export class RulePackageRegistry {
 
   semanticInstructions(input: { roomId: string; product?: Product; platform?: RulePackage['platform']; industry?: string }): Array<{ title: string; instruction?: string; contextWindow?: string; risk: RiskLevel; policyRef: string }> {
     const packages = new Set(this.activeUnits(input).map((unit) => unit.packageId));
-    return this.store.listRuleUnits('active').filter((unit) => packages.has(unit.packageId) && unit.kind === 'context').map((unit) => ({ title: unit.title, instruction: unit.instruction, contextWindow: unit.contextWindow, risk: unit.risk, policyRef: unit.policyRef })).slice(0, 20);
+    return this.store.listRuleUnits('active').filter((unit) => packages.has(unit.packageId) && (unit.kind === 'sentence' || unit.kind === 'context')).map((unit) => ({ title: unit.title, instruction: unit.instruction, contextWindow: unit.contextWindow, risk: unit.risk, policyRef: unit.policyRef })).slice(0, 20);
   }
 
   asComplianceRules(input: { roomId: string; product?: Product; platform?: RulePackage['platform']; industry?: string }): ComplianceRule[] {
