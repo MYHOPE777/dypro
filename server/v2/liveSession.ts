@@ -34,6 +34,7 @@ export type LiveSessionOptions = {
   now?: () => number;
   endingDrainTimeoutMs?: number;
   rules?: (product: Product) => ComplianceRule[];
+  semanticRules?: (product: Product) => Array<{ title: string; instruction?: string; contextWindow?: string; risk: 'safe' | 'warning' | 'blocked'; policyRef: string }>;
   referencePhrases?: (presenterId: string, productId: string) => Array<{ text: string; purpose?: CoachPurpose }>;
   resolvePresenter?: (presenterId: string) => { id: string; name: string } | null;
   onComplianceResult?: (result: ComplianceResult, product: Product) => void;
@@ -73,6 +74,7 @@ export class LiveSession {
   private readonly segmentRevisions = new Map<string, number>();
   private readonly reviewPipeline: RealtimeReviewPipeline;
   private readonly rulesProvider: (product: Product) => ComplianceRule[];
+  private readonly semanticRulesProvider: LiveSessionOptions['semanticRules'];
   private readonly referencePhraseProvider: (presenterId: string, productId: string) => Array<{ text: string; purpose?: CoachPurpose }>;
   private readonly presenterResolver: (presenterId: string) => { id: string; name: string } | null;
   private readonly speakerDiarizer = new SpeakerDiarizer();
@@ -88,6 +90,7 @@ export class LiveSession {
     this.now = options.now ?? Date.now;
     this.endingDrainTimeoutMs = options.endingDrainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
     this.rulesProvider = options.rules ?? (() => []);
+    this.semanticRulesProvider = options.semanticRules;
     this.referencePhraseProvider = options.referencePhrases ?? (() => []);
     this.presenterResolver = options.resolvePresenter ?? ((presenterId) => presenterId === options.session.presenterId ? { id: presenterId, name: options.session.presenterName } : null);
     this.id = options.session.sessionId;
@@ -285,6 +288,7 @@ export class LiveSession {
       context: productContext,
       stats: this.snapshotValue.stats,
       customRules: this.rulesProvider(product),
+      semanticRules: this.semanticRulesProvider?.(product),
       referencePhrases: this.referencePhraseProvider(this.snapshotValue.presenterId, product.id),
     });
   }

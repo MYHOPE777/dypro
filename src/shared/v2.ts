@@ -6,6 +6,7 @@ import type {
   SessionStats,
   SpeakerLabel,
   TranscriptSegment,
+  SyncTarget,
 } from './types';
 import type { AudioTrack } from './v2Audio';
 
@@ -129,13 +130,15 @@ export type DeliveryJob = {
   updatedAt: number;
 };
 
-export type ResourceDeliveryType = 'rule' | 'presenter_phrase';
+export type ResourceDeliveryType = 'rule' | 'rule_unit' | 'presenter_phrase';
 
 export type ResourceDeliveryJob = {
   id: string;
   resourceType: ResourceDeliveryType;
   resourceId: string;
   resourceVersion: number;
+  target?: SyncTarget;
+  approvalStatus?: 'awaiting_approval' | 'approved';
   status: DeliveryStatus;
   idempotencyKey: string;
   payload: unknown;

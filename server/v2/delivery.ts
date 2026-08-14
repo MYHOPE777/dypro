@@ -1,9 +1,11 @@
 import type { ResourceDeliveryJob, SessionReview } from '../../src/shared/v2';
+import type { SyncTarget } from '../../src/shared/types';
 import { BoundedScheduler } from './scheduler';
 import { SqliteFactStore } from './store';
 
 export type DeliveryGateway = {
   readonly configured: boolean;
+  readonly targets?: SyncTarget[];
   deliver(review: SessionReview): Promise<void>;
   deliverResource?(job: ResourceDeliveryJob): Promise<void>;
 };
@@ -55,7 +57,10 @@ export class DurableDelivery {
       await this.scheduler.run('background', `resource:${job.resourceId}`, async () => {
         this.store.updateResourceDeliveryJob(job.idempotencyKey, 'uploading');
         try {
-          for (const gateway of gateways) await gateway.deliverResource!(job);
+          const target = job.target ?? 'merchant_database';
+          const targetGateways = gateways.filter((gateway) => !gateway.targets || gateway.targets.includes(target));
+          if (targetGateways.length === 0) throw new Error(`没有配置 ${target} 交付适配器`);
+          for (const gateway of targetGateways) await gateway.deliverResource!(job);
           const latest = this.store.listResourceDeliveryJobs().find((candidate) => candidate.idempotencyKey === job.idempotencyKey);
           this.store.updateResourceDeliveryJob(job.idempotencyKey, latest?.status === 'superseded' ? 'superseded' : 'synced');
         } catch (error) {

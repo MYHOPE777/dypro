@@ -16,6 +16,7 @@ import { DurableDelivery, deliveryGatewaysFromEnv } from './delivery';
 import { AuthorizationModule } from './authorization';
 import { RuleModule } from './rules';
 import { PresenterModule } from './presenters';
+import { RulePackageRegistry } from './rulePackages';
 
 export type LiveSessionPort = Pick<LiveSession, 'dispatch' | 'snapshot' | 'subscribe'> & { readonly id: string };
 
@@ -26,6 +27,7 @@ export type V2Runtime = {
   readonly delivery: DurableDelivery;
   readonly authorization: AuthorizationModule;
   readonly rules: RuleModule;
+  readonly rulePackages: RulePackageRegistry;
   readonly presenters: PresenterModule;
   getOrCreateSession(input?: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string }): LiveSessionPort;
   getOrCreateOperatorSession(input?: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string }): LiveSessionPort;
@@ -60,6 +62,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
   const delivery = new DurableDelivery(store, scheduler, deliveryGatewaysFromEnv(env));
   const authorization = new AuthorizationModule(env);
   const rules = new RuleModule(store);
+  const rulePackages = new RulePackageRegistry(store);
   const presenters = new PresenterModule(store);
   const productProfiler = options.productProfiler ?? new DoubaoProductComplianceProfiler(env);
   const deliveryTimer = setInterval(() => { void delivery.flushOnce(); }, 5_000);
@@ -133,7 +136,8 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
       store, scheduler, products: () => store.listProducts(tenantId, targetRoom), capture,
       analyzer: createDoubaoAnalyzer(env),
       coach: createDoubaoCoach(env),
-      rules: (product) => rules.active(targetRoom, product),
+      rules: (product) => [...rules.active(targetRoom, product), ...rulePackages.asComplianceRules({ roomId: targetRoom, product, platform: product.complianceProfile?.platformRuleset, industry: product.complianceProfile?.industry })],
+      semanticRules: (product) => rulePackages.semanticInstructions({ roomId: targetRoom, product, platform: product.complianceProfile?.platformRuleset, industry: product.complianceProfile?.industry }),
       referencePhrases: (activePresenterId, productId) => presenters.references(activePresenterId, productId).slice(0, 10).map((phrase) => ({ text: phrase.text, purpose: phrase.purpose })),
       resolvePresenter: (activePresenterId) => {
         const candidate = presenters.get(activePresenterId);
@@ -201,7 +205,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
   };
 
   return {
-    store, scheduler, review, delivery, authorization, rules, presenters,
+    store, scheduler, review, delivery, authorization, rules, rulePackages, presenters,
     getOrCreateSession,
     getOrCreateOperatorSession,
     getSession: (sessionId) => sessions.get(sessionId) ?? (store.getSessionSnapshot(sessionId) ? getOrCreateSession({ sessionId }) : null),

@@ -21,8 +21,10 @@ describe('SQLite catalog modules', () => {
     rules.learn('room-default', 'session-2', { ...finding, confidence: 0.99 }, DEFAULT_PRODUCT);
     // Approval creates a new published version before later evidence is merged.
     expect(rules.list('room-default')[0]).toMatchObject({ version: 3, evidenceCount: 2, lastSessionId: 'session-2' });
+    expect(store.listResourceDeliveryJobs('queued')).toHaveLength(0);
+    expect(store.listResourceDeliveryJobs('superseded')).toHaveLength(0);
+    store.createManualSyncJobs({ resourceType: 'rule', resourceId: rules.list('room-default')[0]!.id, resourceVersion: 3, payload: rules.list('room-default')[0], targets: ['merchant_database'], actorId: 'owner' });
     expect(store.listResourceDeliveryJobs('queued')).toHaveLength(1);
-    expect(store.listResourceDeliveryJobs('superseded')).toHaveLength(2);
     rules.learn('room-default', 'session-3', { ...finding, confidence: 0.7, matchedTerms: ['低置信词'] }, DEFAULT_PRODUCT);
     expect(rules.list('room-default')).toHaveLength(1);
     rules.learn('room-default', 'session-4', { ...finding, source: 'local-fallback', confidence: 0.99, matchedTerms: ['内置风险词'] }, DEFAULT_PRODUCT);

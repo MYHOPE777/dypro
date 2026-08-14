@@ -1,5 +1,7 @@
 # 开发、发布与回滚手册
 
+规则库和话术库的本地优先、人工同步、文档审核与回滚约定见 [RULE_GOVERNANCE.md](./RULE_GOVERNANCE.md)。每次可交付改动必须追加 [CHANGELOG.md](./CHANGELOG.md)，并通过 `npm test`、`npm run build` 后再提交版本。
+
 本文是 dypro 的固定开发流程。每次功能更新或 Bug 修复都必须留下可验证、可回滚、可追踪的记录。
 
 ## 1. 代码结构

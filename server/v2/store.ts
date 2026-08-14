@@ -1,8 +1,8 @@
 import { mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import type { ComplianceFinding, ComplianceFindingDisposition, ComplianceResult, ComplianceRule, CoachSuggestion, LiveRoom, PresenterPhrase, PresenterProfile, Product, RiskProfile, RuleAuditEntry, SessionStats, SpeechCorrectionEntry, TranscriptSegment } from '../../src/shared/types';
+import type { ComplianceFinding, ComplianceFindingDisposition, ComplianceResult, ComplianceRule, CoachSuggestion, LiveRoom, ManualSyncJob, PhraseMetric, PresenterPhrase, PresenterProfile, Product, RiskProfile, RuleAuditEntry, RuleDocument, RuleDocumentSource, RuleDocumentVersion, RulePackage, RuleReview, RuleUnit, SessionStats, SpeechCorrectionEntry, SyncTarget, TranscriptSegment } from '../../src/shared/types';
 import type { DeliveryJob, DeliveryStatus, LiveEvent, LiveEventType, LiveSessionSnapshot, LiveLifecycle, ResourceDeliveryJob, ResourceDeliveryType, ReviewApproval, ReviewTranscript, SessionReview, SessionSummary } from '../../src/shared/v2';
 
 export type SessionCreation = {
@@ -73,6 +73,49 @@ CREATE TABLE IF NOT EXISTS presenter_phrases (
   version INTEGER NOT NULL,
   status TEXT NOT NULL,
   updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS phrase_metrics (
+  id TEXT PRIMARY KEY,
+  phrase_id TEXT NOT NULL,
+  session_id TEXT,
+  metric_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rule_documents (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT,
+  document_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rule_document_versions (
+  id TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  version_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(document_id, version)
+);
+CREATE TABLE IF NOT EXISTS rule_packages (
+  id TEXT PRIMARY KEY,
+  package_json TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rule_units (
+  id TEXT PRIMARY KEY,
+  package_id TEXT NOT NULL,
+  unit_json TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rule_reviews (
+  id TEXT PRIMARY KEY,
+  resource_type TEXT NOT NULL,
+  resource_id TEXT NOT NULL,
+  review_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS compliance_rules (
   id TEXT PRIMARY KEY,
@@ -227,6 +270,8 @@ CREATE TABLE IF NOT EXISTS resource_delivery_jobs (
   resource_type TEXT NOT NULL,
   resource_id TEXT NOT NULL,
   resource_version INTEGER NOT NULL,
+  target TEXT NOT NULL DEFAULT 'merchant_database',
+  approval_status TEXT NOT NULL DEFAULT 'awaiting_approval',
   idempotency_key TEXT NOT NULL UNIQUE,
   payload_json TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -298,6 +343,9 @@ export class SqliteFactStore {
     this.db.exec("UPDATE live_sessions SET risk_profile = 'strict' WHERE lifecycle <> 'ended' AND risk_profile <> 'strict'");
     const findingColumns = this.db.prepare('PRAGMA table_info(compliance_findings)').all().map((row) => stringValue(row.name));
     if (!findingColumns.includes('product_json')) this.db.exec('ALTER TABLE compliance_findings ADD COLUMN product_json TEXT');
+    const deliveryColumns = this.db.prepare('PRAGMA table_info(resource_delivery_jobs)').all().map((row) => stringValue(row.name));
+    if (!deliveryColumns.includes('target')) this.db.exec("ALTER TABLE resource_delivery_jobs ADD COLUMN target TEXT NOT NULL DEFAULT 'merchant_database'");
+    if (!deliveryColumns.includes('approval_status')) this.db.exec("ALTER TABLE resource_delivery_jobs ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'approved'");
     this.getSessionStatement = this.db.prepare('SELECT * FROM live_sessions WHERE id = ?');
   }
 
@@ -375,13 +423,8 @@ export class SqliteFactStore {
   }
 
   savePhrase(phrase: PresenterPhrase): PresenterPhrase {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      this.db.prepare('INSERT INTO presenter_phrases (id, room_id, presenter_id, phrase_json, version, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET phrase_json=excluded.phrase_json, version=excluded.version, status=excluded.status, updated_at=excluded.updated_at').run(phrase.id, phrase.roomId, phrase.presenterId, json(phrase), phrase.version, phrase.status, phrase.updatedAt);
-      this.enqueueResourceDeliveryInside('presenter_phrase', phrase.id, phrase.version, phrase, phrase.updatedAt);
-      this.db.exec('COMMIT');
-      return phrase;
-    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    this.db.prepare('INSERT INTO presenter_phrases (id, room_id, presenter_id, phrase_json, version, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET phrase_json=excluded.phrase_json, version=excluded.version, status=excluded.status, updated_at=excluded.updated_at').run(phrase.id, phrase.roomId, phrase.presenterId, json(phrase), phrase.version, phrase.status, phrase.updatedAt);
+    return phrase;
   }
 
   getPhrase(phraseId: string): PresenterPhrase | null {
@@ -394,6 +437,95 @@ export class SqliteFactStore {
     return rows.map((row) => parseJson<PresenterPhrase>(row.phrase_json, {} as PresenterPhrase)).filter((phrase) => !productId || phrase.productId === null || phrase.productId === productId);
   }
 
+  savePhraseMetric(metric: PhraseMetric): PhraseMetric {
+    this.db.prepare('INSERT INTO phrase_metrics (id, phrase_id, session_id, metric_json, created_at) VALUES (?, ?, ?, ?, ?)').run(metric.id, metric.phraseId, metric.sessionId ?? null, json(metric), metric.createdAt);
+    return metric;
+  }
+
+  listPhraseMetrics(phraseId: string): PhraseMetric[] {
+    return this.db.prepare('SELECT metric_json FROM phrase_metrics WHERE phrase_id = ? ORDER BY created_at DESC').all(phraseId).map((row) => parseJson<PhraseMetric>(row.metric_json, {} as PhraseMetric));
+  }
+
+  saveRuleDocument(document: RuleDocument, version: RuleDocumentVersion): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('INSERT INTO rule_documents (id, tenant_id, document_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET document_json=excluded.document_json, updated_at=excluded.updated_at').run(document.id, document.tenantId ?? null, json(document), document.updatedAt);
+      this.db.prepare('INSERT INTO rule_document_versions (id, document_id, version, version_json, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(document_id, version) DO UPDATE SET version_json=excluded.version_json').run(version.id, document.id, version.version, json(version), version.createdAt);
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  getRuleDocument(documentId: string): RuleDocument | null {
+    const row = this.db.prepare('SELECT document_json FROM rule_documents WHERE id = ?').get(documentId);
+    return row ? parseJson<RuleDocument>(row.document_json, {} as RuleDocument) : null;
+  }
+
+  listRuleDocuments(status?: RuleDocument['status']): RuleDocument[] {
+    const rows = status ? this.db.prepare('SELECT document_json FROM rule_documents WHERE json_extract(document_json, \'$.status\') = ? ORDER BY updated_at DESC').all(status) : this.db.prepare('SELECT document_json FROM rule_documents ORDER BY updated_at DESC').all();
+    return rows.map((row) => parseJson<RuleDocument>(row.document_json, {} as RuleDocument));
+  }
+
+  listRuleDocumentVersions(documentId: string): RuleDocumentVersion[] {
+    return this.db.prepare('SELECT version_json FROM rule_document_versions WHERE document_id = ? ORDER BY version DESC').all(documentId).map((row) => parseJson<RuleDocumentVersion>(row.version_json, {} as RuleDocumentVersion));
+  }
+
+  saveRulePackage(pkg: RulePackage): RulePackage {
+    this.db.prepare('INSERT INTO rule_packages (id, package_json, version, enabled, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET package_json=excluded.package_json, version=excluded.version, enabled=excluded.enabled, updated_at=excluded.updated_at').run(pkg.id, json(pkg), pkg.version, pkg.enabled ? 1 : 0, pkg.updatedAt);
+    return pkg;
+  }
+
+  getRulePackage(packageId: string): RulePackage | null {
+    const row = this.db.prepare('SELECT package_json FROM rule_packages WHERE id = ?').get(packageId);
+    return row ? parseJson<RulePackage>(row.package_json, {} as RulePackage) : null;
+  }
+
+  listRulePackages(status?: RulePackage['status']): RulePackage[] {
+    const rows = status ? this.db.prepare('SELECT package_json FROM rule_packages WHERE json_extract(package_json, \'$.status\') = ? ORDER BY updated_at DESC').all(status) : this.db.prepare('SELECT package_json FROM rule_packages ORDER BY updated_at DESC').all();
+    return rows.map((row) => parseJson<RulePackage>(row.package_json, {} as RulePackage));
+  }
+
+  createRuleDocumentVersion(input: Omit<RuleDocument, 'latestVersion' | 'status' | 'createdAt' | 'updatedAt' | 'source'> & { content: string; source?: RuleDocumentSource; now?: number }): { document: RuleDocument; version: RuleDocumentVersion } {
+    const now = input.now ?? Date.now();
+    const current = this.getRuleDocument(input.id);
+    const previous = current ? this.listRuleDocumentVersions(input.id)[0] : undefined;
+    const versionNumber = (current?.latestVersion ?? 0) + 1;
+    const contentHash = createHash('sha256').update(input.content).digest('hex');
+    const lines = input.content.split(/\r?\n/u);
+    const previousLines = previous?.content.split(/\r?\n/u) ?? [];
+    const added = Math.max(0, lines.length - previousLines.length);
+    const removed = Math.max(0, previousLines.length - lines.length);
+    const changed = previous ? lines.slice(0, Math.min(lines.length, previousLines.length)).filter((line, index) => line !== previousLines[index]).length : 0;
+    const document: RuleDocument = { id: input.id, tenantId: input.tenantId, platform: input.platform, industry: input.industry, title: input.title, publisher: input.publisher, source: input.source ?? 'upload', sourceUrl: input.sourceUrl, status: 'pending_review', latestVersion: versionNumber, createdAt: current?.createdAt ?? now, updatedAt: now };
+    const version: RuleDocumentVersion = { id: `rule-doc-version-${randomUUID()}`, documentId: input.id, version: versionNumber, content: input.content, contentHash, fetchedAt: now, diffSummary: { added, removed, changed }, changedSections: lines.filter((line, index) => previous && line !== previousLines[index]).slice(0, 20), createdAt: now };
+    this.saveRuleDocument(document, version);
+    return { document, version };
+  }
+
+  saveRuleUnit(unit: RuleUnit): RuleUnit {
+    this.db.prepare('INSERT INTO rule_units (id, package_id, unit_json, version, enabled, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET unit_json=excluded.unit_json, version=excluded.version, enabled=excluded.enabled, updated_at=excluded.updated_at').run(unit.id, unit.packageId, json(unit), unit.version, unit.enabled ? 1 : 0, unit.updatedAt);
+    return unit;
+  }
+
+  getRuleUnit(unitId: string): RuleUnit | null {
+    const row = this.db.prepare('SELECT unit_json FROM rule_units WHERE id = ?').get(unitId);
+    return row ? parseJson<RuleUnit>(row.unit_json, {} as RuleUnit) : null;
+  }
+
+  listRuleUnits(status?: RuleUnit['status']): RuleUnit[] {
+    const rows = status ? this.db.prepare('SELECT unit_json FROM rule_units WHERE json_extract(unit_json, \'$.status\') = ? ORDER BY updated_at DESC').all(status) : this.db.prepare('SELECT unit_json FROM rule_units ORDER BY updated_at DESC').all();
+    return rows.map((row) => parseJson<RuleUnit>(row.unit_json, {} as RuleUnit));
+  }
+
+  saveRuleReview(review: RuleReview): RuleReview {
+    this.db.prepare('INSERT INTO rule_reviews (id, resource_type, resource_id, review_json, created_at) VALUES (?, ?, ?, ?, ?)').run(review.id, review.resourceType, review.resourceId, json(review), review.createdAt);
+    return review;
+  }
+
+  listRuleReviews(resourceId?: string): RuleReview[] {
+    const rows = resourceId ? this.db.prepare('SELECT review_json FROM rule_reviews WHERE resource_id = ? ORDER BY created_at DESC').all(resourceId) : this.db.prepare('SELECT review_json FROM rule_reviews ORDER BY created_at DESC').all();
+    return rows.map((row) => parseJson<RuleReview>(row.review_json, {} as RuleReview));
+  }
+
   saveRule(rule: ComplianceRule, audit: { actorId: string; action: RuleAuditEntry['action']; details: Record<string, unknown>; occurredAt?: number }): ComplianceRule {
     const occurredAt = audit.occurredAt ?? Date.now();
     this.db.exec('BEGIN IMMEDIATE');
@@ -401,7 +533,6 @@ export class SqliteFactStore {
       this.db.prepare('INSERT INTO compliance_rules (id, tenant_id, room_id, rule_json, version, enabled, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET rule_json=excluded.rule_json, version=excluded.version, enabled=excluded.enabled, updated_at=excluded.updated_at').run(rule.id, 'tenant-local', rule.roomId, json(rule), rule.version, rule.enabled ? 1 : 0, rule.updatedAt);
       this.db.prepare('INSERT INTO rule_versions (rule_id, version, rule_json, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(rule_id, version) DO UPDATE SET rule_json=excluded.rule_json').run(rule.id, rule.version, json(rule), occurredAt);
       this.db.prepare('INSERT INTO rule_audits (id, rule_id, actor_id, action, details_json, occurred_at) VALUES (?, ?, ?, ?, ?, ?)').run(`audit-${randomUUID()}`, rule.id, audit.actorId, audit.action, json(audit.details), occurredAt);
-      this.enqueueResourceDeliveryInside('rule', rule.id, rule.version, rule, occurredAt);
       this.db.exec('COMMIT');
       return rule;
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
@@ -777,9 +908,33 @@ export class SqliteFactStore {
       : this.db.prepare('SELECT * FROM resource_delivery_jobs ORDER BY created_at, id').all();
     return rows.map((row) => ({
       id: stringValue(row.id), resourceType: stringValue(row.resource_type) as ResourceDeliveryType, resourceId: stringValue(row.resource_id), resourceVersion: numberValue(row.resource_version),
+      target: stringValue(row.target, 'merchant_database') as SyncTarget,
+      approvalStatus: stringValue(row.approval_status, 'approved') as 'awaiting_approval' | 'approved',
       status: stringValue(row.status, 'queued') as DeliveryStatus, idempotencyKey: stringValue(row.idempotency_key), payload: parseJson<unknown>(row.payload_json, null),
       attemptCount: numberValue(row.attempt_count), lastError: row.last_error === null || row.last_error === undefined ? null : stringValue(row.last_error), createdAt: numberValue(row.created_at), updatedAt: numberValue(row.updated_at),
     }));
+  }
+
+  createManualSyncJobs(input: { resourceType: ResourceDeliveryType; resourceId: string; resourceVersion: number; payload: unknown; targets: Exclude<SyncTarget, 'local'>[]; actorId: string; now?: number }): ResourceDeliveryJob[] {
+    if (!input.targets.length) return [];
+    const now = input.now ?? Date.now();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const jobs: ResourceDeliveryJob[] = [];
+      for (const target of [...new Set(input.targets)]) {
+        const idempotencyKey = `${input.resourceType}:${input.resourceId}:${input.resourceVersion}:${target}`;
+        this.db.prepare("UPDATE resource_delivery_jobs SET status = 'superseded', updated_at = ? WHERE resource_type = ? AND resource_id = ? AND resource_version < ? AND target = ? AND status IN ('queued', 'uploading', 'failed')").run(now, input.resourceType, input.resourceId, input.resourceVersion, target);
+        this.db.prepare('INSERT INTO resource_delivery_jobs (id, resource_type, resource_id, resource_version, target, approval_status, idempotency_key, payload_json, status, attempt_count, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?) ON CONFLICT(idempotency_key) DO NOTHING').run(`resource-delivery-${randomUUID()}`, input.resourceType, input.resourceId, input.resourceVersion, target, 'approved', idempotencyKey, json(input.payload), 'queued', now, now);
+        jobs.push(this.listResourceDeliveryJobs().find((job) => job.idempotencyKey === idempotencyKey)!);
+      }
+      this.db.exec('COMMIT');
+      void input.actorId;
+      return jobs;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  listPendingResourceApprovals(): ResourceDeliveryJob[] {
+    return this.listResourceDeliveryJobs().filter((job) => job.approvalStatus === 'awaiting_approval');
   }
 
   updateResourceDeliveryJob(idempotencyKey: string, status: DeliveryStatus, error?: string | null, now = Date.now()): ResourceDeliveryJob {
@@ -841,7 +996,7 @@ export class SqliteFactStore {
   private enqueueResourceDeliveryInside(resourceType: ResourceDeliveryType, resourceId: string, resourceVersion: number, payload: unknown, now: number): void {
     const idempotencyKey = `${resourceType}:${resourceId}:${resourceVersion}`;
     this.db.prepare("UPDATE resource_delivery_jobs SET status = 'superseded', updated_at = ? WHERE resource_type = ? AND resource_id = ? AND resource_version < ? AND status IN ('queued', 'uploading', 'failed')").run(now, resourceType, resourceId, resourceVersion);
-    this.db.prepare('INSERT INTO resource_delivery_jobs (id, resource_type, resource_id, resource_version, idempotency_key, payload_json, status, attempt_count, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?) ON CONFLICT(idempotency_key) DO NOTHING').run(`resource-delivery-${randomUUID()}`, resourceType, resourceId, resourceVersion, idempotencyKey, json(payload), 'queued', now, now);
+    this.db.prepare('INSERT INTO resource_delivery_jobs (id, resource_type, resource_id, resource_version, target, approval_status, idempotency_key, payload_json, status, attempt_count, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?) ON CONFLICT(idempotency_key) DO NOTHING').run(`resource-delivery-${randomUUID()}`, resourceType, resourceId, resourceVersion, 'merchant_database', 'awaiting_approval', idempotencyKey, json(payload), 'queued', now, now);
   }
 
   private persistSessionProjection(sessionId: string, next: LiveSessionSnapshot, event: LiveEvent, previousEndedAt: unknown): void {

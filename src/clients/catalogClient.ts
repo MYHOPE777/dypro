@@ -1,4 +1,4 @@
-import type { ComplianceFinding, ComplianceResult, ComplianceRule, CoachPurpose, PresenterPhrase, PresenterProfile, Product, RuleAuditEntry } from '../shared/types';
+import type { ComplianceFinding, ComplianceResult, ComplianceRule, CoachPurpose, ManualSyncJob, PresenterPhrase, PresenterProfile, Product, RuleAuditEntry, RuleDocument, RulePackage, RuleUnit } from '../shared/types';
 import { authenticatedHeaders, clearAuthToken, V2_AUTH_REQUIRED_EVENT } from './authHeaders';
 
 export class CatalogClient {
@@ -28,6 +28,12 @@ export class CatalogClient {
   async submitRuleToPublic(rule: ComplianceRule): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}/public-submit`, { method: 'POST' }); }
   async reviewPublicRule(rule: ComplianceRule, decision: 'adopted' | 'deferred' | 'discarded'): Promise<ComplianceRule> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}/public-review`, { method: 'POST', body: JSON.stringify({ decision }) }); }
   async publicRuleCandidates(): Promise<ComplianceRule[]> { return this.request('/api/v2/operations/rules'); }
+  async ruleDocuments(): Promise<RuleDocument[]> { return this.request('/api/v2/rule-documents'); }
+  async reviewRuleDocument(document: RuleDocument, decision: 'approved' | 'rejected'): Promise<RuleDocument> { return this.request(`/api/v2/rule-documents/${encodeURIComponent(document.id)}/review`, { method: 'POST', body: JSON.stringify({ decision }) }); }
+  async rulePackages(): Promise<{ packages: RulePackage[]; units: RuleUnit[] }> { return this.request('/api/v2/rule-packages'); }
+  async roomRuleUnits(roomId: string, status?: RuleUnit['status']): Promise<RuleUnit[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/rule-units${status ? `?status=${encodeURIComponent(status)}` : ''}`); }
+  async reviewRuleUnit(unit: RuleUnit, decision: 'approved' | 'rejected' | 'deferred' | 'discarded'): Promise<RuleUnit> { return this.request(`/api/v2/rule-units/${encodeURIComponent(unit.id)}/review`, { method: 'POST', body: JSON.stringify({ decision }) }); }
+  async syncRule(rule: ComplianceRule, targets: Array<'merchant_database' | 'private_knowledge_base'>): Promise<ManualSyncJob[]> { return this.request(`/api/v2/rules/${encodeURIComponent(rule.id)}/sync`, { method: 'POST', body: JSON.stringify({ targets }) }); }
   async presenters(roomId: string): Promise<PresenterProfile[]> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/presenters`); }
   async createPresenter(roomId: string, name: string): Promise<PresenterProfile> { return this.request(`/api/v2/rooms/${encodeURIComponent(roomId)}/presenters`, { method: 'POST', body: JSON.stringify({ name }) }); }
   async phrases(presenterId: string, productId?: string): Promise<PresenterPhrase[]> { return this.request(`/api/v2/presenters/${encodeURIComponent(presenterId)}/phrases${productId ? `?productId=${encodeURIComponent(productId)}` : ''}`); }

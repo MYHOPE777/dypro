@@ -7,6 +7,7 @@ export type AnalysisInput = {
   transcript: string;
   product?: Pick<Product, 'id' | 'name' | 'category' | 'price' | 'compliantPhrases'> & Partial<Pick<Product, 'description' | 'sellingPoints' | 'complianceProfile' | 'updatedAt'>>;
   customRules?: ComplianceRule[];
+  semanticRules?: Array<{ title: string; instruction?: string; contextWindow?: string; risk: RiskLevel; policyRef: string }>;
   riskProfile?: RiskProfile;
   speaker?: SpeakerLabel;
   speakerId?: string;
@@ -30,7 +31,7 @@ type Rule = {
   policyRef: string;
 };
 
-const MEDICAL_CONDITION_CLAIM = /(?:(?:保证|一定|绝对|肯定|必定)(?:可以|能够|能)?){0,1}(?:(?:治疗|治愈|治好|根治|医治).{0,12}|(?<![政自整法德人善])治(?:一下)?)(?:耳聋|失聪|耳鸣|近视|白内障|糖尿病|高血压|癌症|肿瘤|抑郁症|关节炎|喉咙痛|咽喉痛|咽痛|嗓子痛|头痛|头疼|牙痛|胃痛|感冒|咳嗽|发烧|发热|失眠|鼻炎|咽炎)|(?:耳聋|失聪|耳鸣|近视|白内障|糖尿病|高血压|癌症|肿瘤|抑郁症|关节炎|喉咙痛|咽喉痛|咽痛|嗓子痛|头痛|头疼|牙痛|胃痛|感冒|咳嗽|发烧|发热|失眠|鼻炎|咽炎).{0,12}(?:(?:保证|一定|绝对|肯定|必定)(?:可以|能够|能)?){0,1}(?:治疗|治愈|治好|根治|医治|能治|可治)/iu;
+const MEDICAL_CONDITION_CLAIM = /(?:(?:保证|一定|绝对|肯定|必定)(?:可以|能够|能)?(?:治疗|治愈|治好|根治|医治|治(?:一下)?))?(?:(?:治疗|治愈|治好|根治|医治).{0,12}|(?:^|[^\p{Script=Han}]|能|可以|能够|帮你|给你|专门)治(?:一下)?)(?:耳聋|失聪|耳鸣|近视|白内障|糖尿病|高血压|癌症|肿瘤|抑郁症|关节炎|喉咙痛|咽喉痛|咽痛|嗓子痛|头痛|头疼|牙痛|胃痛|感冒|咳嗽|发烧|发热|失眠|鼻炎|咽炎)|(?:耳聋|失聪|耳鸣|近视|白内障|糖尿病|高血压|癌症|肿瘤|抑郁症|关节炎|喉咙痛|咽喉痛|咽痛|嗓子痛|头痛|头疼|牙痛|胃痛|感冒|咳嗽|发烧|发热|失眠|鼻炎|咽炎).{0,12}(?:(?:保证|一定|绝对|肯定|必定)(?:可以|能够|能)?){0,1}(?:治疗|治愈|治好|根治|医治|能治|可治)/iu;
 const SENSITIVE_CLAIM_NEGATION = /(?:不能|不可|不得|禁止|不要|不建议|不可以|没有|并非|不是|不具备|无法|别说|严禁|切勿|避免).{0,18}$/iu;
 const SENSITIVE_CLAIM_REFERENCE = /(?:例如|比如|所谓|有人说|常见说法|错误说法|不要说|不应说|不能说|平台不允许|科普|引用|广告中).{0,18}$/iu;
 const ABSOLUTE_EFFECT_CLAIM = /(?:保证|一定|绝对|百分之百|100%|完全|全部|永远|永久|立刻|马上).{0,14}(?:有效|见效|改善|消失|恢复|年轻|减肥|减重|降下来|提升|解决|没有噪音|不反弹|不复发)|(?:有效|见效|改善|消失|恢复|年轻|减肥|减重|降下来|提升|解决|没有噪音|不反弹|不复发).{0,14}(?:保证|一定|绝对|百分之百|100%|完全|全部|永远|永久)/iu;
@@ -178,8 +179,9 @@ const RULES: Rule[] = [
 const makeId = () => `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const severity: Record<RiskLevel, number> = { safe: 0, warning: 1, blocked: 2 };
 
-function customScopeWeight(scope: ComplianceRule['scope']): number {
-  return scope === 'product' ? 3 : scope === 'category' ? 2 : 1;
+function customScopeWeight(rule: ComplianceRule): number {
+  if (rule.layer) return { legal: 5, platform: 4, industry: 3, room: 2, product: 1 }[rule.layer];
+  return rule.scope === 'product' ? 3 : rule.scope === 'category' ? 2 : 1;
 }
 
 function enforcementFor(risk: RiskLevel): ComplianceEnforcement {
@@ -270,7 +272,7 @@ export function evaluateCustomRules(input: AnalysisInput): ComplianceResult | nu
       return false;
     }
   }).sort((first, second) => severity[second.risk] - severity[first.risk]
-    || customScopeWeight(second.scope) - customScopeWeight(first.scope)
+    || customScopeWeight(second) - customScopeWeight(first)
     || second.pattern.length - first.pattern.length
     || second.version - first.version)[0];
   if (!rule) return null;

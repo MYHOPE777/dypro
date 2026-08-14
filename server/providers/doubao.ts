@@ -145,7 +145,7 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
       const content = await requestArk(
         this.config,
         SYSTEM_PROMPT,
-        `当前商品：${JSON.stringify(product)}\n当前风险档位：严格（所有直播场次统一）\n当前说话人：${input.speaker === 'other' ? '其他人' : '主播'}\n主播当前原话：${input.transcript}\n同一商品最近上下文：${input.context?.text ?? '无'}\n本直播间相关规则：${JSON.stringify(compactRules)}`,
+        `当前商品：${JSON.stringify(product)}\n当前风险档位：严格（所有直播场次统一）\n当前说话人：${input.speaker === 'other' ? '其他人' : '主播'}\n主播当前原话：${input.transcript}\n同一商品最近上下文：${input.context?.text ?? '无'}\n本直播间相关规则：${JSON.stringify(compactRules)}\n已审核语义规则指令：${JSON.stringify(input.semanticRules ?? [])}`,
         this.maxOutputTokens,
         true,
       );

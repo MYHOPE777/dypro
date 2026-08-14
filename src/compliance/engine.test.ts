@@ -3,6 +3,11 @@ import { analyzeTranscript } from './engine';
 import type { ComplianceRule } from '../shared/types';
 
 describe('analyzeTranscript', () => {
+  it('does not treat the character 治 inside unrelated words as a medical claim', async () => {
+    const result = await analyzeTranscript({ productId: 'serum', transcript: '我们治理环境，也提到喉咙痛人群' });
+    expect(result.risk).not.toBe('blocked');
+  });
+
   it('flags semantic appearance claims without relying on a listed sensitive word', async () => {
     const result = await analyzeTranscript({ productId: 'serum', transcript: '这款面霜用了之后毛孔看不见了，皮肤像婴儿一样' });
 

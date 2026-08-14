@@ -69,7 +69,7 @@ describe('DurableDelivery', () => {
     store.close();
   });
 
-  it('automatically delivers versioned rules and presenter phrases without session approval', async () => {
+  it('delivers versioned rules and presenter phrases only after manual target approval', async () => {
     const store = new SqliteFactStore({ filename: ':memory:' });
     store.ensureRoom({ id: 'room-default', tenantId: 'tenant-local' });
     const presenter = new PresenterModule(store, () => 10).ensureDefault('room-default');
@@ -84,6 +84,9 @@ describe('DurableDelivery', () => {
     };
     const worker = new DurableDelivery(store, scheduler, [gateway]);
 
+    expect(store.listResourceDeliveryJobs('queued')).toHaveLength(0);
+    store.createManualSyncJobs({ resourceType: 'rule', resourceId: rule.id, resourceVersion: rule.version, payload: rule, targets: ['merchant_database'], actorId: 'operator' });
+    store.createManualSyncJobs({ resourceType: 'presenter_phrase', resourceId: phrase.id, resourceVersion: phrase.version, payload: phrase, targets: ['private_knowledge_base'], actorId: 'operator' });
     expect(store.listResourceDeliveryJobs('queued')).toHaveLength(2);
     scheduler.pauseBackground();
     expect(await worker.flushOnce()).toBe(0);
@@ -91,7 +94,7 @@ describe('DurableDelivery', () => {
     expect(await worker.flushOnce()).toBe(1);
     expect(await worker.flushOnce()).toBe(1);
 
-    expect(delivered).toEqual([`rule:${rule.id}:1`, `presenter_phrase:${phrase.id}:1`]);
+    expect(delivered.sort()).toEqual([`presenter_phrase:${phrase.id}:1`, `rule:${rule.id}:1`].sort());
     expect(store.listResourceDeliveryJobs('synced')).toHaveLength(2);
     store.close();
   });

@@ -7,7 +7,7 @@ export type CaptureState = 'idle' | 'live' | 'paused' | 'ended';
 export type SpeakerLabel = 'host' | 'other';
 export type SpeakerSource = 'default' | 'automatic' | 'manual';
 export type CoachPurpose = '塑品' | '憋单' | '逼单' | '转化' | '互动' | '留人' | '答疑';
-export type CommercePlatformRuleset = 'douyin-ecommerce-live';
+export type CommercePlatformRuleset = 'douyin-ecommerce-live' | 'pinduoduo-ecommerce-live';
 
 export type ProductComplianceProfile = {
   industry: string;
@@ -295,10 +295,132 @@ export type ComplianceRuleScope = 'room' | 'category' | 'product' | 'shared';
 export type ComplianceRuleStatus = 'draft' | 'pending_review' | 'published' | 'rejected' | 'rolled_back';
 export type PublicRuleStatus = 'not_submitted' | 'pending' | 'adopted' | 'deferred' | 'discarded';
 
+export type RuleLayer = 'legal' | 'platform' | 'industry' | 'room' | 'product';
+export type RuleUnitKind = 'term' | 'sentence' | 'context';
+export type RuleUnitStatus = 'draft' | 'pending_review' | 'active' | 'rejected' | 'rolled_back' | 'pending_publish';
+export type RuleDocumentSource = 'upload' | 'url' | 'built_in';
+export type RuleDocumentStatus = 'draft' | 'pending_review' | 'published' | 'superseded' | 'rejected';
+export type RuleReviewDecision = 'approved' | 'rejected' | 'deferred' | 'discarded';
+export type SyncTarget = 'local' | 'merchant_database' | 'private_knowledge_base';
+
+export type RuleDocument = {
+  id: string;
+  tenantId?: string;
+  platform: CommercePlatformRuleset | 'general';
+  industry?: string;
+  title: string;
+  publisher: string;
+  source: RuleDocumentSource;
+  sourceUrl?: string;
+  status: RuleDocumentStatus;
+  latestVersion: number;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type RuleDocumentVersion = {
+  id: string;
+  documentId: string;
+  version: number;
+  content: string;
+  contentHash: string;
+  publishedAt?: number;
+  fetchedAt: number;
+  diffSummary?: { added: number; removed: number; changed: number };
+  changedSections?: string[];
+  createdAt: number;
+};
+
+export type RulePackage = {
+  id: string;
+  tenantId?: string;
+  layer: RuleLayer;
+  name: string;
+  platform?: CommercePlatformRuleset | 'general';
+  industry?: string;
+  roomId?: string;
+  productId?: string;
+  documentId?: string;
+  documentVersion?: number;
+  version: number;
+  status: RuleUnitStatus;
+  enabled: boolean;
+  immutable?: boolean;
+  createdBy: string;
+  approvedBy?: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type RuleUnit = {
+  id: string;
+  packageId: string;
+  version: number;
+  kind: RuleUnitKind;
+  pattern?: string;
+  instruction?: string;
+  contextWindow?: string;
+  title: string;
+  reason: string;
+  alternative: string;
+  policyRef: string;
+  risk: RiskLevel;
+  confidence: number;
+  evidenceText?: string;
+  matchedTerms?: string[];
+  status: RuleUnitStatus;
+  enabled: boolean;
+  source: 'built_in' | 'document' | 'doubao' | 'manual';
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type RuleReview = {
+  id: string;
+  resourceType: 'document' | 'rule_unit' | 'public_rule';
+  resourceId: string;
+  decision: RuleReviewDecision;
+  actorId: string;
+  note?: string;
+  createdAt: number;
+};
+
+export type ManualSyncJob = {
+  id: string;
+  resourceType: 'rule' | 'rule_unit' | 'presenter_phrase';
+  resourceId: string;
+  resourceVersion: number;
+  target: SyncTarget;
+  status: 'awaiting_approval' | 'queued' | 'uploading' | 'synced' | 'failed' | 'superseded';
+  idempotencyKey: string;
+  payload: unknown;
+  approvedBy?: string;
+  approvedAt?: number;
+  attemptCount: number;
+  lastError?: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type PhraseMetric = {
+  id: string;
+  phraseId: string;
+  sessionId?: string;
+  adopted: boolean;
+  interactionScore?: number;
+  conversionScore?: number;
+  retentionScore?: number;
+  riskScore?: number;
+  note?: string;
+  createdAt: number;
+};
+
 export type ComplianceRule = {
   id: string;
   roomId: string;
   scope: ComplianceRuleScope;
+  /** New rule-package layer; legacy rules derive precedence from scope. */
+  layer?: RuleLayer;
   /** Required when scope is `product`; absent on legacy room rules. */
   productId?: string;
   /** Required when scope is `category`; absent on legacy room rules. */
