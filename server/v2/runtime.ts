@@ -32,7 +32,7 @@ export type V2Runtime = {
   getOrCreateSession(input?: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string }): LiveSessionPort;
   getOrCreateOperatorSession(input?: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string }): LiveSessionPort;
   getSession(sessionId: string): LiveSessionPort | null;
-  dispatch(sessionId: string, command: LiveCommand): Promise<void>;
+  dispatch(sessionId: string, command: LiveCommand, actorId?: string): Promise<void>;
   snapshot(sessionId: string): LiveSessionSnapshot | null;
   subscribe(sessionId: string, listener: (event: LiveEvent, snapshot: LiveSessionSnapshot) => void): () => void;
   listRooms(): ReturnType<SqliteFactStore['listRooms']>;
@@ -209,7 +209,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
     getOrCreateSession,
     getOrCreateOperatorSession,
     getSession: (sessionId) => sessions.get(sessionId) ?? (store.getSessionSnapshot(sessionId) ? getOrCreateSession({ sessionId }) : null),
-    dispatch: async (sessionId, command) => { const session = getOrCreateSession({ sessionId }); await session.dispatch(command); },
+    dispatch: async (sessionId, command, actorId) => { const session = getOrCreateSession({ sessionId }); await session.dispatch(command, actorId ? { actorId } : undefined); },
     snapshot: (sessionId) => sessions.get(sessionId)?.snapshot() ?? store.getSessionSnapshot(sessionId),
     subscribe: (sessionId, listener) => getOrCreateSession({ sessionId }).subscribe(listener),
     listRooms: () => store.listRooms(),

@@ -608,12 +608,11 @@ export class SqliteFactStore {
     try {
       this.db.prepare('UPDATE compliance_findings SET disposition = ?, rule_id = ?, disposed_by = ?, disposed_at = ?, resolution_note = ?, updated_at = ? WHERE session_id = ? AND segment_id = ?').run(disposition, ruleId ?? null, actorId, now, note?.trim() || null, now, sessionId, segmentId);
       if (existing.result.annotationId) {
-        const row = this.getSessionStatement.get(sessionId);
-        const annotations = parseJson<TranscriptAnnotation[]>(row?.transcript_annotations_json, []);
-        const updated = annotations.map((annotation) => annotation.id === existing.result.annotationId
-          ? { ...annotation, status: disposition, ...(ruleId ? { ruleId } : {}), updatedAt: now }
-          : annotation);
-        this.db.prepare('UPDATE live_sessions SET transcript_annotations_json = ?, updated_at = ? WHERE id = ?').run(json(updated), now, sessionId);
+        this.appendInsideTransaction(sessionId, {
+          type: 'transcript.annotation_resolved',
+          occurredAt: now,
+          payload: { annotationId: existing.result.annotationId, disposition, actorId, ...(ruleId ? { ruleId } : {}), ...(note?.trim() ? { note: note.trim() } : {}) },
+        });
       }
       this.db.exec('COMMIT');
     } catch (error) {
@@ -824,6 +823,7 @@ export class SqliteFactStore {
       this.revokeReviewInside(sessionId, now);
       if (correction) this.recordSpeechCorrectionInside(correction.roomId, { ...correction, actorId, sessionId, segmentId }, now);
       this.db.prepare('INSERT INTO review_edits (id, session_id, segment_id, kind, before_json, after_json, content_revision, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(`edit-${randomUUID()}`, sessionId, segmentId, kind, json(previous), json(segment), contentRevision, actorId, now);
+      this.appendInsideTransaction(sessionId, { type: 'review.edited', occurredAt: now, payload: { kind, segmentId, contentRevision, actorId } });
       this.db.exec('COMMIT');
       return { contentRevision, segment };
     } catch (error) {
@@ -855,6 +855,7 @@ export class SqliteFactStore {
       this.db.prepare('UPDATE live_sessions SET content_revision = ?, updated_at = ? WHERE id = ?').run(contentRevision, now, sessionId);
       this.revokeReviewInside(sessionId, now, note);
       this.db.prepare('INSERT INTO review_edits (id, session_id, segment_id, kind, before_json, after_json, content_revision, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(`edit-${randomUUID()}`, sessionId, null, 'note.updated', json({ note: stringValue(review.note) }), json({ note }), contentRevision, actorId, now);
+      this.appendInsideTransaction(sessionId, { type: 'review.edited', occurredAt: now, payload: { kind: 'note.updated', contentRevision, actorId } });
       this.db.exec('COMMIT');
       return contentRevision;
     } catch (error) {
@@ -1129,12 +1130,22 @@ export class SqliteFactStore {
         }
         break;
       }
+      case 'transcript.annotation_resolved': {
+        const annotationId = stringValue(payload.annotationId);
+        const status = payload.disposition === 'confirmed' ? 'confirmed' : payload.disposition === 'dismissed' ? 'dismissed' : null;
+        if (annotationId && status) {
+          snapshot.transcriptAnnotations = snapshot.transcriptAnnotations.map((annotation) => annotation.id === annotationId
+            ? { ...annotation, status, ...(typeof payload.ruleId === 'string' ? { ruleId: payload.ruleId } : {}), updatedAt: event.occurredAt }
+            : annotation);
+        }
+        break;
+      }
       case 'speaker.assigned': {
         const segmentId = stringValue(payload.segmentId);
         const segmentIds = Array.isArray(payload.segmentIds) ? payload.segmentIds.filter((value): value is string => typeof value === 'string') : [segmentId];
         const speaker = payload.speaker === 'other' ? 'other' : 'host';
         const speakerName = typeof payload.speakerName === 'string' && payload.speakerName.trim() ? payload.speakerName.trim() : undefined;
-        snapshot.transcriptHistory = snapshot.transcriptHistory.map((segment) => segmentIds.includes(segment.id) ? { ...segment, speaker, speakerSource: 'manual', speakerConfidence: 1, ...(speakerName ? { speakerName } : {}) } : segment);
+        snapshot.transcriptHistory = snapshot.transcriptHistory.map((segment) => segmentIds.includes(segment.id) ? { ...segment, speaker, speakerSource: 'manual', speakerConfidence: 1, ...(typeof payload.speakerId === 'string' ? { speakerId: payload.speakerId } : {}), ...(speakerName ? { speakerName } : {}) } : segment);
         snapshot.contentRevision += 1;
         break;
       }
@@ -1167,6 +1178,7 @@ export class SqliteFactStore {
         break;
       case 'session.created':
       case 'session.ended':
+      case 'review.edited':
         break;
     }
     snapshot.latestSequence = event.sequence;

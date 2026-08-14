@@ -80,6 +80,28 @@ describe('v2 operator view', () => {
     expect(frame.command).toEqual(expect.objectContaining({ type: 'transcript_annotate', segmentId: 'segment-new', selectedText: '一定能治喉咙痛', start: 0, end: 7, kind: 'sentence' }));
   });
 
+  it('uses the actual selected occurrence when identical transcript text repeats', async () => {
+    render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    const text = '重复词 重复词';
+    socket.receive({ type: 'ready', requestId: 'join', sessionId: 'live-transcript-selection', products: PRODUCTS, snapshot: { ...snapshot(), sessionId: 'live-transcript-selection', partialTranscript: '', transcriptHistory: [{ id: 'segment-repeat', text, isFinal: true, timestamp: 1, offsetMs: null, startOffsetMs: null, endOffsetMs: null, speaker: 'host' }] } });
+
+    const paragraph = await screen.findByText(text);
+    const textNode = paragraph.firstChild!;
+    const range = document.createRange();
+    range.setStart(textNode, 4);
+    range.setEnd(textNode, 7);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges(); selection.addRange(range);
+    fireEvent.contextMenu(paragraph);
+    fireEvent.click(await screen.findByRole('button', { name: '标注违规词' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+    const frame = JSON.parse(socket.sent.at(-1) as string) as { command: Record<string, unknown> };
+    expect(frame.command).toEqual(expect.objectContaining({ type: 'transcript_annotate', segmentId: 'segment-repeat', selectedText: '重复词', start: 4, end: 7, kind: 'term' }));
+  });
+
   it('labels generated coaching choices as coming from Doubao', async () => {
     render(<App />);
     const socket = FakeWebSocket.instances[0];

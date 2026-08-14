@@ -19,6 +19,13 @@ function deriveCorrection(originalText: string, correctedText: string): { wrongT
   return wrongText && correctText && wrongText !== correctText ? { wrongText, correctText } : undefined;
 }
 
+function optionalText(value: string | undefined, maximum: number, name: string): string | undefined {
+  if (value === undefined) return undefined;
+  const text = value.trim();
+  if (text.length > maximum) throw new Error(`${name}不能超过 ${maximum} 个字符`);
+  return text || undefined;
+}
+
 export class SessionReviewModule {
   constructor(private readonly store: SqliteFactStore) {}
 
@@ -57,14 +64,15 @@ export class SessionReviewModule {
     const start = Math.max(0, Math.min(segment.text.length, Math.floor(input.start)));
     const end = Math.max(start, Math.min(segment.text.length, Math.floor(input.end)));
     const selectedText = input.selectedText.trim();
+    if (selectedText.length > 2_000) throw new Error('选中文本不能超过 2000 个字符');
     if (!selectedText || segment.text.slice(start, end).trim() !== selectedText) throw new Error('选中文本与当前转录不一致，请重新选择');
     const now = Date.now();
     const annotation: TranscriptAnnotation = {
       id: `annotation-${randomUUID()}`, sessionId, segmentId, selectedText, start, end, kind: input.kind, risk: 'blocked',
-      title: input.title?.trim() || (input.kind === 'term' ? '人工标注违规词' : '人工标注违规句'),
-      reason: input.reason?.trim() || '主播表达被人工标注为需要拦截的风险内容',
-      alternative: input.alternative?.trim() || '请改用不承诺功效、不绝对化的客观表达',
-      policyRef: input.policyRef?.trim() || '直播间人工复核规则', confidence: 1, status: 'pending', actorId, createdAt: now, updatedAt: now,
+      title: optionalText(input.title, 160, '违规标题') || (input.kind === 'term' ? '人工标注违规词' : '人工标注违规句'),
+      reason: optionalText(input.reason, 500, '判断说明') || '主播表达被人工标注为需要拦截的风险内容',
+      alternative: optionalText(input.alternative, 500, '替代表达') || '请改用不承诺功效、不绝对化的客观表达',
+      policyRef: optionalText(input.policyRef, 200, '规则依据') || '直播间人工复核规则', confidence: 1, status: 'pending', actorId, createdAt: now, updatedAt: now,
     };
     const syntheticSegmentId = `${segment.id}:annotation:${annotation.id}`;
     const result: ComplianceResult = {

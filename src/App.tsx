@@ -242,6 +242,22 @@ function SpeakerBadge({ segment }: { segment: TranscriptSegment }) {
 type TranscriptMenuState = { segment: TranscriptSegment; selectedText: string; start: number; end: number; x: number; y: number };
 type TranscriptEditorState = TranscriptMenuState & ({ mode: 'replace'; replacement: string } | { mode: 'annotate'; kind: 'term' | 'sentence'; reason: string } | { mode: 'speaker'; speaker: 'host' | 'other'; speakerName: string });
 
+function transcriptSelection(element: HTMLElement, segment: TranscriptSegment): Pick<TranscriptMenuState, 'selectedText' | 'start' | 'end'> {
+  const paragraph = element.querySelector('p');
+  const selection = window.getSelection();
+  if (!paragraph || !selection || selection.rangeCount === 0 || selection.isCollapsed) return { selectedText: segment.text, start: 0, end: segment.text.length };
+  const range = selection.getRangeAt(0);
+  if (!paragraph.contains(range.startContainer) || !paragraph.contains(range.endContainer)) return { selectedText: segment.text, start: 0, end: segment.text.length };
+  const prefix = document.createRange();
+  prefix.selectNodeContents(paragraph);
+  prefix.setEnd(range.startContainer, range.startOffset);
+  const start = prefix.toString().length;
+  const selectedText = range.toString().trim();
+  const end = start + range.toString().length;
+  if (!selectedText || segment.text.slice(start, end).trim() !== selectedText) return { selectedText: segment.text, start: 0, end: segment.text.length };
+  return { selectedText, start, end };
+}
+
 function TranscriptFeed({ snapshot, compact = false, send }: { snapshot: LiveSessionSnapshot; compact?: boolean; send?: (command: LiveCommand) => boolean }) {
   const items = snapshot.transcriptHistory.slice(compact ? -4 : -8).reverse();
   const [menu, setMenu] = useState<TranscriptMenuState | null>(null);
@@ -256,13 +272,8 @@ function TranscriptFeed({ snapshot, compact = false, send }: { snapshot: LiveSes
   const openMenu = (event: ReactMouseEvent<HTMLElement>, segment: TranscriptSegment) => {
     if (!send) return;
     event.preventDefault(); event.stopPropagation();
-    const selection = window.getSelection();
-    const selected = selection?.toString().trim() || '';
-    const selectionBelongsToItem = Boolean(selected && selection?.anchorNode && event.currentTarget.contains(selection.anchorNode));
-    const selectedText = selectionBelongsToItem ? selected : segment.text;
-    const start = Math.max(0, segment.text.indexOf(selectedText));
-    const end = start + selectedText.length;
-    setMenu({ segment, selectedText, start, end, x: Math.min(event.clientX, window.innerWidth - 260), y: Math.min(event.clientY, window.innerHeight - 220) });
+    const { selectedText, start, end } = transcriptSelection(event.currentTarget, segment);
+    setMenu({ segment, selectedText, start, end, x: Math.max(8, Math.min(event.clientX, window.innerWidth - 260)), y: Math.max(8, Math.min(event.clientY, window.innerHeight - 220)) });
   };
   const replace = () => {
     if (!editor || editor.mode !== 'replace' || !send) return;

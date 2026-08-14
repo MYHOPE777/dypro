@@ -53,7 +53,7 @@ export class RealtimeReviewPipeline {
     monotonicNow?: () => number;
   }) {}
 
-  async process(input: { token: ReviewToken; segment: TranscriptSegment; product: Product; roomId?: string; riskProfile: RiskProfile; context: AnalysisInput['context']; stats: SessionStats; customRules?: ComplianceRule[]; semanticRules?: AnalysisInput['semanticRules']; referencePhrases?: Array<{ text: string; purpose?: CoachPurpose }> }): Promise<void> {
+  async process(input: { token: ReviewToken; segment: TranscriptSegment; product: Product; roomId?: string; riskProfile: RiskProfile; context: AnalysisInput['context']; stats: SessionStats; customRules?: ComplianceRule[]; semanticRules?: AnalysisInput['semanticRules']; referencePhrases?: Array<{ text: string; purpose?: CoachPurpose }>; presentAsLatest?: boolean }): Promise<void> {
     const { token, segment, product } = input;
     const processStartedAt = this.monotonicNow();
     const analysisInput: AnalysisInput = { roomId: input.roomId, productId: product.id, transcript: segment.text, product, speaker: segment.speaker, speakerId: segment.speakerId, riskProfile: 'strict', context: input.context, customRules: input.customRules, semanticRules: input.semanticRules };
@@ -62,8 +62,11 @@ export class RealtimeReviewPipeline {
     const localCompletedAt = this.monotonicNow();
     const local = { ...normalized(localResult, segment, product, this.now()), analysisMs: this.elapsed(processStartedAt, localCompletedAt) };
     this.logTiming(input, 'local_rule', processStartedAt, localStartedAt, localCompletedAt);
-    if (!this.options.isProductSegmentCurrent(token) || !this.options.isLatest(token)) return;
-    this.options.onCompliance(local, true, product);
+    if (!this.options.isProductSegmentCurrent(token)) return;
+    // Corrections can target an older transcript segment. Re-run compliance
+    // for that segment, but keep the current live prompt/risk panel untouched.
+    const localIsLatest = input.presentAsLatest !== false && this.options.isLatest(token);
+    this.options.onCompliance(local, localIsLatest, product);
     const references = input.referencePhrases?.filter((phrase) => phrase.text.trim()) ?? [];
     const coachInput = (compliance: ComplianceResult): CoachInput => ({
       product,
@@ -76,7 +79,7 @@ export class RealtimeReviewPipeline {
     });
     const fallbackFor = (compliance: ComplianceResult) => localSuggestions(coachInput(compliance)).slice(0, 3);
     const fallback = fallbackFor(local);
-    if (this.options.isLatest(token)) this.options.onCoach(segment.id, fallback, true);
+    if (localIsLatest) this.options.onCoach(segment.id, fallback, true);
 
     const requestCoach = async (compliance: ComplianceResult, safeFallback: CoachSuggestion[]) => {
       const queuedAt = this.monotonicNow();
@@ -113,7 +116,7 @@ export class RealtimeReviewPipeline {
       const resolved = { ...normalized(remote.value.value, segment, product, this.now()), analysisMs: this.elapsed(processStartedAt, semanticCompletedAt) };
       this.logTiming(input, 'semantic_review', processStartedAt, semanticStartedAt ?? semanticCompletedAt, semanticCompletedAt, semanticQueuedAt, remote.timedOut || remote.value.expired, resolved.analysisTiming);
       if (!this.options.isProductSegmentCurrent(token)) return;
-      const latest = this.options.isLatest(token);
+      const latest = input.presentAsLatest !== false && this.options.isLatest(token);
       this.options.onCompliance(resolved, latest, product);
       if (RISK_SEVERITY[resolved.risk] <= RISK_SEVERITY[local.risk]) return;
       if (!latest) return;
@@ -132,16 +135,17 @@ export class RealtimeReviewPipeline {
       });
     }).catch(() => undefined);
 
+    if (!localIsLatest) return;
     if (!this.options.coach?.suggestMany) {
-      if (this.options.isLatest(token)) this.options.onCoach(segment.id, fallback, false);
+      if (localIsLatest) this.options.onCoach(segment.id, fallback, false);
       this.logTiming(input, 'coach', processStartedAt, localCompletedAt, localCompletedAt, undefined, false);
       return;
     }
     void requestCoach(local, fallback).then((remoteCoach) => {
       this.logTiming(input, 'coach', processStartedAt, remoteCoach.startedAt, remoteCoach.completedAt, remoteCoach.queuedAt, remoteCoach.timedOut);
-      if (!semanticOverrideActive && this.options.isProductSegmentCurrent(token) && this.options.isLatest(token)) this.options.onCoach(segment.id, remoteCoach.suggestions, false);
+      if (!semanticOverrideActive && input.presentAsLatest !== false && this.options.isProductSegmentCurrent(token) && this.options.isLatest(token)) this.options.onCoach(segment.id, remoteCoach.suggestions, false);
     }).catch(() => {
-      if (!semanticOverrideActive && this.options.isProductSegmentCurrent(token) && this.options.isLatest(token)) this.options.onCoach(segment.id, fallback, false);
+      if (!semanticOverrideActive && input.presentAsLatest !== false && this.options.isProductSegmentCurrent(token) && this.options.isLatest(token)) this.options.onCoach(segment.id, fallback, false);
     });
   }
 

@@ -192,6 +192,34 @@ describe('LiveSession', () => {
     store.close();
   });
 
+  it('rechecks a corrected older segment without replacing current coaching', async () => {
+    const { store, session } = makeSession({
+      analyzer: { analyze: async (input) => ({ ...result(input.productId, 'safe'), transcript: input.transcript }) },
+    });
+    const coachInputs: string[] = [];
+    const sessionWithCoach = new LiveSession({
+      store,
+      scheduler: new BoundedScheduler({ modelGlobal: 4, modelPerSession: 2, background: 1 }),
+      products: PRODUCTS,
+      capture: new FakeCapture(),
+      analyzer: { analyze: async (input) => ({ ...result(input.productId, 'safe'), transcript: input.transcript }) },
+      coach: { suggest: async () => ({ id: 'coach-one', purpose: '塑品' as const, text: '测试话术', reason: '测试', source: 'doubao' as const, createdAt: 1 }), suggestMany: async (input) => { coachInputs.push(input.transcript); return [1, 2, 3].map((index) => ({ id: `coach-${index}`, purpose: '塑品' as const, text: `${input.transcript}-${index}`, reason: '测试', source: 'doubao' as const, createdAt: index })); } },
+      session: { sessionId: 'session-correction-current', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '测试主播', product: DEFAULT_PRODUCT, lineup: PRODUCTS },
+    });
+    await sessionWithCoach.dispatch({ type: 'start' });
+    await sessionWithCoach.dispatch({ type: 'demo_transcript', text: '较早原话' });
+    await sessionWithCoach.dispatch({ type: 'demo_transcript', text: '当前原话' });
+    await vi.waitFor(() => expect(sessionWithCoach.snapshot().coachSuggestions[0]?.text).toBe('当前原话-1'));
+    await vi.waitFor(() => expect(coachInputs).toContain('当前原话'));
+    const oldSegment = sessionWithCoach.snapshot().transcriptHistory.find((segment) => segment.text === '较早原话')!;
+
+    await sessionWithCoach.dispatch({ type: 'transcript_correct', segmentId: oldSegment.id, text: '较早纠正' });
+    await vi.waitFor(() => expect(sessionWithCoach.snapshot().transcriptHistory.find((segment) => segment.id === oldSegment.id)?.text).toBe('较早纠正'));
+    expect(sessionWithCoach.snapshot().coachSuggestions[0]?.text).toBe('当前原话-1');
+    expect(coachInputs).not.toContain('较早纠正');
+    store.close();
+  });
+
   it('resets semantic context when the active product changes', async () => {
     const contexts: string[] = [];
     const analyzer: ReviewAnalyzer = { analyze: async (input) => {

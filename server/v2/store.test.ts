@@ -40,6 +40,32 @@ describe('SqliteFactStore', () => {
     expect(store.getSessionSnapshot(sessionId)?.latestSequence).toBe(2);
   });
 
+  it('rebuilds resolved transcript annotations from the append-only event stream', () => {
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    stores.push(store);
+    const sessionId = 'session-annotation-rebuild';
+    store.createSession({ sessionId, tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '测试主播', product: DEFAULT_PRODUCT, lineup: [DEFAULT_PRODUCT] });
+    store.appendSessionEvent(sessionId, { type: 'transcript.final', occurredAt: 2, payload: { segment: JSON.stringify({ id: 'segment-annotation', text: '一定能治好', isFinal: true, timestamp: 2, speaker: 'host', productId: DEFAULT_PRODUCT.id }) } });
+    const annotation = { id: 'annotation-rebuild', sessionId, segmentId: 'segment-annotation', selectedText: '一定能治好', start: 0, end: 5, kind: 'sentence', risk: 'blocked', title: '违规句', reason: '测试', alternative: '安全表达', policyRef: '测试规则', confidence: 1, status: 'pending', actorId: 'operator-a', createdAt: 3, updatedAt: 3 };
+    const result = { id: 'finding-rebuild', segmentId: 'segment-annotation:annotation:annotation-rebuild', transcriptSegmentId: 'segment-annotation', annotationId: annotation.id, productId: DEFAULT_PRODUCT.id, risk: 'blocked', title: '违规句', reason: '测试', alternative: '安全表达', policyRef: '测试规则', confidence: 1, source: 'manual', transcript: '一定能治好', matchedTerms: ['一定能治好'], ruleKind: 'sentence', createdAt: 3 };
+    store.appendSessionEvent(sessionId, { type: 'compliance.updated', occurredAt: 3, payload: { result: JSON.stringify(result), annotation: JSON.stringify(annotation), product: JSON.stringify(DEFAULT_PRODUCT), latest: false } });
+    store.resolveComplianceFinding(sessionId, result.segmentId, 'confirmed', 'operator-a', 'rule-local', '已确认', 4);
+
+    expect(store.getSessionSnapshot(sessionId)?.transcriptAnnotations).toMatchObject([{ id: annotation.id, status: 'confirmed', ruleId: 'rule-local' }]);
+    store.rebuildSessionProjections(sessionId);
+    expect(store.getSessionSnapshot(sessionId)?.transcriptAnnotations).toMatchObject([{ id: annotation.id, status: 'confirmed', ruleId: 'rule-local' }]);
+  });
+
+  it('keeps a manually assigned speaker id in the live snapshot projection', () => {
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    stores.push(store);
+    const sessionId = 'session-speaker-projection';
+    store.createSession({ sessionId, tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '测试主播', product: DEFAULT_PRODUCT, lineup: [DEFAULT_PRODUCT] });
+    store.appendSessionEvent(sessionId, { type: 'transcript.final', occurredAt: 2, payload: { segment: JSON.stringify({ id: 'segment-speaker', text: '助理介绍', isFinal: true, timestamp: 2, speaker: 'host' }) } });
+    store.appendSessionEvent(sessionId, { type: 'speaker.assigned', occurredAt: 3, payload: { segmentId: 'segment-speaker', segmentIds: ['segment-speaker'], speaker: 'other', speakerId: 'speaker-assistant', speakerName: '助理小王' } });
+    expect(store.getSessionSnapshot(sessionId)?.transcriptHistory[0]).toMatchObject({ speaker: 'other', speakerId: 'speaker-assistant', speakerName: '助理小王' });
+  });
+
   it('uses strict risk for new sessions while preserving ended-session audit history', () => {
     const store = new SqliteFactStore({ filename: ':memory:' });
     stores.push(store);

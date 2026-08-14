@@ -23,6 +23,7 @@ export type CapturePort = {
 
 export type ReviewAnalyzer = Pick<ComplianceAnalyzer, 'analyze'>;
 export type AsrTranscript = { text: string; isFinal: boolean; startTimeMs?: number; endTimeMs?: number };
+export type LiveCommandContext = { actorId?: string };
 
 export type LiveSessionOptions = {
   store: SqliteFactStore;
@@ -136,7 +137,7 @@ export class LiveSession {
     return () => this.listeners.delete(listener);
   }
 
-  async dispatch(command: LiveCommand): Promise<void> {
+  async dispatch(command: LiveCommand, context: LiveCommandContext = {}): Promise<void> {
     switch (command.type) {
       case 'start':
         if (this.snapshotValue.lifecycle === 'idle') {
@@ -195,7 +196,7 @@ export class LiveSession {
         this.assignSpeaker(command.segmentId, command.speaker, command.speakerId, command.speakerName);
         return;
       case 'transcript_annotate':
-        this.annotateTranscript(command);
+        this.annotateTranscript(command, context.actorId ?? 'system');
         return;
       case 'audio':
         if (this.snapshotValue.lifecycle === 'live') {
@@ -326,6 +327,7 @@ export class LiveSession {
       customRules: this.rulesProvider(correctedProduct),
       semanticRules: this.semanticRulesProvider?.(correctedProduct),
       referencePhrases: this.referencePhraseProvider(this.snapshotValue.presenterId, correctedProduct.id),
+      presentAsLatest: corrected.id === this.snapshotValue.transcriptHistory.at(-1)?.id && correctedProduct.id === this.snapshotValue.product.id,
     });
   }
 
@@ -339,7 +341,7 @@ export class LiveSession {
     this.commit('speaker.assigned', { segmentId: segmentIdValue, segmentIds, speaker, ...(boundId ? { speakerId: boundId } : {}), ...(normalizedName ? { speakerName: normalizedName } : {}) });
   }
 
-  private annotateTranscript(command: Extract<LiveCommand, { type: 'transcript_annotate' }>): void {
+  private annotateTranscript(command: Extract<LiveCommand, { type: 'transcript_annotate' }>, actorId: string): void {
     const segment = this.snapshotValue.transcriptHistory.find((candidate) => candidate.id === command.segmentId);
     if (!segment || !segment.isFinal) return;
     const selectedText = command.selectedText.trim();
@@ -364,7 +366,7 @@ export class LiveSession {
       policyRef: command.policyRef?.trim() || '直播间人工复核规则',
       confidence: 1,
       status: 'pending',
-      actorId: 'live-operator',
+      actorId,
       createdAt: now,
       updatedAt: now,
     };
