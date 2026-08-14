@@ -68,6 +68,31 @@ export type TranscriptSegment = {
   /** Whether the label was inferred from audio or confirmed by the operator. */
   speakerSource?: SpeakerSource;
   speakerConfidence?: number;
+  /** Product context active when this final segment was recorded. */
+  productId?: string;
+  /** Operator-defined display name, such as 主播张三 or 助理小王. */
+  speakerName?: string;
+};
+
+export type TranscriptAnnotation = {
+  id: string;
+  sessionId: string;
+  segmentId: string;
+  selectedText: string;
+  start: number;
+  end: number;
+  kind: ComplianceRuleKind;
+  risk: Exclude<RiskLevel, 'safe'>;
+  title: string;
+  reason: string;
+  alternative: string;
+  policyRef: string;
+  confidence: number;
+  status: 'pending' | 'confirmed' | 'dismissed';
+  ruleId?: string;
+  actorId: string;
+  createdAt: number;
+  updatedAt: number;
 };
 
 export type TimelineEventType =
@@ -167,7 +192,7 @@ export type ComplianceResult = {
   alternative: string;
   policyRef: string;
   confidence: number;
-  source: 'doubao' | 'local-fallback' | 'custom-rule';
+  source: 'doubao' | 'local-fallback' | 'custom-rule' | 'manual';
   /** Operator action. block_phrase replaces the current wording; it never stops capture or ends the live session. */
   enforcement?: ComplianceEnforcement;
   category?: ComplianceCategory;
@@ -182,6 +207,12 @@ export type ComplianceResult = {
   matchedTerms?: string[];
   /** Only stable term findings are eligible for automatic rule learning. */
   ruleKind?: ComplianceRuleKind;
+  /** Manual annotation id, when the operator records a missed violation. */
+  annotationId?: string;
+  /** Original transcript segment when a finding uses a synthetic finding key. */
+  transcriptSegmentId?: string;
+  evidenceStart?: number;
+  evidenceEnd?: number;
 };
 
 export type ComplianceFindingDisposition = 'pending' | 'confirmed' | 'dismissed';

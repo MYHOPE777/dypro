@@ -5,6 +5,7 @@ import type {
   RiskProfile,
   SessionStats,
   SpeakerLabel,
+  TranscriptAnnotation,
   TranscriptSegment,
   SyncTarget,
 } from './types';
@@ -27,6 +28,7 @@ export type LiveSessionSnapshot = {
   lineup: Product[];
   partialTranscript: string;
   transcriptHistory: TranscriptSegment[];
+  transcriptAnnotations: TranscriptAnnotation[];
   latestCompliance: ComplianceResult | null;
   alerts: ComplianceResult[];
   coachSuggestions: CoachSuggestion[];
@@ -53,7 +55,8 @@ export type LiveCommand =
   | { type: 'select_presenter'; presenterId: string }
   | { type: 'demo_transcript'; text: string; isFinal?: boolean }
   | { type: 'transcript_correct'; segmentId: string; text: string }
-  | { type: 'assign_speaker'; segmentId: string; speaker: SpeakerLabel; speakerId?: string }
+  | { type: 'assign_speaker'; segmentId: string; speaker: SpeakerLabel; speakerId?: string; speakerName?: string }
+  | { type: 'transcript_annotate'; segmentId: string; selectedText: string; start: number; end: number; kind: 'term' | 'sentence' | 'context'; title?: string; reason?: string; alternative?: string; policyRef?: string }
   | { type: 'audio'; pcm: Uint8Array; sampleRate: number; channels?: number; track?: AudioTrack };
 
 export type LiveEventType =
@@ -67,6 +70,7 @@ export type LiveEventType =
   | 'transcript.partial'
   | 'transcript.final'
   | 'transcript.corrected'
+  | 'transcript.annotated'
   | 'speaker.assigned'
   | 'compliance.updated'
   | 'coach.updated'

@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import type { ComplianceFinding, ComplianceFindingDisposition, ComplianceResult, ComplianceRule, CoachSuggestion, LiveRoom, ManualSyncJob, PhraseMetric, PresenterPhrase, PresenterProfile, Product, RiskProfile, RuleAuditEntry, RuleDocument, RuleDocumentSource, RuleDocumentVersion, RulePackage, RuleReview, RuleUnit, SessionStats, SpeechCorrectionEntry, SyncTarget, TranscriptSegment } from '../../src/shared/types';
+import type { ComplianceFinding, ComplianceFindingDisposition, ComplianceResult, ComplianceRule, CoachSuggestion, LiveRoom, ManualSyncJob, PhraseMetric, PresenterPhrase, PresenterProfile, Product, RiskProfile, RuleAuditEntry, RuleDocument, RuleDocumentSource, RuleDocumentVersion, RulePackage, RuleReview, RuleUnit, SessionStats, SpeechCorrectionEntry, SyncTarget, TranscriptAnnotation, TranscriptSegment } from '../../src/shared/types';
 import type { DeliveryJob, DeliveryStatus, LiveEvent, LiveEventType, LiveSessionSnapshot, LiveLifecycle, ResourceDeliveryJob, ResourceDeliveryType, ReviewApproval, ReviewTranscript, SessionReview, SessionSummary } from '../../src/shared/v2';
 
 export type SessionCreation = {
@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS live_sessions (
   lineup_json TEXT NOT NULL,
   partial_transcript TEXT NOT NULL DEFAULT '',
   transcript_json TEXT NOT NULL DEFAULT '[]',
+  transcript_annotations_json TEXT NOT NULL DEFAULT '[]',
   latest_compliance_json TEXT,
   alerts_json TEXT NOT NULL DEFAULT '[]',
   coach_json TEXT NOT NULL DEFAULT '[]',
@@ -345,6 +346,8 @@ export class SqliteFactStore {
     this.db.exec("UPDATE live_sessions SET risk_profile = 'strict' WHERE lifecycle <> 'ended' AND risk_profile <> 'strict'");
     const findingColumns = this.db.prepare('PRAGMA table_info(compliance_findings)').all().map((row) => stringValue(row.name));
     if (!findingColumns.includes('product_json')) this.db.exec('ALTER TABLE compliance_findings ADD COLUMN product_json TEXT');
+    const sessionColumns = this.db.prepare('PRAGMA table_info(live_sessions)').all().map((row) => stringValue(row.name));
+    if (!sessionColumns.includes('transcript_annotations_json')) this.db.exec("ALTER TABLE live_sessions ADD COLUMN transcript_annotations_json TEXT NOT NULL DEFAULT '[]'");
     const deliveryInfo = this.db.prepare('PRAGMA table_info(resource_delivery_jobs)').all();
     const deliveryColumns = deliveryInfo.map((row) => stringValue(row.name));
     if (!deliveryColumns.includes('target')) this.db.exec("ALTER TABLE resource_delivery_jobs ADD COLUMN target TEXT NOT NULL DEFAULT 'merchant_database'");
@@ -378,8 +381,8 @@ export class SqliteFactStore {
     try {
       this.db.prepare('INSERT OR IGNORE INTO tenants (id, name, created_at) VALUES (?, ?, ?)').run(input.tenantId, input.tenantId, now);
       this.db.prepare('INSERT OR IGNORE INTO rooms (id, tenant_id, name, account_name, owner_actor_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(input.roomId, input.tenantId, input.roomId, input.roomId, 'owner', now, now);
-      this.db.prepare('INSERT OR REPLACE INTO live_sessions (id, tenant_id, room_id, presenter_id, presenter_name, lifecycle, product_json, lineup_json, partial_transcript, transcript_json, latest_compliance_json, alerts_json, coach_json, coach_pending, risk_profile, stats_json, content_revision, latest_sequence, created_at, updated_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
-        input.sessionId, input.tenantId, input.roomId, input.presenterId, input.presenterName, 'idle', json(input.product), json(input.lineup), '', '[]', null, '[]', '[]', 0, 'strict', json(stats), 0, 0, now, now, null,
+      this.db.prepare('INSERT OR REPLACE INTO live_sessions (id, tenant_id, room_id, presenter_id, presenter_name, lifecycle, product_json, lineup_json, partial_transcript, transcript_json, transcript_annotations_json, latest_compliance_json, alerts_json, coach_json, coach_pending, risk_profile, stats_json, content_revision, latest_sequence, created_at, updated_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
+        input.sessionId, input.tenantId, input.roomId, input.presenterId, input.presenterName, 'idle', json(input.product), json(input.lineup), '', '[]', '[]', null, '[]', '[]', 0, 'strict', json(stats), 0, 0, now, now, null,
       );
       this.db.prepare('INSERT OR REPLACE INTO session_reviews (session_id, note, approval, delivery, updated_at) VALUES (?, ?, ?, ?, ?)').run(input.sessionId, '', 'approval_required', 'not_queued', now);
       this.appendInsideTransaction(input.sessionId, { type: 'session.created', occurredAt: now, payload: { roomId: input.roomId, tenantId: input.tenantId, presenterId: input.presenterId, presenterName: input.presenterName, productId: input.product.id, product: json(input.product), lineup: json(input.lineup), riskProfile: 'strict' } });
@@ -601,7 +604,22 @@ export class SqliteFactStore {
     if (!existing) throw new Error('待处置风险不存在');
     if (existing.disposition === disposition && (!ruleId || existing.ruleId === ruleId)) return existing;
     if (existing.disposition !== 'pending') throw new Error('该风险已完成处置');
-    this.db.prepare('UPDATE compliance_findings SET disposition = ?, rule_id = ?, disposed_by = ?, disposed_at = ?, resolution_note = ?, updated_at = ? WHERE session_id = ? AND segment_id = ?').run(disposition, ruleId ?? null, actorId, now, note?.trim() || null, now, sessionId, segmentId);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('UPDATE compliance_findings SET disposition = ?, rule_id = ?, disposed_by = ?, disposed_at = ?, resolution_note = ?, updated_at = ? WHERE session_id = ? AND segment_id = ?').run(disposition, ruleId ?? null, actorId, now, note?.trim() || null, now, sessionId, segmentId);
+      if (existing.result.annotationId) {
+        const row = this.getSessionStatement.get(sessionId);
+        const annotations = parseJson<TranscriptAnnotation[]>(row?.transcript_annotations_json, []);
+        const updated = annotations.map((annotation) => annotation.id === existing.result.annotationId
+          ? { ...annotation, status: disposition, ...(ruleId ? { ruleId } : {}), updatedAt: now }
+          : annotation);
+        this.db.prepare('UPDATE live_sessions SET transcript_annotations_json = ?, updated_at = ? WHERE id = ?').run(json(updated), now, sessionId);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
     return this.getComplianceFinding(sessionId, segmentId)!;
   }
 
@@ -692,8 +710,8 @@ export class SqliteFactStore {
       this.db.prepare('DELETE FROM transcript_projections WHERE session_id = ?').run(sessionId);
       this.db.prepare('DELETE FROM compliance_projections WHERE session_id = ?').run(sessionId);
       this.db.prepare('DELETE FROM coach_projections WHERE session_id = ?').run(sessionId);
-      this.db.prepare('UPDATE live_sessions SET presenter_id = ?, presenter_name = ?, lifecycle = ?, product_json = ?, lineup_json = ?, partial_transcript = ?, transcript_json = ?, latest_compliance_json = NULL, alerts_json = ?, coach_json = ?, coach_pending = 0, risk_profile = ?, stats_json = ?, content_revision = 0, latest_sequence = 0, created_at = ?, updated_at = ?, ended_at = NULL WHERE id = ?').run(
-        stringValue(created.payload.presenterId, current.presenterId), stringValue(created.payload.presenterName, current.presenterName), 'idle', json(initialProduct), json(initialLineup), '', '[]', '[]', '[]', stringValue(created.payload.riskProfile, current.riskProfile), json(emptyStats()), created.occurredAt, created.occurredAt, sessionId,
+      this.db.prepare('UPDATE live_sessions SET presenter_id = ?, presenter_name = ?, lifecycle = ?, product_json = ?, lineup_json = ?, partial_transcript = ?, transcript_json = ?, transcript_annotations_json = ?, latest_compliance_json = NULL, alerts_json = ?, coach_json = ?, coach_pending = 0, risk_profile = ?, stats_json = ?, content_revision = 0, latest_sequence = 0, created_at = ?, updated_at = ?, ended_at = NULL WHERE id = ?').run(
+        stringValue(created.payload.presenterId, current.presenterId), stringValue(created.payload.presenterName, current.presenterName), 'idle', json(initialProduct), json(initialLineup), '', '[]', '[]', '[]', '[]', stringValue(created.payload.riskProfile, current.riskProfile), json(emptyStats()), created.occurredAt, created.occurredAt, sessionId,
       );
 
       for (const event of events) {
@@ -1029,8 +1047,8 @@ export class SqliteFactStore {
       ? event.occurredAt
       : previousEndedAt === null || previousEndedAt === undefined ? null : numberValue(previousEndedAt);
     this.db.prepare('UPDATE live_sessions SET presenter_id = ?, presenter_name = ? WHERE id = ?').run(next.presenterId, next.presenterName, sessionId);
-    this.db.prepare('UPDATE live_sessions SET lifecycle = ?, product_json = ?, lineup_json = ?, partial_transcript = ?, transcript_json = ?, latest_compliance_json = ?, alerts_json = ?, coach_json = ?, coach_pending = ?, risk_profile = ?, stats_json = ?, content_revision = ?, latest_sequence = ?, updated_at = ?, ended_at = ? WHERE id = ?').run(
-      next.lifecycle, json(next.product), json(next.lineup), next.partialTranscript, json(next.transcriptHistory), next.latestCompliance ? json(next.latestCompliance) : null, json(next.alerts), json(next.coachSuggestions), next.coachPending ? 1 : 0, next.riskProfile, json(next.stats), next.contentRevision, event.sequence, event.occurredAt, endedAt, sessionId,
+    this.db.prepare('UPDATE live_sessions SET lifecycle = ?, product_json = ?, lineup_json = ?, partial_transcript = ?, transcript_json = ?, transcript_annotations_json = ?, latest_compliance_json = ?, alerts_json = ?, coach_json = ?, coach_pending = ?, risk_profile = ?, stats_json = ?, content_revision = ?, latest_sequence = ?, updated_at = ?, ended_at = ? WHERE id = ?').run(
+      next.lifecycle, json(next.product), json(next.lineup), next.partialTranscript, json(next.transcriptHistory), json(next.transcriptAnnotations), next.latestCompliance ? json(next.latestCompliance) : null, json(next.alerts), json(next.coachSuggestions), next.coachPending ? 1 : 0, next.riskProfile, json(next.stats), next.contentRevision, event.sequence, event.occurredAt, endedAt, sessionId,
     );
   }
 
@@ -1103,15 +1121,29 @@ export class SqliteFactStore {
         snapshot.contentRevision += 1;
         break;
       }
+      case 'transcript.annotated': {
+        const annotation = parseJson<TranscriptAnnotation | null>(payload.annotation, null);
+        if (annotation) {
+          snapshot.transcriptAnnotations = [...snapshot.transcriptAnnotations.filter((item) => item.id !== annotation.id), annotation].slice(-80);
+          snapshot.contentRevision += 1;
+        }
+        break;
+      }
       case 'speaker.assigned': {
         const segmentId = stringValue(payload.segmentId);
         const segmentIds = Array.isArray(payload.segmentIds) ? payload.segmentIds.filter((value): value is string => typeof value === 'string') : [segmentId];
         const speaker = payload.speaker === 'other' ? 'other' : 'host';
-        snapshot.transcriptHistory = snapshot.transcriptHistory.map((segment) => segmentIds.includes(segment.id) ? { ...segment, speaker, speakerSource: 'manual', speakerConfidence: 1 } : segment);
+        const speakerName = typeof payload.speakerName === 'string' && payload.speakerName.trim() ? payload.speakerName.trim() : undefined;
+        snapshot.transcriptHistory = snapshot.transcriptHistory.map((segment) => segmentIds.includes(segment.id) ? { ...segment, speaker, speakerSource: 'manual', speakerConfidence: 1, ...(speakerName ? { speakerName } : {}) } : segment);
         snapshot.contentRevision += 1;
         break;
       }
       case 'compliance.updated': {
+        const annotation = parseJson<TranscriptAnnotation | null>(payload.annotation, null);
+        if (annotation) {
+          snapshot.transcriptAnnotations = [...snapshot.transcriptAnnotations.filter((item) => item.id !== annotation.id), annotation].slice(-80);
+          snapshot.contentRevision += 1;
+        }
         const result = parseJson<ComplianceResult | null>(payload.result, null);
         if (result) {
           const previousRow = result.segmentId ? this.db.prepare('SELECT result_json FROM compliance_projections WHERE session_id = ? AND segment_id = ?').get(event.sessionId, result.segmentId) : undefined;
@@ -1154,12 +1186,14 @@ export class SqliteFactStore {
         const segment = parseJson<TranscriptSegment>(row.segment_json, {} as TranscriptSegment);
         const updated: TranscriptSegment = event.type === 'transcript.corrected'
           ? { ...segment, text: stringValue(event.payload.text, segment.text) }
-          : { ...segment, speaker: event.payload.speaker === 'other' ? 'other' : 'host', speakerSource: 'manual', speakerConfidence: 1, ...(typeof event.payload.speakerId === 'string' ? { speakerId: event.payload.speakerId } : {}) };
+          : { ...segment, speaker: event.payload.speaker === 'other' ? 'other' : 'host', speakerSource: 'manual', speakerConfidence: 1, ...(typeof event.payload.speakerId === 'string' ? { speakerId: event.payload.speakerId } : {}), ...(typeof event.payload.speakerName === 'string' && event.payload.speakerName.trim() ? { speakerName: event.payload.speakerName.trim() } : {}) };
         this.db.prepare('UPDATE transcript_projections SET revision = revision + 1, segment_json = ? WHERE session_id = ? AND segment_id = ?').run(json(updated), sessionId, segmentId);
       }
       if (revokeReview) this.revokeReviewInside(sessionId, event.occurredAt);
     }
+    if (event.type === 'transcript.annotated' && revokeReview) this.revokeReviewInside(sessionId, event.occurredAt);
     if (event.type === 'compliance.updated') {
+      if (event.payload.annotation && revokeReview) this.revokeReviewInside(sessionId, event.occurredAt);
       const result = parseJson<ComplianceResult | null>(event.payload.result, null);
       if (result?.segmentId) {
         this.db.prepare('INSERT INTO compliance_projections (session_id, segment_id, result_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id, segment_id) DO UPDATE SET result_json=excluded.result_json, updated_at=excluded.updated_at').run(sessionId, result.segmentId, json(result), event.occurredAt);
@@ -1191,7 +1225,7 @@ export class SqliteFactStore {
       sessionId: stringValue(row.id), tenantId: stringValue(row.tenant_id), roomId: stringValue(row.room_id),
       presenterId: stringValue(row.presenter_id), presenterName: stringValue(row.presenter_name), lifecycle: stringValue(row.lifecycle, 'idle') as LiveLifecycle,
       product: parseJson<Product>(row.product_json, {} as Product), lineup: parseJson<Product[]>(row.lineup_json, []), partialTranscript: stringValue(row.partial_transcript),
-      transcriptHistory: parseJson<TranscriptSegment[]>(row.transcript_json, []), latestCompliance: parseJson<ComplianceResult | null>(row.latest_compliance_json, null), alerts: parseJson<ComplianceResult[]>(row.alerts_json, []),
+      transcriptHistory: parseJson<TranscriptSegment[]>(row.transcript_json, []), transcriptAnnotations: parseJson<TranscriptAnnotation[]>(row.transcript_annotations_json, []), latestCompliance: parseJson<ComplianceResult | null>(row.latest_compliance_json, null), alerts: parseJson<ComplianceResult[]>(row.alerts_json, []),
       coachSuggestions: parseJson<CoachSuggestion[]>(row.coach_json, []), coachPending: boolValue(row.coach_pending), riskProfile: stringValue(row.risk_profile, 'strict') as RiskProfile,
       stats: parseJson<SessionStats>(row.stats_json, emptyStats()), contentRevision: numberValue(row.content_revision), latestSequence: numberValue(row.latest_sequence), createdAt: numberValue(row.created_at), updatedAt: numberValue(row.updated_at),
     };

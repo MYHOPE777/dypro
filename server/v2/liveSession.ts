@@ -1,6 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import type { ComplianceAnalyzer } from '../../src/compliance/engine';
 import { analyzeTranscript } from '../../src/compliance/engine';
-import type { CoachPurpose, ComplianceResult, ComplianceRule, Product, SpeakerLabel, TranscriptSegment } from '../../src/shared/types';
+import type { CoachPurpose, ComplianceResult, ComplianceRule, Product, SpeakerLabel, TranscriptAnnotation, TranscriptSegment } from '../../src/shared/types';
 import type { LiveCommand, LiveEvent, LiveSessionListener, LiveSessionSnapshot } from '../../src/shared/v2';
 import type { AudioTrack } from '../../src/shared/v2Audio';
 import type { CoachProvider } from '../providers/doubaoCoach';
@@ -78,7 +79,7 @@ export class LiveSession {
   private readonly referencePhraseProvider: (presenterId: string, productId: string) => Array<{ text: string; purpose?: CoachPurpose }>;
   private readonly presenterResolver: (presenterId: string) => { id: string; name: string } | null;
   private readonly speakerDiarizer = new SpeakerDiarizer();
-  private readonly speakerBindings = new Map<string, SpeakerLabel>();
+  private readonly speakerBindings = new Map<string, { speaker: SpeakerLabel; speakerName?: string }>();
   private audioOffsetMs = 0;
   private endingPromise: Promise<void> | null = null;
 
@@ -97,6 +98,11 @@ export class LiveSession {
     const existing = this.store.getSessionSnapshot(this.id);
     this.store.createSession(options.session);
     this.snapshotValue = this.store.getSessionSnapshot(this.id)!;
+    for (const segment of this.snapshotValue.transcriptHistory) {
+      if (segment.speakerId && segment.speakerSource === 'manual' && segment.speaker) {
+        this.speakerBindings.set(segment.speakerId, { speaker: segment.speaker, ...(segment.speakerName ? { speakerName: segment.speakerName } : {}) });
+      }
+    }
     this.productContextStartedAt = this.snapshotValue.createdAt;
     this.segmentSequence = this.snapshotValue.transcriptHistory.reduce((maximum, segment) => {
       const match = segment.id.match(/-segment-(\d+)$/u);
@@ -183,10 +189,13 @@ export class LiveSession {
         await this.ingestTranscript(command.text, command.isFinal ?? true);
         return;
       case 'transcript_correct':
-        this.correctTranscript(command.segmentId, command.text);
+        await this.correctTranscript(command.segmentId, command.text);
         return;
       case 'assign_speaker':
-        this.assignSpeaker(command.segmentId, command.speaker, command.speakerId);
+        this.assignSpeaker(command.segmentId, command.speaker, command.speakerId, command.speakerName);
+        return;
+      case 'transcript_annotate':
+        this.annotateTranscript(command);
         return;
       case 'audio':
         if (this.snapshotValue.lifecycle === 'live') {
@@ -261,7 +270,8 @@ export class LiveSession {
     const boundSpeaker = timing.assignment ? this.speakerBindings.get(timing.assignment.speakerId) : undefined;
     const segment: TranscriptSegment = {
       id, text, isFinal, timestamp: now, offsetMs: endOffsetMs, startOffsetMs, endOffsetMs,
-      speaker: boundSpeaker ?? 'host',
+      speaker: boundSpeaker?.speaker ?? 'host',
+      ...(boundSpeaker?.speakerName ? { speakerName: boundSpeaker.speakerName } : {}),
       ...(timing.assignment ? { speakerId: timing.assignment.speakerId, speakerSource: boundSpeaker ? 'manual' : timing.assignment.source, speakerConfidence: boundSpeaker ? 1 : timing.assignment.confidence } : { speakerSource: 'default' as const, speakerConfidence: 0.5 }),
     };
     if (!isFinal) {
@@ -274,14 +284,15 @@ export class LiveSession {
     const mentioned = segment.speaker !== 'other' ? findMentionedProduct(text, this.snapshotValue.lineup) : null;
     if (mentioned && mentioned.product.id !== this.snapshotValue.product.id) this.selectProduct(mentioned.product.id, 'speech');
     const product = this.snapshotValue.product;
+    const finalizedSegment: TranscriptSegment = { ...segment, productId: product.id };
     const requestNumber = ++this.requestSequence;
     const productGeneration = this.productRevision;
     const revision = this.segmentRevisions.get(id) ?? 0;
-    this.commit('transcript.final', { segment: JSON.stringify(segment), productId: product.id });
+    this.commit('transcript.final', { segment: JSON.stringify(finalizedSegment), productId: product.id });
     const productContext = buildRiskContext(this.snapshotValue.transcriptHistory, this.productContextStartedAt, now);
     await this.reviewPipeline.process({
       token: { requestSequence: requestNumber, productRevision: productGeneration, segmentRevision: revision, segmentId: id },
-      segment,
+      segment: finalizedSegment,
       product,
       roomId: this.snapshotValue.roomId,
       riskProfile: this.snapshotValue.riskProfile,
@@ -293,20 +304,92 @@ export class LiveSession {
     });
   }
 
-  private correctTranscript(segmentIdValue: string, text: string): void {
+  private async correctTranscript(segmentIdValue: string, text: string): Promise<void> {
     const original = this.snapshotValue.transcriptHistory.find((segment) => segment.id === segmentIdValue);
     if (!original || !text.trim()) return;
     this.segmentRevisions.set(segmentIdValue, (this.segmentRevisions.get(segmentIdValue) ?? 0) + 1);
     this.commit('transcript.corrected', { segmentId: segmentIdValue, text: text.trim(), originalText: original.text });
+    if (this.snapshotValue.lifecycle !== 'live' && this.snapshotValue.lifecycle !== 'paused') return;
+    const corrected = this.snapshotValue.transcriptHistory.find((segment) => segment.id === segmentIdValue);
+    if (!corrected) return;
+    const correctedProduct = this.snapshotValue.lineup.find((product) => product.id === corrected.productId) ?? this.products().find((product) => product.id === corrected.productId) ?? this.snapshotValue.product;
+    const requestNumber = ++this.requestSequence;
+    const productGeneration = this.productRevision;
+    await this.reviewPipeline.process({
+      token: { requestSequence: requestNumber, productRevision: productGeneration, segmentRevision: this.segmentRevisions.get(segmentIdValue) ?? 0, segmentId: segmentIdValue },
+      segment: corrected,
+      product: correctedProduct,
+      roomId: this.snapshotValue.roomId,
+      riskProfile: this.snapshotValue.riskProfile,
+      context: buildRiskContext(this.snapshotValue.transcriptHistory, this.productContextStartedAt, this.now()),
+      stats: this.snapshotValue.stats,
+      customRules: this.rulesProvider(correctedProduct),
+      semanticRules: this.semanticRulesProvider?.(correctedProduct),
+      referencePhrases: this.referencePhraseProvider(this.snapshotValue.presenterId, correctedProduct.id),
+    });
   }
 
-  private assignSpeaker(segmentIdValue: string, speaker: SpeakerLabel, speakerId?: string): void {
+  private assignSpeaker(segmentIdValue: string, speaker: SpeakerLabel, speakerId?: string, speakerName?: string): void {
     const target = this.snapshotValue.transcriptHistory.find((segment) => segment.id === segmentIdValue);
     if (!target) return;
     const boundId = speakerId ?? target.speakerId;
-    if (boundId) this.speakerBindings.set(boundId, speaker);
-    const segmentIds = boundId ? this.snapshotValue.transcriptHistory.filter((segment) => segment.speakerId === boundId).map((segment) => segment.id) : [segmentIdValue];
-    this.commit('speaker.assigned', { segmentId: segmentIdValue, segmentIds, speaker, ...(boundId ? { speakerId: boundId } : {}) });
+    const normalizedName = speakerName?.trim().slice(0, 80) || undefined;
+    if (boundId) this.speakerBindings.set(boundId, { speaker, ...(normalizedName ? { speakerName: normalizedName } : {}) });
+    const segmentIds = boundId ? [...new Set([segmentIdValue, ...this.snapshotValue.transcriptHistory.filter((segment) => segment.speakerId === boundId).map((segment) => segment.id)])] : [segmentIdValue];
+    this.commit('speaker.assigned', { segmentId: segmentIdValue, segmentIds, speaker, ...(boundId ? { speakerId: boundId } : {}), ...(normalizedName ? { speakerName: normalizedName } : {}) });
+  }
+
+  private annotateTranscript(command: Extract<LiveCommand, { type: 'transcript_annotate' }>): void {
+    const segment = this.snapshotValue.transcriptHistory.find((candidate) => candidate.id === command.segmentId);
+    if (!segment || !segment.isFinal) return;
+    const selectedText = command.selectedText.trim();
+    const start = Math.max(0, Math.min(segment.text.length, Math.floor(command.start)));
+    const end = Math.max(start, Math.min(segment.text.length, Math.floor(command.end)));
+    const evidence = segment.text.slice(start, end).trim();
+    if (!evidence || evidence !== selectedText) return;
+    const now = this.now();
+    const annotationProduct = this.snapshotValue.lineup.find((product) => product.id === segment.productId) ?? this.products().find((product) => product.id === segment.productId) ?? this.snapshotValue.product;
+    const annotation: TranscriptAnnotation = {
+      id: `annotation-${randomUUID()}`,
+      sessionId: this.id,
+      segmentId: segment.id,
+      selectedText: evidence,
+      start,
+      end,
+      kind: command.kind,
+      risk: 'blocked',
+      title: command.title?.trim() || (command.kind === 'term' ? '人工标注违规词' : '人工标注违规句'),
+      reason: command.reason?.trim() || '主播表达被人工标注为需要拦截的风险内容',
+      alternative: command.alternative?.trim() || '请改用不承诺功效、不绝对化的客观表达',
+      policyRef: command.policyRef?.trim() || '直播间人工复核规则',
+      confidence: 1,
+      status: 'pending',
+      actorId: 'live-operator',
+      createdAt: now,
+      updatedAt: now,
+    };
+    const syntheticSegmentId = `${segment.id}:annotation:${annotation.id}`;
+    const result: ComplianceResult = {
+      id: annotation.id,
+      segmentId: syntheticSegmentId,
+      transcriptSegmentId: segment.id,
+      annotationId: annotation.id,
+      productId: annotationProduct.id,
+      risk: annotation.risk,
+      title: annotation.title,
+      reason: annotation.reason,
+      alternative: annotation.alternative,
+      policyRef: annotation.policyRef,
+      confidence: annotation.confidence,
+      source: 'manual',
+      transcript: segment.text,
+      matchedTerms: [annotation.selectedText],
+      ruleKind: annotation.kind,
+      evidenceStart: annotation.start,
+      evidenceEnd: annotation.end,
+      createdAt: now,
+    };
+    this.commit('compliance.updated', { result: JSON.stringify(result), annotation: JSON.stringify(annotation), product: JSON.stringify(annotationProduct), segmentId: syntheticSegmentId, latest: true });
   }
 
   private commit(type: LiveEvent['type'], payload: Record<string, unknown>): LiveEvent {

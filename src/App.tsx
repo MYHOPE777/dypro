@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import {
   AlertTriangle,
   Archive,
@@ -43,7 +43,7 @@ import type { AudioTrack } from './shared/v2Audio';
 
 const EMPTY: LiveSessionSnapshot = {
   sessionId: '', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '默认主播', lifecycle: 'idle',
-  product: DEFAULT_PRODUCT, lineup: PRODUCTS, partialTranscript: '', transcriptHistory: [], latestCompliance: null, alerts: [], coachSuggestions: [], coachPending: false,
+  product: DEFAULT_PRODUCT, lineup: PRODUCTS, partialTranscript: '', transcriptHistory: [], transcriptAnnotations: [], latestCompliance: null, alerts: [], coachSuggestions: [], coachPending: false,
   riskProfile: 'strict', stats: { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 }, contentRevision: 0, latestSequence: 0, createdAt: Date.now(), updatedAt: Date.now(),
 };
 
@@ -235,19 +235,60 @@ function SpeakerBadge({ segment }: { segment: TranscriptSegment }) {
   const automatic = segment.speakerSource === 'automatic';
   return <span className={`v2-speaker ${segment.speaker === 'other' ? 'other' : 'host'} ${automatic ? 'automatic' : ''}`}>
     {segment.speaker === 'other' ? <UsersRound size={11} /> : <UserRound size={11} />}
-    {segment.speaker === 'other' ? '其他人' : automatic ? `${segment.speakerId ?? '待确认'}` : '主播'}
+    {segment.speakerName || (segment.speaker === 'other' ? '其他人' : automatic ? `${segment.speakerId ?? '待确认'}` : '主播')}
   </span>;
 }
 
-function TranscriptFeed({ snapshot, compact = false }: { snapshot: LiveSessionSnapshot; compact?: boolean }) {
-  const items = snapshot.transcriptHistory.slice(compact ? -4 : -8);
+type TranscriptMenuState = { segment: TranscriptSegment; selectedText: string; start: number; end: number; x: number; y: number };
+type TranscriptEditorState = TranscriptMenuState & ({ mode: 'replace'; replacement: string } | { mode: 'annotate'; kind: 'term' | 'sentence'; reason: string } | { mode: 'speaker'; speaker: 'host' | 'other'; speakerName: string });
+
+function TranscriptFeed({ snapshot, compact = false, send }: { snapshot: LiveSessionSnapshot; compact?: boolean; send?: (command: LiveCommand) => boolean }) {
+  const items = snapshot.transcriptHistory.slice(compact ? -4 : -8).reverse();
+  const [menu, setMenu] = useState<TranscriptMenuState | null>(null);
+  const [editor, setEditor] = useState<TranscriptEditorState | null>(null);
+  useEffect(() => {
+    const close = () => setMenu(null);
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') { setMenu(null); setEditor(null); } };
+    window.addEventListener('click', close);
+    window.addEventListener('keydown', escape);
+    return () => { window.removeEventListener('click', close); window.removeEventListener('keydown', escape); };
+  }, []);
+  const openMenu = (event: ReactMouseEvent<HTMLElement>, segment: TranscriptSegment) => {
+    if (!send) return;
+    event.preventDefault(); event.stopPropagation();
+    const selection = window.getSelection();
+    const selected = selection?.toString().trim() || '';
+    const selectionBelongsToItem = Boolean(selected && selection?.anchorNode && event.currentTarget.contains(selection.anchorNode));
+    const selectedText = selectionBelongsToItem ? selected : segment.text;
+    const start = Math.max(0, segment.text.indexOf(selectedText));
+    const end = start + selectedText.length;
+    setMenu({ segment, selectedText, start, end, x: Math.min(event.clientX, window.innerWidth - 260), y: Math.min(event.clientY, window.innerHeight - 220) });
+  };
+  const replace = () => {
+    if (!editor || editor.mode !== 'replace' || !send) return;
+    const text = `${editor.segment.text.slice(0, editor.start)}${editor.replacement}${editor.segment.text.slice(editor.end)}`.trim();
+    if (text) send({ type: 'transcript_correct', segmentId: editor.segment.id, text });
+    setEditor(null);
+  };
+  const annotate = () => {
+    if (!editor || editor.mode !== 'annotate' || !send) return;
+    send({ type: 'transcript_annotate', segmentId: editor.segment.id, selectedText: editor.selectedText, start: editor.start, end: editor.end, kind: editor.kind, reason: editor.reason });
+    setEditor(null);
+  };
+  const assignSpeaker = () => {
+    if (!editor || editor.mode !== 'speaker' || !send) return;
+    send({ type: 'assign_speaker', segmentId: editor.segment.id, speaker: editor.speaker, speakerId: editor.segment.speakerId, speakerName: editor.speakerName.trim() || (editor.speaker === 'host' ? snapshot.presenterName : '其他人') });
+    setEditor(null);
+  };
   return <section className={`v2-transcript ${compact ? 'compact' : ''}`}>
-    <header><div><span>实时转录</span><strong>{snapshot.partialTranscript ? '识别中' : '已同步'}</strong></div><small>共 {snapshot.transcriptHistory.length} 段</small></header>
+    <header><div><span>实时转录</span><strong>{snapshot.partialTranscript ? '识别中' : '已同步'}</strong></div><small>最新在前 · 共 {snapshot.transcriptHistory.length} 段</small></header>
     {snapshot.partialTranscript && <div className="v2-partial"><span>···</span><p>{snapshot.partialTranscript}</p></div>}
     <div className="v2-transcript-list">
-      {items.map((segment) => <article key={segment.id}><time>{formatTime(segment.timestamp)}</time><SpeakerBadge segment={segment} /><p>{segment.text}</p></article>)}
+      {items.map((segment) => <article key={segment.id} onContextMenu={(event) => openMenu(event, segment)}><time>{formatTime(segment.timestamp)}</time>{send ? <button type="button" className="v2-speaker-button" title="标注说话人" onClick={(event) => { event.stopPropagation(); setEditor({ segment, selectedText: segment.text, start: 0, end: segment.text.length, x: event.clientX, y: event.clientY, mode: 'speaker', speaker: segment.speaker ?? 'host', speakerName: segment.speakerName ?? (segment.speaker === 'other' ? '' : snapshot.presenterName) }); }}><SpeakerBadge segment={segment} /></button> : <SpeakerBadge segment={segment} />}<p>{segment.text}</p></article>)}
       {!items.length && !snapshot.partialTranscript && <div className="v2-empty">开始收音后，识别结果会出现在这里</div>}
     </div>
+    {menu && <div className="v2-transcript-menu" style={{ left: menu.x, top: menu.y }} onClick={(event) => event.stopPropagation()}><small>已选：{menu.selectedText}</small><button type="button" onClick={() => { setEditor({ ...menu, mode: 'replace', replacement: menu.selectedText }); setMenu(null); }}><Pencil size={13} />纠错 / 替换</button><button type="button" onClick={() => { setEditor({ ...menu, mode: 'annotate', kind: 'term', reason: '' }); setMenu(null); }}><ShieldAlert size={13} />标注违规词</button><button type="button" onClick={() => { setEditor({ ...menu, mode: 'annotate', kind: 'sentence', reason: '' }); setMenu(null); }}><ShieldAlert size={13} />标注违规句</button></div>}
+    {editor && <div className="v2-modal v2-transcript-action-modal" onClick={() => setEditor(null)}><section onClick={(event) => event.stopPropagation()}><header><div><strong>{editor.mode === 'replace' ? '纠错或替换' : editor.mode === 'speaker' ? '标注说话人' : editor.kind === 'term' ? '标注违规词' : '标注违规句'}</strong><small>原文：{editor.selectedText}</small></div><button type="button" title="关闭" onClick={() => setEditor(null)}><X size={14} /></button></header>{editor.mode === 'replace' ? <label>替换为<textarea autoFocus value={editor.replacement} onChange={(event) => setEditor({ ...editor, replacement: event.target.value })} /></label> : editor.mode === 'speaker' ? <><label>身份<select value={editor.speaker} onChange={(event) => setEditor({ ...editor, speaker: event.target.value as 'host' | 'other' })}><option value="host">主播</option><option value="other">其它人</option></select></label><label>姓名或备注<input autoFocus value={editor.speakerName} onChange={(event) => setEditor({ ...editor, speakerName: event.target.value })} placeholder={editor.speaker === 'host' ? '例如：主播张三' : '例如：助理小王'} /></label></> : <><label>违规类型<select value={editor.kind} onChange={(event) => setEditor({ ...editor, kind: event.target.value as 'term' | 'sentence' })}><option value="term">违规词 / 明确短语</option><option value="sentence">违规句 / 语义表达</option></select></label><label>判断说明<textarea value={editor.reason} onChange={(event) => setEditor({ ...editor, reason: event.target.value })} placeholder="可选：说明为什么需要拦截，后续人工复核时可修改" /></label></>}<footer><button type="button" onClick={() => setEditor(null)}>取消</button><button type="button" className="primary" onClick={editor.mode === 'replace' ? replace : editor.mode === 'speaker' ? assignSpeaker : annotate}><Save size={13} />保存</button></footer></section></div>}
   </section>;
 }
 
@@ -565,6 +606,7 @@ function ReviewWorkspace({ roomId, onClose }: { roomId: string; onClose: () => v
   const [review, setReview] = useState<SessionReview | null>(null);
   const [note, setNote] = useState('');
   const [editing, setEditing] = useState<{ segmentId: string; text: string } | null>(null);
+  const [speakerEditing, setSpeakerEditing] = useState<{ segmentId: string; speaker: 'host' | 'other'; speakerName: string; speakerId?: string } | null>(null);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -587,7 +629,7 @@ function ReviewWorkspace({ roomId, onClose }: { roomId: string; onClose: () => v
     try { await task(); await loadSessions(); await loadReview(selected); } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } finally { setBusy(false); }
   };
   const saveTranscript = () => editing && run(() => client.correctTranscript(selected, editing.segmentId, editing.text).then(() => setEditing(null)));
-  const assignSpeaker = (segment: TranscriptSegment) => run(() => client.assignSpeaker(selected, segment.id, segment.speaker === 'other' ? 'host' : 'other', segment.speakerId));
+  const saveSpeaker = () => speakerEditing && run(() => client.assignSpeaker(selected, speakerEditing.segmentId, speakerEditing.speaker, speakerEditing.speakerId, speakerEditing.speakerName).then(() => setSpeakerEditing(null)));
   const saveNote = () => run(() => client.saveNote(selected, note));
   const deliver = () => run(() => review?.delivery === 'failed' ? client.retryDelivery(selected) : client.approveDelivery(selected));
 
@@ -598,7 +640,7 @@ function ReviewWorkspace({ roomId, onClose }: { roomId: string; onClose: () => v
         <div className="v2-review-summary"><div><strong>{review.summary.presenterName}</strong><span>内容版本 {review.summary.contentRevision}</span></div><div><span className={`v2-delivery ${review.delivery}`}>{review.delivery === 'synced' ? '已同步' : review.delivery === 'failed' ? '上传失败' : review.approval === 'approved' ? '已人工确认' : '等待人工确认'}</span><button type="button" onClick={deliver} disabled={busy || review.summary.lifecycle !== 'ended' || note !== review.summary.note}><Database size={14} />{review.delivery === 'failed' ? '重新上传' : '确认并上传'}</button></div></div>
         <div className="v2-review-note"><textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录本场表现、待改话术和下一场安排" /><button type="button" disabled={busy || note === review.summary.note} onClick={saveNote}><Save size={13} />保存备注</button></div>
         {review.audioPath && <SessionAudio client={client} sessionId={selected} />}
-        <section className="v2-review-transcripts"><header><span>转录与说话人</span><small>主播 / 其他人可逐段纠正</small></header>{review.transcripts.map((segment) => <article key={segment.id}><time>{formatTime(segment.timestamp)}</time><button type="button" className="v2-speaker-button" onClick={() => void assignSpeaker(segment)} disabled={busy}><SpeakerBadge segment={segment} /></button>{editing?.segmentId === segment.id ? <div className="v2-review-edit"><textarea value={editing.text} onChange={(event) => setEditing({ ...editing, text: event.target.value })} /><button type="button" onClick={() => void saveTranscript()} disabled={busy}><Save size={13} /></button><button type="button" onClick={() => setEditing(null)}><X size={13} /></button></div> : <><p>{segment.text}</p><button type="button" title="纠正文本" onClick={() => setEditing({ segmentId: segment.id, text: segment.text })}><Pencil size={13} /></button></>}</article>)}</section>
+        <section className="v2-review-transcripts"><header><span>转录与说话人</span><small>最新在前 · 可标注主播、助理或其它人姓名</small></header>{[...review.transcripts].reverse().map((segment) => <article key={segment.id}><time>{formatTime(segment.timestamp)}</time><button type="button" className="v2-speaker-button" title="编辑说话人" onClick={() => setSpeakerEditing({ segmentId: segment.id, speaker: segment.speaker ?? 'host', speakerName: segment.speakerName ?? (segment.speaker === 'other' ? '' : review.summary.presenterName), ...(segment.speakerId ? { speakerId: segment.speakerId } : {}) })} disabled={busy}><SpeakerBadge segment={segment} /></button>{speakerEditing?.segmentId === segment.id ? <div className="v2-speaker-edit"><select value={speakerEditing.speaker} onChange={(event) => setSpeakerEditing({ ...speakerEditing, speaker: event.target.value as 'host' | 'other' })}><option value="host">主播</option><option value="other">其它人</option></select><input value={speakerEditing.speakerName} onChange={(event) => setSpeakerEditing({ ...speakerEditing, speakerName: event.target.value })} placeholder={speakerEditing.speaker === 'host' ? '主播姓名' : '例如：助理小王'} /><button type="button" onClick={() => void saveSpeaker()} disabled={busy}><Save size={13} /></button><button type="button" onClick={() => setSpeakerEditing(null)}><X size={13} /></button></div> : editing?.segmentId === segment.id ? <div className="v2-review-edit"><textarea value={editing.text} onChange={(event) => setEditing({ ...editing, text: event.target.value })} /><button type="button" onClick={() => void saveTranscript()} disabled={busy}><Save size={13} /></button><button type="button" onClick={() => setEditing(null)}><X size={13} /></button></div> : <><p>{segment.text}</p><button type="button" title="纠正文本" onClick={() => setEditing({ segmentId: segment.id, text: segment.text })}><Pencil size={13} /></button></>}</article>)}</section>
       </> : <div className="v2-empty">选择一场直播开始复核</div>}</main></div>
     {message && <div className="v2-review-message">{message}</div>}
   </section></div>;
@@ -713,7 +755,7 @@ function OperatorApp() {
   return <div className="v2-app">
     <header className="v2-topbar"><div className="v2-brand"><span><MonitorUp size={18} /></span><div><strong>直播中控</strong><small>风险预警与主播提词</small></div></div><div className="v2-live-state"><i className={live.snapshot.lifecycle === 'live' ? 'live' : ''} /><span>{lifecycleText(live.snapshot.lifecycle)}</span><small>{live.snapshot.presenterName}</small></div><LiveControls snapshot={live.snapshot} connected={live.connected} status={live.status} send={live.send} sendAudio={live.sendAudio} /></header>
     <div className="v2-operator-grid"><ProductRail snapshot={live.snapshot} products={live.products} send={live.send} openHistory={() => setHistoryOpen(true)} openLibrary={() => openLibrary()} />
-      <main className="v2-main"><header className="v2-product-context"><div><span>当前商品</span><h1>{live.snapshot.product.name}</h1></div><strong>{live.snapshot.product.price}</strong></header><CoachBoard snapshot={live.snapshot} /><TranscriptFeed snapshot={live.snapshot} compact /><DemoInput snapshot={live.snapshot} send={live.send} /></main>
+      <main className="v2-main"><header className="v2-product-context"><div><span>当前商品</span><h1>{live.snapshot.product.name}</h1></div><strong>{live.snapshot.product.price}</strong></header><CoachBoard snapshot={live.snapshot} /><TranscriptFeed snapshot={live.snapshot} compact send={live.send} /><DemoInput snapshot={live.snapshot} send={live.send} /></main>
       <aside className="v2-right-rail"><RiskPanel snapshot={live.snapshot} findings={findings} onConfirmFinding={confirmFinding} onDismissFinding={dismissFinding} onOpenInbox={() => openLibrary('rules')} /><section className="v2-session-stats"><div><Clock3 size={14} /><span>直播时长</span><strong>{Math.floor(live.snapshot.stats.speakingSeconds / 60).toString().padStart(2, '0')}:{(live.snapshot.stats.speakingSeconds % 60).toString().padStart(2, '0')}</strong></div><div><AlertTriangle size={14} /><span>风险提醒</span><strong>{live.snapshot.stats.warningCount + live.snapshot.stats.blockedCount}</strong></div></section><DisplayLinkPanel sessionId={live.snapshot.sessionId} /></aside>
     </div>{historyOpen && <ReviewWorkspace roomId={live.snapshot.roomId} onClose={() => setHistoryOpen(false)} />}{libraryOpen && <LibraryWorkspace snapshot={live.snapshot} products={live.products} send={live.send} onClose={() => setLibraryOpen(false)} initialTab={libraryTab} findings={findings} onConfirmFinding={confirmFinding} onDismissFinding={dismissFinding} />}
   </div>;

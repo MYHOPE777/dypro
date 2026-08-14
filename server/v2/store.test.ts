@@ -243,4 +243,19 @@ describe('SqliteFactStore', () => {
     expect(store.getComplianceFinding('session-risk-inbox', 'segment-old')).toMatchObject({ disposition: 'dismissed', resolutionNote: '确认属于误判', result: expect.objectContaining({ reason: '模型补充证据' }) });
     expect(store.listComplianceFindings('room-default', 'pending')).toEqual([]);
   });
+
+  it('rebuilds manual transcript annotations and updates their review status', () => {
+    const store = new SqliteFactStore({ filename: ':memory:' });
+    stores.push(store);
+    store.createSession({ sessionId: 'session-annotation', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '主播', product: DEFAULT_PRODUCT, lineup: [DEFAULT_PRODUCT], createdAt: 1 });
+    const annotation = { id: 'annotation-1', sessionId: 'session-annotation', segmentId: 'segment-1', selectedText: '一定能治', start: 0, end: 4, kind: 'term' as const, risk: 'blocked' as const, title: '医疗功效', reason: '治疗承诺', alternative: '客观描述', policyRef: '直播规则', confidence: 1, status: 'pending' as const, actorId: 'reviewer', createdAt: 2, updatedAt: 2 };
+    store.appendSessionEvent('session-annotation', { type: 'transcript.final', occurredAt: 2, payload: { segment: JSON.stringify({ id: 'segment-1', text: '一定能治喉咙痛', isFinal: true, timestamp: 2, offsetMs: null, startOffsetMs: null, endOffsetMs: null, speaker: 'host' }) } });
+    const result = { id: annotation.id, segmentId: 'segment-1:annotation:annotation-1', transcriptSegmentId: 'segment-1', annotationId: annotation.id, productId: DEFAULT_PRODUCT.id, risk: 'blocked' as const, title: annotation.title, reason: annotation.reason, alternative: annotation.alternative, policyRef: annotation.policyRef, confidence: 1, source: 'manual' as const, transcript: '一定能治喉咙痛', matchedTerms: [annotation.selectedText], ruleKind: 'term' as const, createdAt: 3 };
+    store.appendSessionEvent('session-annotation', { type: 'compliance.updated', occurredAt: 4, payload: { result: JSON.stringify(result), annotation: JSON.stringify(annotation), product: JSON.stringify(DEFAULT_PRODUCT), latest: false } });
+
+    expect(store.getSessionSnapshot('session-annotation')?.transcriptAnnotations[0]).toMatchObject({ id: 'annotation-1', status: 'pending' });
+    const resolved = store.resolveComplianceFinding('session-annotation', result.segmentId, 'dismissed', 'reviewer', undefined, '需要进一步确认', 5);
+    expect(resolved.disposition).toBe('dismissed');
+    expect(store.getSessionSnapshot('session-annotation')?.transcriptAnnotations[0]).toMatchObject({ status: 'dismissed' });
+  });
 });

@@ -26,7 +26,7 @@ class FakeWebSocket {
 function snapshot(): LiveSessionSnapshot {
   return {
     sessionId: 'live-client-test', tenantId: 'tenant-local', roomId: 'room-default', presenterId: 'presenter-default', presenterName: '测试主播', lifecycle: 'live',
-    product: PRODUCTS[0], lineup: PRODUCTS, partialTranscript: '正在介绍商品', transcriptHistory: [], latestCompliance: null, alerts: [],
+    product: PRODUCTS[0], lineup: PRODUCTS, partialTranscript: '正在介绍商品', transcriptHistory: [], transcriptAnnotations: [], latestCompliance: null, alerts: [],
     coachSuggestions: [
       { id: 'one', purpose: '塑品', text: '第一段建议', reason: '建立价值', source: 'local-fallback', createdAt: 1 },
       { id: 'two', purpose: '互动', text: '第二段建议', reason: '引导互动', source: 'local-fallback', createdAt: 1 },
@@ -58,6 +58,26 @@ describe('v2 operator view', () => {
       const frame = JSON.parse(socket.sent.at(-1) as string) as { command: { type: string; productId?: string } };
       expect(frame.command).toEqual({ type: 'select_product', productId: 'headphones' });
     });
+  });
+
+  it('puts the latest transcript first and sends a manual sentence annotation from the context menu', async () => {
+    const { container } = render(<App />);
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    const transcripts = [
+      { id: 'segment-old', text: '较早的话术', isFinal: true, timestamp: 1, offsetMs: null, startOffsetMs: null, endOffsetMs: null, speaker: 'host' as const },
+      { id: 'segment-new', text: '一定能治喉咙痛', isFinal: true, timestamp: 2, offsetMs: null, startOffsetMs: null, endOffsetMs: null, speaker: 'host' as const },
+    ];
+    socket.receive({ type: 'ready', requestId: 'join', sessionId: 'live-transcript-actions', products: PRODUCTS, snapshot: { ...snapshot(), sessionId: 'live-transcript-actions', partialTranscript: '', transcriptHistory: transcripts } });
+
+    await screen.findByText('最新在前 · 共 2 段');
+    expect([...container.querySelectorAll('.v2-transcript-list article > p')].map((node) => node.textContent)).toEqual(['一定能治喉咙痛', '较早的话术']);
+    fireEvent.contextMenu(screen.getByText('一定能治喉咙痛'));
+    fireEvent.click(await screen.findByRole('button', { name: '标注违规句' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+    const frame = JSON.parse(socket.sent.at(-1) as string) as { command: Record<string, unknown> };
+    expect(frame.command).toEqual(expect.objectContaining({ type: 'transcript_annotate', segmentId: 'segment-new', selectedText: '一定能治喉咙痛', start: 0, end: 7, kind: 'sentence' }));
   });
 
   it('labels generated coaching choices as coming from Doubao', async () => {

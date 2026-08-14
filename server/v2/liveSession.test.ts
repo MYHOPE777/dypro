@@ -267,6 +267,20 @@ describe('LiveSession', () => {
     store.close();
   });
 
+  it('persists a named speaker assignment and manual missed-risk annotation', async () => {
+    const { store, session } = makeSession();
+    await session.dispatch({ type: 'start' });
+    await session.dispatch({ type: 'demo_transcript', text: '一定能治喉咙痛', isFinal: true });
+    const segment = session.snapshot().transcriptHistory[0];
+    await session.dispatch({ type: 'assign_speaker', segmentId: segment.id, speaker: 'other', speakerId: 'speaker-2', speakerName: '助理小王' });
+    await session.dispatch({ type: 'transcript_annotate', segmentId: segment.id, selectedText: '一定能治喉咙痛', start: 0, end: segment.text.length, kind: 'sentence' });
+
+    expect(session.snapshot().transcriptHistory[0]).toMatchObject({ speaker: 'other', speakerName: '助理小王' });
+    expect(session.snapshot().transcriptAnnotations[0]).toMatchObject({ selectedText: '一定能治喉咙痛', kind: 'sentence', status: 'pending' });
+    expect(store.listComplianceFindings('room-default', 'pending')).toContainEqual(expect.objectContaining({ result: expect.objectContaining({ source: 'manual', annotationId: expect.any(String), transcriptSegmentId: segment.id }) }));
+    store.close();
+  });
+
   it('auto-switches from presenter speech before predicting the next line from that speech', async () => {
     const coachInputs: CoachInput[] = [];
     const store = new SqliteFactStore({ filename: ':memory:' });

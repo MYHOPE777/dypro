@@ -140,7 +140,8 @@ function isLiveCommand(value: unknown): value is LiveCommand {
     case 'select_presenter': return typeof command.presenterId === 'string' && command.presenterId.length <= 96;
     case 'demo_transcript': return typeof command.text === 'string' && command.text.trim().length > 0 && command.text.length <= 4_000 && (command.isFinal === undefined || typeof command.isFinal === 'boolean');
     case 'transcript_correct': return typeof command.segmentId === 'string' && command.segmentId.length <= 160 && typeof command.text === 'string' && command.text.trim().length > 0 && command.text.length <= 4_000;
-    case 'assign_speaker': return typeof command.segmentId === 'string' && command.segmentId.length <= 160 && (command.speaker === 'host' || command.speaker === 'other') && (command.speakerId === undefined || (typeof command.speakerId === 'string' && command.speakerId.length <= 96));
+    case 'assign_speaker': return typeof command.segmentId === 'string' && command.segmentId.length <= 160 && (command.speaker === 'host' || command.speaker === 'other') && (command.speakerId === undefined || (typeof command.speakerId === 'string' && command.speakerId.length <= 96)) && (command.speakerName === undefined || (typeof command.speakerName === 'string' && command.speakerName.trim().length <= 80));
+    case 'transcript_annotate': return typeof command.segmentId === 'string' && command.segmentId.length <= 160 && typeof command.selectedText === 'string' && command.selectedText.trim().length > 0 && command.selectedText.length <= 2_000 && typeof command.start === 'number' && Number.isInteger(command.start) && typeof command.end === 'number' && Number.isInteger(command.end) && command.start >= 0 && command.end >= command.start && command.end <= 4_000 && (command.kind === 'term' || command.kind === 'sentence' || command.kind === 'context');
     default: return false;
   }
 }
@@ -464,7 +465,25 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
       const speaker = request.body?.speaker === 'other' ? 'other' : request.body?.speaker === 'host' ? 'host' : null;
       if (!speaker) throw new Error('说话人标记无效');
       const session = runtime.snapshot(routeParam(request, 'sessionId')); if (session) runtime.authorization.assert(identity(request), session.roomId, 'review');
-      return response.json(runtime.review.assignSpeaker(routeParam(request, 'sessionId'), routeParam(request, 'segmentId'), speaker, typeof request.body?.speakerId === 'string' ? request.body.speakerId : undefined, actorId(request)));
+      return response.json(runtime.review.assignSpeaker(routeParam(request, 'sessionId'), routeParam(request, 'segmentId'), speaker, typeof request.body?.speakerId === 'string' ? request.body.speakerId : undefined, actorId(request), typeof request.body?.speakerName === 'string' ? request.body.speakerName : undefined));
+    } catch (error) { return jsonError(response, error); }
+  });
+  app.post('/api/v2/sessions/:sessionId/transcripts/:segmentId/annotate', (request, response) => {
+    try {
+      const sessionId = routeParam(request, 'sessionId');
+      const session = runtime.snapshot(sessionId); if (session) runtime.authorization.assert(identity(request), session.roomId, 'review');
+      const kind = request.body?.kind === 'term' || request.body?.kind === 'sentence' || request.body?.kind === 'context' ? request.body.kind : null;
+      if (!kind) throw new Error('违规标注类型无效');
+      const selectedText = bodyString(request.body?.selectedText, '选中文本');
+      const start = Number(request.body?.start); const end = Number(request.body?.end);
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start) throw new Error('选中文本位置无效');
+      return response.status(201).json(runtime.review.annotateTranscript(sessionId, routeParam(request, 'segmentId'), {
+        selectedText, start, end, kind,
+        ...(typeof request.body?.title === 'string' ? { title: request.body.title } : {}),
+        ...(typeof request.body?.reason === 'string' ? { reason: request.body.reason } : {}),
+        ...(typeof request.body?.alternative === 'string' ? { alternative: request.body.alternative } : {}),
+        ...(typeof request.body?.policyRef === 'string' ? { policyRef: request.body.policyRef } : {}),
+      }, actorId(request)));
     } catch (error) { return jsonError(response, error); }
   });
   app.post('/api/v2/sessions/:sessionId/note', (request, response) => {
