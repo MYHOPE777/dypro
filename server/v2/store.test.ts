@@ -99,6 +99,8 @@ describe('SqliteFactStore', () => {
     const store = new SqliteFactStore({ filename });
     stores.push(store);
     expect(store.listResourceDeliveryJobs('queued')).toMatchObject([{ approvalStatus: 'awaiting_approval', target: 'merchant_database' }]);
+    const reproved = store.createManualSyncJobs({ resourceType: 'rule', resourceId: 'legacy-rule', resourceVersion: 1, payload: { roomId: 'room-default' }, targets: ['merchant_database'], actorId: 'operator', now: 2 });
+    expect(reproved[0]).toMatchObject({ approvalStatus: 'approved', approvedBy: 'operator', approvedAt: 2, status: 'queued' });
     rmSync(directory, { recursive: true, force: true });
   });
 

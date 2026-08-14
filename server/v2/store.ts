@@ -942,7 +942,14 @@ export class SqliteFactStore {
       for (const target of [...new Set(input.targets)]) {
         const idempotencyKey = `${input.resourceType}:${input.resourceId}:${input.resourceVersion}:${target}`;
         this.db.prepare("UPDATE resource_delivery_jobs SET status = 'superseded', updated_at = ? WHERE resource_type = ? AND resource_id = ? AND resource_version < ? AND target = ? AND status IN ('queued', 'uploading', 'failed')").run(now, input.resourceType, input.resourceId, input.resourceVersion, target);
-        this.db.prepare('INSERT INTO resource_delivery_jobs (id, resource_type, resource_id, resource_version, target, approval_status, approved_by, approved_at, idempotency_key, payload_json, status, attempt_count, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?) ON CONFLICT(idempotency_key) DO NOTHING').run(`resource-delivery-${randomUUID()}`, input.resourceType, input.resourceId, input.resourceVersion, target, 'approved', input.actorId, now, idempotencyKey, json(input.payload), 'queued', now, now);
+        this.db.prepare(`INSERT INTO resource_delivery_jobs (id, resource_type, resource_id, resource_version, target, approval_status, approved_by, approved_at, idempotency_key, payload_json, status, attempt_count, last_error, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
+          ON CONFLICT(idempotency_key) DO UPDATE SET
+            approval_status = 'approved', approved_by = excluded.approved_by, approved_at = excluded.approved_at,
+            payload_json = excluded.payload_json,
+            status = CASE WHEN resource_delivery_jobs.status IN ('synced', 'uploading') THEN resource_delivery_jobs.status ELSE 'queued' END,
+            last_error = CASE WHEN resource_delivery_jobs.status IN ('synced', 'uploading') THEN resource_delivery_jobs.last_error ELSE NULL END,
+            updated_at = excluded.updated_at`).run(`resource-delivery-${randomUUID()}`, input.resourceType, input.resourceId, input.resourceVersion, target, 'approved', input.actorId, now, idempotencyKey, json(input.payload), 'queued', now, now);
         jobs.push(this.listResourceDeliveryJobs().find((job) => job.idempotencyKey === idempotencyKey)!);
       }
       this.db.exec('COMMIT');

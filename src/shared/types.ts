@@ -396,6 +396,7 @@ export type ManualSyncJob = {
   resourceId: string;
   resourceVersion: number;
   target: SyncTarget;
+  approvalStatus?: 'awaiting_approval' | 'approved';
   status: 'awaiting_approval' | 'queued' | 'uploading' | 'synced' | 'failed' | 'superseded';
   idempotencyKey: string;
   payload: unknown;
