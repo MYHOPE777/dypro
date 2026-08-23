@@ -243,6 +243,11 @@ describe('SqliteFactStore', () => {
     store.editReviewNote('session-reviewed-rebuild', '保留这条复盘备注', 'reviewer', 5);
     store.approveCurrentDelivery('session-reviewed-rebuild', 'reviewer', 6);
 
+    const reviewEvents = store.listSessionEvents('session-reviewed-rebuild').filter((event) => event.type === 'review.edited');
+    expect(reviewEvents).toHaveLength(2);
+    expect(reviewEvents[0].payload.segment).toContain('人工纠正后的话术');
+    expect(reviewEvents[1].payload.note).toBe('保留这条复盘备注');
+
     store.rebuildSessionProjections('session-reviewed-rebuild');
     const review = store.getSessionReview('session-reviewed-rebuild')!;
 

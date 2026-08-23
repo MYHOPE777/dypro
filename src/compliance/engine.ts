@@ -18,6 +18,13 @@ export type ComplianceAnalyzer = {
   analyze(input: AnalysisInput): Promise<ComplianceResult>;
 };
 
+// Realtime review can provide the local result that was already computed on
+// the capture path. Providers that support this hook must reuse it instead of
+// running the local rule engine a second time.
+export type ComplianceAnalyzerWithLocal = ComplianceAnalyzer & {
+  analyzeWithLocal?(input: AnalysisInput, localResult: ComplianceResult, localGuardrailMs?: number): Promise<ComplianceResult>;
+};
+
 type Rule = {
   id: string;
   pattern: RegExp;

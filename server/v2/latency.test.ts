@@ -9,6 +9,41 @@ import { RealtimeReviewPipeline } from './realtimeReviewPipeline';
 const segment: TranscriptSegment = { id: 'segment-latency', text: '这款商品适合日常使用', isFinal: true, timestamp: 1, offsetMs: 1, startOffsetMs: 0, endOffsetMs: 1, speaker: 'host' };
 
 describe('realtime latency budgets', () => {
+  it('reuses the realtime local result instead of running local rules twice', async () => {
+    let localCalls = 0;
+    let analyzerCalls = 0;
+    let analyzeWithLocalCalls = 0;
+    const localResult: ComplianceResult = {
+      id: 'local-once', productId: DEFAULT_PRODUCT.id, risk: 'safe', title: '可继续', reason: '安全',
+      alternative: '继续介绍商品页面信息', policyRef: 'test', confidence: 0.9, source: 'local-fallback',
+      transcript: segment.text, createdAt: 1,
+    };
+    const pipeline = new RealtimeReviewPipeline({
+      sessionId: 'local-once-session',
+      scheduler: new BoundedScheduler({ modelGlobal: 2, modelPerSession: 2, background: 1 }),
+      localAnalyzer: { analyze: async () => { localCalls += 1; return localResult; } },
+      analyzer: {
+        analyze: async () => { analyzerCalls += 1; return localResult; },
+        analyzeWithLocal: async (_input, received) => { analyzeWithLocalCalls += 1; return received; },
+      },
+      isProductSegmentCurrent: () => true,
+      isLatest: () => true,
+      onCompliance: () => undefined,
+      onCoach: () => undefined,
+    });
+
+    await pipeline.process({
+      token: { requestSequence: 1, productRevision: 0, segmentRevision: 0, segmentId: segment.id },
+      segment, product: DEFAULT_PRODUCT, riskProfile: 'strict',
+      context: { text: segment.text, segmentCount: 1, windowStartMs: 0, windowEndMs: 1 },
+      stats: { speakingSeconds: 0, words: 0, blockedCount: 0, warningCount: 0, safeCount: 0 },
+    });
+    await vi.waitFor(() => expect(analyzeWithLocalCalls).toBe(1));
+
+    expect(localCalls).toBe(1);
+    expect(analyzerCalls).toBe(0);
+  });
+
   it('keeps local rule P95 below 50ms and first three prompts below 800ms', async () => {
     const samples: number[] = [];
     for (let index = 0; index < 100; index += 1) {

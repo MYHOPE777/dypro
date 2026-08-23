@@ -1,4 +1,4 @@
-import type { ComplianceAnalyzer, AnalysisInput } from '../../src/compliance/engine';
+import type { ComplianceAnalyzer, ComplianceAnalyzerWithLocal, AnalysisInput } from '../../src/compliance/engine';
 import { analyzeTranscript } from '../../src/compliance/engine';
 import type { ComplianceAnalysisTiming, ComplianceCategory, ComplianceResult } from '../../src/shared/types';
 import { SemanticReviewPolicy } from '../compliance/semanticReviewPolicy';
@@ -58,7 +58,7 @@ function fromDoubao(input: AnalysisInput, payload: Record<string, unknown>): Com
   };
 }
 
-export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
+export class DoubaoComplianceAnalyzer implements ComplianceAnalyzerWithLocal {
   private readonly config: ArkConfig | null;
   private readonly maxOutputTokens: number;
   private readonly localFastPath: boolean;
@@ -80,6 +80,14 @@ export class DoubaoComplianceAnalyzer implements ComplianceAnalyzer {
     const localStartedAt = performance.now();
     const localResult = await analyzeTranscript(input);
     const localGuardrailMs = elapsedMs(localStartedAt);
+    return this.analyzeWithLocalInternal(input, localResult, localGuardrailMs, analyzerStartedAt);
+  }
+
+  async analyzeWithLocal(input: AnalysisInput, localResult: ComplianceResult, localGuardrailMs = 0): Promise<ComplianceResult> {
+    return this.analyzeWithLocalInternal(input, localResult, localGuardrailMs, performance.now());
+  }
+
+  private async analyzeWithLocalInternal(input: AnalysisInput, localResult: ComplianceResult, localGuardrailMs: number, analyzerStartedAt: number): Promise<ComplianceResult> {
     const review = this.reviewPolicy.decide({
       roomId: input.roomId,
       productId: input.productId,

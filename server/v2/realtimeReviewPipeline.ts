@@ -1,4 +1,4 @@
-import { createLocalAnalyzer, type AnalysisInput, type ComplianceAnalyzer } from '../../src/compliance/engine';
+import { createLocalAnalyzer, type AnalysisInput, type ComplianceAnalyzer, type ComplianceAnalyzerWithLocal } from '../../src/compliance/engine';
 import type { CoachPurpose, ComplianceResult, ComplianceRule, CoachSuggestion, Product, RiskProfile, SessionStats, TranscriptSegment } from '../../src/shared/types';
 import { localSuggestions, type CoachInput, type CoachProvider } from '../providers/doubaoCoach';
 import { BoundedScheduler } from './scheduler';
@@ -42,7 +42,8 @@ export class RealtimeReviewPipeline {
   constructor(private readonly options: {
     sessionId: string;
     scheduler: BoundedScheduler;
-    analyzer: Pick<ComplianceAnalyzer, 'analyze'>;
+    analyzer: Pick<ComplianceAnalyzerWithLocal, 'analyze' | 'analyzeWithLocal'>;
+    localAnalyzer?: Pick<ComplianceAnalyzer, 'analyze'>;
     coach?: CoachProvider | null;
     now?: () => number;
     isProductSegmentCurrent: (token: ReviewToken) => boolean;
@@ -58,7 +59,8 @@ export class RealtimeReviewPipeline {
     const processStartedAt = this.monotonicNow();
     const analysisInput: AnalysisInput = { roomId: input.roomId, productId: product.id, transcript: segment.text, product, speaker: segment.speaker, speakerId: segment.speakerId, riskProfile: 'strict', context: input.context, customRules: input.customRules, semanticRules: input.semanticRules };
     const localStartedAt = this.monotonicNow();
-    const localResult = await this.options.scheduler.run('realtime', this.options.sessionId, () => this.localAnalyzer.analyze(analysisInput));
+    const localAnalyzer = this.options.localAnalyzer ?? this.localAnalyzer;
+    const localResult = await this.options.scheduler.run('realtime', this.options.sessionId, () => localAnalyzer.analyze(analysisInput));
     const localCompletedAt = this.monotonicNow();
     const local = { ...normalized(localResult, segment, product, this.now()), analysisMs: this.elapsed(processStartedAt, localCompletedAt) };
     this.logTiming(input, 'local_rule', processStartedAt, localStartedAt, localCompletedAt);
@@ -108,7 +110,10 @@ export class RealtimeReviewPipeline {
       semanticStartedAt = this.monotonicNow();
       const remainingMs = MODEL_BUDGET_MS - this.elapsed(semanticQueuedAt, semanticStartedAt);
       if (remainingMs <= 0) return { value: local, expired: true };
-      const result = await withTimeout(this.options.analyzer.analyze(analysisInput), remainingMs, local);
+      const semanticResult = this.options.analyzer.analyzeWithLocal
+        ? this.options.analyzer.analyzeWithLocal(analysisInput, local, this.elapsed(processStartedAt, localCompletedAt))
+        : this.options.analyzer.analyze(analysisInput);
+      const result = await withTimeout(semanticResult, remainingMs, local);
       return { value: result.value, expired: result.timedOut };
     });
     void withTimeout(semanticTask, MODEL_BUDGET_MS, { value: local, expired: true }).then((remote) => {

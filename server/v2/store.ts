@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import type { ComplianceFinding, ComplianceFindingDisposition, ComplianceResult, ComplianceRule, CoachSuggestion, LiveRoom, ManualSyncJob, PhraseMetric, PresenterPhrase, PresenterProfile, Product, RiskProfile, RuleAuditEntry, RuleDocument, RuleDocumentSource, RuleDocumentVersion, RulePackage, RuleReview, RuleUnit, SessionStats, SpeechCorrectionEntry, SyncTarget, TranscriptAnnotation, TranscriptSegment } from '../../src/shared/types';
 import type { DeliveryJob, DeliveryStatus, LiveEvent, LiveEventType, LiveSessionSnapshot, LiveLifecycle, ResourceDeliveryJob, ResourceDeliveryType, ReviewApproval, ReviewTranscript, SessionReview, SessionSummary } from '../../src/shared/v2';
+import { reduceSessionSnapshot } from './sessionEventKernel';
 
 export type SessionCreation = {
   sessionId: string;
@@ -703,6 +704,9 @@ export class SqliteFactStore {
     const initialProduct = parseJson<Product>(created.payload.product, current.product);
     const initialLineup = parseJson<Product[]>(created.payload.lineup, current.lineup);
     const reviewEdits = this.db.prepare('SELECT * FROM review_edits WHERE session_id = ? ORDER BY content_revision, created_at, id').all(sessionId);
+    // New review.edited events carry the complete after-state. Keep the
+    // review_edits fallback only for events written by older versions.
+    const eventEditIds = new Set(events.map((event) => typeof event.payload.editId === 'string' ? event.payload.editId : null).filter((value): value is string => Boolean(value)));
 
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -723,6 +727,7 @@ export class SqliteFactStore {
       let contentRevision = this.getContentRevision(sessionId);
       let updatedAt = events.at(-1)?.occurredAt ?? created.occurredAt;
       for (const edit of reviewEdits) {
+        if (eventEditIds.has(stringValue(edit.id))) continue;
         const kind = stringValue(edit.kind);
         if (kind === 'transcript.corrected' || kind === 'speaker.assigned') {
           const segmentId = stringValue(edit.segment_id);
@@ -822,8 +827,9 @@ export class SqliteFactStore {
       this.db.prepare('UPDATE live_sessions SET transcript_json = ?, content_revision = ?, updated_at = ? WHERE id = ?').run(json(this.transcriptsForSession(sessionId)), contentRevision, now, sessionId);
       this.revokeReviewInside(sessionId, now);
       if (correction) this.recordSpeechCorrectionInside(correction.roomId, { ...correction, actorId, sessionId, segmentId }, now);
-      this.db.prepare('INSERT INTO review_edits (id, session_id, segment_id, kind, before_json, after_json, content_revision, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(`edit-${randomUUID()}`, sessionId, segmentId, kind, json(previous), json(segment), contentRevision, actorId, now);
-      this.appendInsideTransaction(sessionId, { type: 'review.edited', occurredAt: now, payload: { kind, segmentId, contentRevision, actorId } });
+      const editId = `edit-${randomUUID()}`;
+      this.db.prepare('INSERT INTO review_edits (id, session_id, segment_id, kind, before_json, after_json, content_revision, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(editId, sessionId, segmentId, kind, json(previous), json(segment), contentRevision, actorId, now);
+      this.appendInsideTransaction(sessionId, { type: 'review.edited', occurredAt: now, payload: { editId, kind, segmentId, contentRevision, revision, actorId, segment: json(segment) } });
       this.db.exec('COMMIT');
       return { contentRevision, segment };
     } catch (error) {
@@ -854,8 +860,9 @@ export class SqliteFactStore {
       const contentRevision = numberValue(session.content_revision) + 1;
       this.db.prepare('UPDATE live_sessions SET content_revision = ?, updated_at = ? WHERE id = ?').run(contentRevision, now, sessionId);
       this.revokeReviewInside(sessionId, now, note);
-      this.db.prepare('INSERT INTO review_edits (id, session_id, segment_id, kind, before_json, after_json, content_revision, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(`edit-${randomUUID()}`, sessionId, null, 'note.updated', json({ note: stringValue(review.note) }), json({ note }), contentRevision, actorId, now);
-      this.appendInsideTransaction(sessionId, { type: 'review.edited', occurredAt: now, payload: { kind: 'note.updated', contentRevision, actorId } });
+      const editId = `edit-${randomUUID()}`;
+      this.db.prepare('INSERT INTO review_edits (id, session_id, segment_id, kind, before_json, after_json, content_revision, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(editId, sessionId, null, 'note.updated', json({ note: stringValue(review.note) }), json({ note }), contentRevision, actorId, now);
+      this.appendInsideTransaction(sessionId, { type: 'review.edited', occurredAt: now, payload: { editId, kind: 'note.updated', contentRevision, actorId, note } });
       this.db.exec('COMMIT');
       return contentRevision;
     } catch (error) {
@@ -1062,131 +1069,35 @@ export class SqliteFactStore {
   }
 
   private project(row: SqlRow, event: LiveEvent): LiveSessionSnapshot {
-    const snapshot = this.snapshotFromRow(row);
-    const payload = event.payload;
-    switch (event.type) {
-      case 'lifecycle.changed': {
-        snapshot.lifecycle = (payload.lifecycle as LiveLifecycle) ?? snapshot.lifecycle;
-        if (snapshot.lifecycle === 'ended') snapshot.partialTranscript = '';
-        break;
+    let previousCompliance: ComplianceResult | null = null;
+    if (event.type === 'compliance.updated') {
+      const result = parseJson<ComplianceResult | null>(event.payload.result, null);
+      if (result?.segmentId) {
+        const previousRow = this.db.prepare('SELECT result_json FROM compliance_projections WHERE session_id = ? AND segment_id = ?').get(event.sessionId, result.segmentId);
+        previousCompliance = parseJson<ComplianceResult | null>(previousRow?.result_json, null);
       }
-      case 'product.selected': {
-        const product = parseJson<Product | null>(payload.product, null);
-        if (product) {
-          snapshot.product = product;
-          // Results and prompts are scoped to the active product. Clearing them
-          // here prevents a delayed model response from appearing under a new SKU.
-          snapshot.latestCompliance = null;
-          snapshot.coachSuggestions = [];
-          snapshot.coachPending = false;
-        }
-        break;
-      }
-      case 'lineup.updated': {
-        const lineup = parseJson<Product[]>(payload.lineup, []);
-        if (lineup.length) {
-          snapshot.lineup = lineup;
-          snapshot.product = lineup.find((product) => product.id === snapshot.product.id) ?? snapshot.product;
-          snapshot.latestCompliance = null;
-          snapshot.coachSuggestions = [];
-          snapshot.coachPending = false;
-        }
-        break;
-      }
-      case 'risk_profile.changed':
-        if (payload.profile === 'strict' || payload.profile === 'balanced' || payload.profile === 'optimized') snapshot.riskProfile = payload.profile;
-        break;
-      case 'presenter.selected':
-        snapshot.presenterId = stringValue(payload.presenterId, snapshot.presenterId);
-        snapshot.presenterName = stringValue(payload.presenterName, snapshot.presenterName);
-        break;
-      case 'transcript.partial':
-        snapshot.partialTranscript = stringValue(payload.text);
-        break;
-      case 'transcript.final': {
-        const segment = parseJson<TranscriptSegment | null>(payload.segment, null);
-        if (segment) {
-          snapshot.partialTranscript = '';
-          snapshot.transcriptHistory = [...snapshot.transcriptHistory.filter((candidate) => candidate.id !== segment.id), segment].slice(-80);
-          snapshot.stats.words += segment.text.replace(/\s/g, '').length;
-          const offset = segment.endOffsetMs ?? segment.offsetMs;
-          if (offset !== null && offset !== undefined) snapshot.stats.speakingSeconds = Math.max(snapshot.stats.speakingSeconds, Math.round(offset / 1_000));
-          this.db.prepare('INSERT INTO transcript_projections (session_id, segment_id, revision, segment_json, original_text, note) VALUES (?, ?, 0, ?, ?, \'\') ON CONFLICT(session_id, segment_id) DO UPDATE SET segment_json=excluded.segment_json').run(event.sessionId, segment.id, json(segment), segment.text);
-        }
-        break;
-      }
-      case 'transcript.corrected': {
-        const segmentId = stringValue(payload.segmentId);
-        const text = stringValue(payload.text);
-        snapshot.transcriptHistory = snapshot.transcriptHistory.map((segment) => segment.id === segmentId ? { ...segment, text } : segment);
-        snapshot.contentRevision += 1;
-        break;
-      }
-      case 'transcript.annotated': {
-        const annotation = parseJson<TranscriptAnnotation | null>(payload.annotation, null);
-        if (annotation) {
-          snapshot.transcriptAnnotations = [...snapshot.transcriptAnnotations.filter((item) => item.id !== annotation.id), annotation].slice(-80);
-          snapshot.contentRevision += 1;
-        }
-        break;
-      }
-      case 'transcript.annotation_resolved': {
-        const annotationId = stringValue(payload.annotationId);
-        const status = payload.disposition === 'confirmed' ? 'confirmed' : payload.disposition === 'dismissed' ? 'dismissed' : null;
-        if (annotationId && status) {
-          snapshot.transcriptAnnotations = snapshot.transcriptAnnotations.map((annotation) => annotation.id === annotationId
-            ? { ...annotation, status, ...(typeof payload.ruleId === 'string' ? { ruleId: payload.ruleId } : {}), updatedAt: event.occurredAt }
-            : annotation);
-        }
-        break;
-      }
-      case 'speaker.assigned': {
-        const segmentId = stringValue(payload.segmentId);
-        const segmentIds = Array.isArray(payload.segmentIds) ? payload.segmentIds.filter((value): value is string => typeof value === 'string') : [segmentId];
-        const speaker = payload.speaker === 'other' ? 'other' : 'host';
-        const speakerName = typeof payload.speakerName === 'string' && payload.speakerName.trim() ? payload.speakerName.trim() : undefined;
-        snapshot.transcriptHistory = snapshot.transcriptHistory.map((segment) => segmentIds.includes(segment.id) ? { ...segment, speaker, speakerSource: 'manual', speakerConfidence: 1, ...(typeof payload.speakerId === 'string' ? { speakerId: payload.speakerId } : {}), ...(speakerName ? { speakerName } : {}) } : segment);
-        snapshot.contentRevision += 1;
-        break;
-      }
-      case 'compliance.updated': {
-        const annotation = parseJson<TranscriptAnnotation | null>(payload.annotation, null);
-        if (annotation) {
-          snapshot.transcriptAnnotations = [...snapshot.transcriptAnnotations.filter((item) => item.id !== annotation.id), annotation].slice(-80);
-          snapshot.contentRevision += 1;
-        }
-        const result = parseJson<ComplianceResult | null>(payload.result, null);
-        if (result) {
-          const previousRow = result.segmentId ? this.db.prepare('SELECT result_json FROM compliance_projections WHERE session_id = ? AND segment_id = ?').get(event.sessionId, result.segmentId) : undefined;
-          const previous = parseJson<ComplianceResult | null>(previousRow?.result_json, null);
-          if (previous) snapshot.stats[`${previous.risk}Count` as 'safeCount' | 'warningCount' | 'blockedCount'] = Math.max(0, snapshot.stats[`${previous.risk}Count` as 'safeCount' | 'warningCount' | 'blockedCount'] - 1);
-          if (payload.latest !== false) snapshot.latestCompliance = result;
-          snapshot.alerts = snapshot.alerts.filter((alert) => alert.segmentId !== result.segmentId);
-          if (result.risk !== 'safe') snapshot.alerts = [result, ...snapshot.alerts].slice(0, 20);
-          snapshot.stats[`${result.risk}Count` as 'safeCount' | 'warningCount' | 'blockedCount'] += 1;
-        }
-        break;
-      }
-      case 'coach.updated': {
-        snapshot.coachSuggestions = parseJson<CoachSuggestion[]>(payload.suggestions, []);
-        snapshot.coachPending = boolValue(payload.pending);
-        break;
-      }
-      case 'capture.error':
-        snapshot.lifecycle = 'paused';
-        snapshot.partialTranscript = '';
-        break;
-      case 'session.created':
-      case 'session.ended':
-      case 'review.edited':
-        break;
     }
-    snapshot.latestSequence = event.sequence;
-    snapshot.updatedAt = event.occurredAt;
-    return snapshot;
+    return reduceSessionSnapshot(this.snapshotFromRow(row), event, { previousCompliance });
   }
 
   private projectNormalizedTables(sessionId: string, event: LiveEvent, revokeReview = true): void {
+    if (event.type === 'transcript.final') {
+      const segment = parseJson<TranscriptSegment | null>(event.payload.segment, null);
+      if (segment) {
+        this.db.prepare('INSERT INTO transcript_projections (session_id, segment_id, revision, segment_json, original_text, note) VALUES (?, ?, 0, ?, ?, \'\') ON CONFLICT(session_id, segment_id) DO UPDATE SET segment_json=excluded.segment_json').run(sessionId, segment.id, json(segment), segment.text);
+      }
+    }
+    if (event.type === 'review.edited' && event.payload.segment) {
+      const segmentId = stringValue(event.payload.segmentId);
+      const segment = parseJson<TranscriptSegment | null>(event.payload.segment, null);
+      if (segment && segmentId) {
+        const row = this.db.prepare('SELECT revision FROM transcript_projections WHERE session_id = ? AND segment_id = ?').get(sessionId, segmentId);
+        if (row) {
+          const revision = numberValue(event.payload.revision, numberValue(row.revision) + 1);
+          this.db.prepare('UPDATE transcript_projections SET revision = ?, segment_json = ? WHERE session_id = ? AND segment_id = ?').run(revision, json(segment), sessionId, segmentId);
+        }
+      }
+    }
     if (event.type === 'transcript.corrected' || event.type === 'speaker.assigned') {
       const targetId = stringValue(event.payload.segmentId);
       const segmentIds = event.type === 'speaker.assigned' && Array.isArray(event.payload.segmentIds)

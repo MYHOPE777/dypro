@@ -14,6 +14,9 @@
 | `server/v2/capture.ts` | 麦克风音频、ASR 连接、恢复、暂停和结束。 |
 | `server/v2/http.ts` | `/api/v2`、`/ws/v2`、权限、收音租约和连接关闭。 |
 | `server/v2/store.ts` | SQLite 事务、追加事件和本地投影。 |
+| `server/v2/sessionEventKernel.ts` | 无数据库依赖的场次事件 reducer，供实时投影与重建共用。 |
+| `server/v2/realtimeReviewPipeline.ts` | 本地规则、语义复核、提词竞态和延迟预算。 |
+| `server/v2/ruleActivation.ts` | 将旧规则与规则包编译为当前上下文的统一激活快照。 |
 | `server/v2/rules.ts` | 待处置风险确认后的本地规则、版本、审计和公共规则提交。 |
 | `server/providers/productComplianceProfiler.ts` | 商品行业、标准类目和抖音直播合规画像生成及离线兜底。 |
 | `src/App.tsx` | 操作台、主播屏、资料管理和历史复核视图。 |
