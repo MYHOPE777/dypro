@@ -7,7 +7,6 @@ import cors from 'cors';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { LiveCommand } from '../../src/shared/v2';
 import type { CoachPurpose, CommercePlatformRuleset, ComplianceResult, Product, ProductComplianceProfile, SyncTarget } from '../../src/shared/types';
-import type { ResourceDeliveryJob } from '../../src/shared/v2';
 import type { V2ClientCommand, V2ClientFrame, V2JoinCommand, V2ServerFrame } from '../../src/shared/v2Protocol';
 import { decodeAudioFrame } from '../../src/shared/v2Audio';
 import { createRuntime, type V2Runtime } from './runtime';
@@ -122,16 +121,6 @@ function productInput(productId: string, value: unknown): Product {
 function syncTargets(value: unknown): Exclude<SyncTarget, 'local'>[] {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.filter((target): target is Exclude<SyncTarget, 'local'> => target === 'merchant_database' || target === 'private_knowledge_base'))];
-}
-
-function resourceRoomId(job: ResourceDeliveryJob): string | undefined {
-  if (!job.payload || typeof job.payload !== 'object') return undefined;
-  const payload = job.payload as Record<string, unknown>;
-  if (typeof payload.roomId === 'string') return payload.roomId;
-  if (payload.package && typeof payload.package === 'object' && typeof (payload.package as Record<string, unknown>).roomId === 'string') {
-    return (payload.package as Record<string, unknown>).roomId as string;
-  }
-  return undefined;
 }
 
 function routeParam(request: Request, name: string): string {
@@ -301,40 +290,29 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
     try {
       const roomId = routeParam(request, 'roomId'); runtime.authorization.assert(identity(request), roomId, 'view');
       const disposition = request.query.disposition === 'confirmed' || request.query.disposition === 'dismissed' || request.query.disposition === 'all' ? request.query.disposition : 'pending';
-      return response.json(runtime.store.listComplianceFindings(roomId, disposition));
+      return response.json(runtime.findings.list(roomId, disposition));
     } catch (error) { return jsonError(response, error, 403); }
   });
   app.post('/api/v2/sessions/:sessionId/compliance-findings/:segmentId/confirm', (request, response) => {
     try {
       const sessionId = routeParam(request, 'sessionId'); const segmentId = routeParam(request, 'segmentId');
-      const finding = runtime.store.getComplianceFinding(sessionId, segmentId); if (!finding) return response.status(404).json({ message: '待处置风险不存在' });
+      const finding = runtime.findings.get(sessionId, segmentId); if (!finding) return response.status(404).json({ message: '待处置风险不存在' });
       runtime.authorization.assert(identity(request), finding.roomId, 'control');
-      if (finding.disposition === 'confirmed' && finding.ruleId) return response.json({ finding, rule: runtime.store.getRule(finding.ruleId) });
-      if (finding.disposition !== 'pending') return response.status(409).json({ message: '该风险已完成处置' });
-      const snapshot = runtime.snapshot(sessionId);
-      const product = (finding.product?.id === finding.productId ? finding.product : undefined)
-        ?? runtime.listProducts(finding.roomId).find((candidate) => candidate.id === finding.productId)
-        ?? snapshot?.lineup.find((candidate) => candidate.id === finding.productId)
-        ?? (snapshot?.product.id === finding.productId ? snapshot.product : undefined);
-      if (!product) return response.status(409).json({ message: '无法找到风险发生时的商品资料，请先恢复该商品后再确认' });
-      if (finding.result.ruleKind === 'sentence' || finding.result.ruleKind === 'context') {
-        const semanticUnit = runtime.rulePackages.confirmSemanticFinding(finding.roomId, actorId(request), finding.result, product);
-        const resolved = runtime.store.resolveComplianceFinding(sessionId, segmentId, 'confirmed', actorId(request), undefined, typeof request.body?.note === 'string' ? request.body.note : undefined);
-        return response.status(201).json({ finding: resolved, semanticUnit });
-      }
-      const rule = runtime.rules.confirmFinding(finding.roomId, actorId(request), finding.result, product);
-      const resolved = runtime.store.resolveComplianceFinding(sessionId, segmentId, 'confirmed', actorId(request), rule.id, typeof request.body?.note === 'string' ? request.body.note : undefined);
-      return response.status(201).json({ finding: resolved, rule });
+      if (finding.disposition !== 'pending' && finding.disposition !== 'confirmed') return response.status(409).json({ message: '该风险已完成处置' });
+      const resolved = runtime.findings.confirm(sessionId, segmentId, actorId(request), typeof request.body?.note === 'string' ? request.body.note : undefined);
+      if (!resolved) return response.status(404).json({ message: '待处置风险不存在' });
+      return response.status(finding.disposition === 'confirmed' ? 200 : 201).json(resolved);
     } catch (error) { return jsonError(response, error); }
   });
   app.post('/api/v2/sessions/:sessionId/compliance-findings/:segmentId/dismiss', (request, response) => {
     try {
       const sessionId = routeParam(request, 'sessionId'); const segmentId = routeParam(request, 'segmentId');
-      const finding = runtime.store.getComplianceFinding(sessionId, segmentId); if (!finding) return response.status(404).json({ message: '待处置风险不存在' });
+      const finding = runtime.findings.get(sessionId, segmentId); if (!finding) return response.status(404).json({ message: '待处置风险不存在' });
       runtime.authorization.assert(identity(request), finding.roomId, 'control');
-      if (finding.disposition === 'dismissed') return response.json(finding);
-      if (finding.disposition !== 'pending') return response.status(409).json({ message: '该风险已完成处置' });
-      return response.json(runtime.store.resolveComplianceFinding(sessionId, segmentId, 'dismissed', actorId(request), undefined, typeof request.body?.note === 'string' ? request.body.note : undefined));
+      if (finding.disposition === 'confirmed') return response.status(409).json({ message: '该风险已完成处置' });
+      const resolved = runtime.findings.dismiss(sessionId, segmentId, actorId(request), typeof request.body?.note === 'string' ? request.body.note : undefined);
+      if (!resolved) return response.status(404).json({ message: '待处置风险不存在' });
+      return response.json(resolved);
     } catch (error) { return jsonError(response, error); }
   });
   app.patch('/api/v2/rules/:ruleId', (request, response) => {
@@ -374,35 +352,27 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
   });
   app.post('/api/v2/rules/:ruleId/sync', (request, response) => {
     try {
-      const rule = runtime.store.getRule(routeParam(request, 'ruleId')); if (!rule) return response.status(404).json({ message: '规则不存在' });
+      const rule = runtime.manualDelivery.getRule(routeParam(request, 'ruleId')); if (!rule) return response.status(404).json({ message: '规则不存在' });
       runtime.authorization.assert(identity(request), rule.roomId, 'control');
-      if (rule.status !== 'published' || !rule.enabled) return response.status(409).json({ message: '只有已启用的本地规则才能同步' });
-      const jobs = runtime.store.createManualSyncJobs({ resourceType: 'rule', resourceId: rule.id, resourceVersion: rule.version, payload: rule, targets: syncTargets(request.body?.targets), actorId: actorId(request) });
-      response.status(201).json(jobs);
+      response.status(201).json(runtime.manualDelivery.syncRule(rule.id, syncTargets(request.body?.targets), actorId(request)));
     } catch (error) { jsonError(response, error); }
   });
   app.post('/api/v2/rule-units/:unitId/sync', (request, response) => {
     try {
-      const unit = runtime.store.getRuleUnit(routeParam(request, 'unitId')); if (!unit) return response.status(404).json({ message: '规则单元不存在' });
-      const pkg = runtime.store.getRulePackage(unit.packageId); if (!pkg) return response.status(404).json({ message: '规则包不存在' });
-      if (pkg.roomId) runtime.authorization.assert(identity(request), pkg.roomId, 'control'); else runtime.authorization.assertServiceReview(identity(request));
-      if (unit.status !== 'active' || !unit.enabled) return response.status(409).json({ message: '只有已激活的规则单元才能同步' });
-      response.status(201).json(runtime.store.createManualSyncJobs({ resourceType: 'rule_unit', resourceId: unit.id, resourceVersion: unit.version, payload: { package: pkg, unit }, targets: syncTargets(request.body?.targets), actorId: actorId(request) }));
+      const resolved = runtime.manualDelivery.getRuleUnit(routeParam(request, 'unitId')); if (!resolved) return response.status(404).json({ message: '规则单元不存在' });
+      if (resolved.package.roomId) runtime.authorization.assert(identity(request), resolved.package.roomId, 'control'); else runtime.authorization.assertServiceReview(identity(request));
+      response.status(201).json(runtime.manualDelivery.syncRuleUnit(resolved.unit.id, syncTargets(request.body?.targets), actorId(request)));
     } catch (error) { jsonError(response, error); }
   });
   app.get('/api/v2/sync-jobs', (request, response) => {
     try {
       const current = identity(request);
       const status = typeof request.query.status === 'string' ? request.query.status as never : undefined;
-      const jobs = runtime.store.listResourceDeliveryJobs(status);
-      if (current.role === 'reviewer') return response.json(jobs);
+      if (current.role === 'reviewer') return response.json(runtime.manualDelivery.listJobs(status));
       const requestedRoomId = typeof request.query.roomId === 'string' ? request.query.roomId : undefined;
       if (requestedRoomId) runtime.authorization.assert(current, requestedRoomId, 'view');
       const allowedRooms = new Set(requestedRoomId ? [requestedRoomId] : current.roomIds);
-      return response.json(jobs.filter((job) => {
-        const roomId = resourceRoomId(job);
-        return roomId !== undefined && allowedRooms.has(roomId);
-      }));
+      return response.json(runtime.manualDelivery.listJobs(status, allowedRooms));
     } catch (error) { jsonError(response, error, 403); }
   });
   app.get('/api/v2/operations/rules', (request, response) => {
@@ -427,7 +397,7 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
     try { const phraseId = routeParam(request, 'phraseId'); const phrase = runtime.store.getPhrase(phraseId); if (!phrase) return response.status(404).json({ message: '话术不存在' }); runtime.authorization.assert(identity(request), phrase.roomId, 'control'); const purpose = coachPurpose(request.body?.purpose); return response.json(runtime.presenters.updatePhrase(phraseId, { ...(typeof request.body?.text === 'string' ? { text: request.body.text } : {}), ...(purpose ? { purpose } : {}), ...(request.body?.status === 'reference' || request.body?.status === 'draft' || request.body?.status === 'retired' ? { status: request.body.status } : {}) })); } catch (error) { return jsonError(response, error); }
   });
   app.post('/api/v2/phrases/:phraseId/sync', (request, response) => {
-    try { const phrase = runtime.store.getPhrase(routeParam(request, 'phraseId')); if (!phrase) return response.status(404).json({ message: '话术不存在' }); runtime.authorization.assert(identity(request), phrase.roomId, 'control'); response.status(201).json(runtime.store.createManualSyncJobs({ resourceType: 'presenter_phrase', resourceId: phrase.id, resourceVersion: phrase.version, payload: phrase, targets: syncTargets(request.body?.targets), actorId: actorId(request) })); } catch (error) { jsonError(response, error); }
+    try { const phrase = runtime.manualDelivery.getPhrase(routeParam(request, 'phraseId')); if (!phrase) return response.status(404).json({ message: '话术不存在' }); runtime.authorization.assert(identity(request), phrase.roomId, 'control'); response.status(201).json(runtime.manualDelivery.syncPhrase(phrase.id, syncTargets(request.body?.targets), actorId(request))); } catch (error) { jsonError(response, error); }
   });
   app.get('/api/v2/phrases/:phraseId/metrics', (request, response) => {
     try { const phrase = runtime.store.getPhrase(routeParam(request, 'phraseId')); if (!phrase) return response.status(404).json({ message: '话术不存在' }); runtime.authorization.assert(identity(request), phrase.roomId, 'view'); response.json(runtime.store.listPhraseMetrics(phrase.id)); } catch (error) { jsonError(response, error, 403); }

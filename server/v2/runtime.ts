@@ -18,6 +18,8 @@ import { RuleModule } from './rules';
 import { PresenterModule } from './presenters';
 import { RulePackageRegistry } from './rulePackages';
 import { RuleActivationIndex } from './ruleActivation';
+import { FindingReviewModule } from './findingReview';
+import { ManualDeliveryModule } from './manualDelivery';
 
 export type LiveSessionPort = Pick<LiveSession, 'dispatch' | 'snapshot' | 'subscribe'> & { readonly id: string };
 
@@ -30,6 +32,8 @@ export type V2Runtime = {
   readonly rules: RuleModule;
   readonly rulePackages: RulePackageRegistry;
   readonly ruleActivation: RuleActivationIndex;
+  readonly findings: FindingReviewModule;
+  readonly manualDelivery: ManualDeliveryModule;
   readonly presenters: PresenterModule;
   getOrCreateSession(input?: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string }): LiveSessionPort;
   getOrCreateOperatorSession(input?: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string }): LiveSessionPort;
@@ -73,6 +77,8 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
   const sessions = new Map<string, LiveSession>();
   const writers = new Map<string, { source: AudioFileWriter; asr: AudioFileWriter }>();
   const productProfileTasks = new Set<Promise<void>>();
+  const findings = new FindingReviewModule(store, rules, rulePackages, (targetRoom) => store.listProducts(store.listRooms().find((room) => room.id === targetRoom)?.tenantId ?? 'tenant-local', targetRoom), (sessionId) => sessions.get(sessionId)?.snapshot() ?? store.getSessionSnapshot(sessionId));
+  const manualDelivery = new ManualDeliveryModule(store);
   const seedProducts = PRODUCTS.map((product) => {
     const seeded = { ...product, updatedAt: product.updatedAt || Date.now() };
     return { ...seeded, complianceProfile: product.complianceProfile ?? localProductComplianceProfile(seeded) };
@@ -208,7 +214,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
   };
 
   return {
-    store, scheduler, review, delivery, authorization, rules, rulePackages, ruleActivation, presenters,
+    store, scheduler, review, delivery, authorization, rules, rulePackages, ruleActivation, findings, manualDelivery, presenters,
     getOrCreateSession,
     getOrCreateOperatorSession,
     getSession: (sessionId) => sessions.get(sessionId) ?? (store.getSessionSnapshot(sessionId) ? getOrCreateSession({ sessionId }) : null),

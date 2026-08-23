@@ -6,9 +6,10 @@
 - 新增 `RuleActivationIndex`，按直播间、商品、平台和行业编译统一的词级/语义规则快照，运行时不再直接拼接两套规则来源。
 - 纠错、说话人修改和备注修改的 `review.edited` 事件携带完整修改后内容；重启重建优先重放事件，旧版本事件保留兼容回放。
 - 新增 `SessionEventKernel`，实时投影与重启重建共享纯事件 reducer；规范化转录投影与快照投影分离。
+- 新增 `FindingReviewModule` 和 `ManualDeliveryModule`，违规处置、规则确认、语义单元确认和人工同步任务不再由 HTTP 路由直接操作 SQLite。
 - 增加本地规则单次执行、规则层级排序和事件重建的回归测试。
 - 不改变 HTTP/WS 外部接口和 SQLite 表结构；无需数据迁移。回滚目标为本次变更前的提交或标签。
-- 验证：`npm test`（207 项）、`npm run build`、`npm run test:e2e`（桌面/移动端）、`git diff --check`。
+- 验证：`npm test`（209 项）、`npm run build`、`npm run test:e2e`（桌面/移动端）、`git diff --check`。
 
 ## 2026-08-14 - 治理闭环修复
 
