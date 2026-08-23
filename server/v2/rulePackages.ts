@@ -37,6 +37,8 @@ export class RulePackageRegistry {
 
   listPackages(status?: RulePackage['status']): RulePackage[] { return this.store.listRulePackages(status); }
   listUnits(status?: RuleUnit['status']): RuleUnit[] { return this.store.listRuleUnits(status); }
+  getPackage(packageId: string): RulePackage | null { return this.store.getRulePackage(packageId); }
+  getUnit(unitId: string): RuleUnit | null { return this.store.getRuleUnit(unitId); }
   listPublicCandidates(): RuleUnit[] { return this.store.listRuleUnits().filter((unit) => unit.publicStatus === 'pending'); }
   listUnitsForRoom(roomId: string, status?: RuleUnit['status']): RuleUnit[] {
     const packageIds = new Set(this.store.listRulePackages().filter((pkg) => pkg.roomId === roomId).map((pkg) => pkg.id));

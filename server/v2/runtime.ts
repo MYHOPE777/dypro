@@ -20,6 +20,7 @@ import { RulePackageRegistry } from './rulePackages';
 import { RuleActivationIndex } from './ruleActivation';
 import { FindingReviewModule } from './findingReview';
 import { ManualDeliveryModule } from './manualDelivery';
+import { SessionRegistry, SessionResourceOwner, ShutdownCoordinator } from './sessionResources';
 
 export type LiveSessionPort = Pick<LiveSession, 'dispatch' | 'snapshot' | 'subscribe'> & { readonly id: string };
 
@@ -74,10 +75,11 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
   const productProfiler = options.productProfiler ?? new DoubaoProductComplianceProfiler(env);
   const deliveryTimer = setInterval(() => { void delivery.flushOnce(); }, 5_000);
   deliveryTimer.unref();
-  const sessions = new Map<string, LiveSession>();
-  const writers = new Map<string, { source: AudioFileWriter; asr: AudioFileWriter }>();
+  const sessionRegistry = new SessionRegistry();
   const productProfileTasks = new Set<Promise<void>>();
-  const findings = new FindingReviewModule(store, rules, rulePackages, (targetRoom) => store.listProducts(store.listRooms().find((room) => room.id === targetRoom)?.tenantId ?? 'tenant-local', targetRoom), (sessionId) => sessions.get(sessionId)?.snapshot() ?? store.getSessionSnapshot(sessionId));
+  const resourceOwner = new SessionResourceOwner(store, presenters);
+  const shutdown = new ShutdownCoordinator(sessionRegistry, resourceOwner, productProfileTasks);
+  const findings = new FindingReviewModule(store, rules, rulePackages, (targetRoom) => store.listProducts(store.listRooms().find((room) => room.id === targetRoom)?.tenantId ?? 'tenant-local', targetRoom), (sessionId) => sessionRegistry.getSession(sessionId)?.snapshot() ?? store.getSessionSnapshot(sessionId));
   const manualDelivery = new ManualDeliveryModule(store);
   const seedProducts = PRODUCTS.map((product) => {
     const seeded = { ...product, updatedAt: product.updatedAt || Date.now() };
@@ -102,7 +104,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
   };
 
   const syncBackgroundScheduling = (): void => {
-    const captureCritical = [...sessions.values()].some((candidate) => {
+    const captureCritical = sessionRegistry.values().some((candidate) => {
       const lifecycle = candidate.snapshot().lifecycle;
       return lifecycle === 'live' || lifecycle === 'ending';
     });
@@ -111,7 +113,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
 
   const getOrCreateSession = (input: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string } = {}): LiveSession => {
     const requestedId = validSessionId(input.sessionId);
-    if (requestedId && sessions.has(requestedId)) return sessions.get(requestedId)!;
+    if (requestedId && sessionRegistry.has(requestedId)) return sessionRegistry.getSession(requestedId)!;
     const persisted = requestedId ? store.getSessionSnapshot(requestedId) : null;
     const targetRoom = persisted?.roomId ?? (input.roomId && /^[a-zA-Z0-9_-]{2,96}$/u.test(input.roomId) ? input.roomId : roomId);
     const tenantId = persisted?.tenantId ?? 'tenant-local';
@@ -156,23 +158,12 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
       onReviewTiming: (timing) => console.info('[realtime-review]', JSON.stringify(timing)),
       session: { sessionId, tenantId, roomId: targetRoom, presenterId, presenterName, product: persisted?.product ?? roomProducts[0], lineup: persisted?.lineup?.length ? persisted.lineup : roomProducts },
     });
-    writers.set(sessionId, writer);
+    const bundle = { session: liveSession, writers: writer };
+    sessionRegistry.register(sessionId, bundle);
     liveSession.subscribe((event) => {
       if (event.type === 'lifecycle.changed' || event.type === 'capture.error') syncBackgroundScheduling();
-      if (event.type === 'session.ended') {
-        const snapshot = liveSession.snapshot();
-        try {
-          presenters.archiveSession(snapshot.presenterId, sessionId, snapshot.product.id, snapshot.transcriptHistory);
-        } catch (error) {
-          console.error('[session-archive]', JSON.stringify({ sessionId, presenterId: snapshot.presenterId, error: error instanceof Error ? error.message : String(error) }));
-        }
-        void Promise.all([writer.source.finalize(), writer.asr.finalize()]).then(([source, asr]) => {
-          if (source.byteLength > 0) store.registerAudioAsset({ id: `audio-source-${sessionId}`, sessionId, path: source.path, encoding: 'pcm_s16le_source', byteLength: source.byteLength, durationMs: source.durationMs, sampleRate: source.sampleRate, channels: source.channels });
-          if (asr.byteLength > 0) store.registerAudioAsset({ id: `audio-asr-${sessionId}`, sessionId, path: asr.path, encoding: 'pcm_s16le_asr', byteLength: asr.byteLength, durationMs: asr.durationMs, sampleRate: asr.sampleRate, channels: asr.channels });
-        }).catch((error) => console.error('[audio-finalize]', JSON.stringify({ sessionId, error: error instanceof Error ? error.message : String(error) })));
-      }
+      if (event.type === 'session.ended') resourceOwner.handleEnded(sessionId, bundle);
     });
-    sessions.set(sessionId, liveSession);
     return liveSession;
   };
 
@@ -181,10 +172,10 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
   // operator on a read-only ended snapshot.
   const getOrCreateOperatorSession = (input: { sessionId?: string; roomId?: string; presenterId?: string; presenterName?: string } = {}): LiveSession => {
     const requestedId = validSessionId(input.sessionId);
-    const requestedSnapshot = requestedId ? (sessions.get(requestedId)?.snapshot() ?? store.getSessionSnapshot(requestedId)) : null;
+    const requestedSnapshot = requestedId ? (sessionRegistry.getSession(requestedId)?.snapshot() ?? store.getSessionSnapshot(requestedId)) : null;
     if (requestedSnapshot?.lifecycle !== 'ended') return getOrCreateSession(input);
 
-    const activeInRoom = [...sessions.values()]
+    const activeInRoom = sessionRegistry.values()
       .map((session) => session.snapshot())
       .filter((snapshot) => snapshot.roomId === requestedSnapshot.roomId && (snapshot.lifecycle === 'idle' || snapshot.lifecycle === 'paused'))
       .sort((left, right) => right.createdAt - left.createdAt)[0];
@@ -200,7 +191,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
     const room = store.listRooms().find((candidate) => candidate.id === targetRoom);
     if (!room) throw new Error('直播间不存在');
     const catalog = store.listProducts(room.tenantId ?? 'tenant-local', targetRoom);
-    await Promise.all([...sessions.values()].filter((session) => {
+    await Promise.all(sessionRegistry.values().filter((session) => {
       const snapshot = session.snapshot();
       return snapshot.roomId === targetRoom && snapshot.lifecycle !== 'ended';
     }).map((session) => {
@@ -217,9 +208,9 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
     store, scheduler, review, delivery, authorization, rules, rulePackages, ruleActivation, findings, manualDelivery, presenters,
     getOrCreateSession,
     getOrCreateOperatorSession,
-    getSession: (sessionId) => sessions.get(sessionId) ?? (store.getSessionSnapshot(sessionId) ? getOrCreateSession({ sessionId }) : null),
+    getSession: (sessionId) => sessionRegistry.getSession(sessionId) ?? (store.getSessionSnapshot(sessionId) ? getOrCreateSession({ sessionId }) : null),
     dispatch: async (sessionId, command, actorId) => { const session = getOrCreateSession({ sessionId }); await session.dispatch(command, actorId ? { actorId } : undefined); },
-    snapshot: (sessionId) => sessions.get(sessionId)?.snapshot() ?? store.getSessionSnapshot(sessionId),
+    snapshot: (sessionId) => sessionRegistry.getSession(sessionId)?.snapshot() ?? store.getSessionSnapshot(sessionId),
     subscribe: (sessionId, listener) => getOrCreateSession({ sessionId }).subscribe(listener),
     listRooms: () => store.listRooms(),
     listProducts: (targetRoom) => {
@@ -276,13 +267,7 @@ export function createRuntime(options: { env?: NodeJS.ProcessEnv; rootDir?: stri
     resolveDisplayLink: (alias) => store.resolveDisplayLink(alias),
     close: async () => {
       clearInterval(deliveryTimer);
-      await Promise.all([...sessions.values()].filter((session) => session.snapshot().lifecycle !== 'ended').map((session) => session.dispatch({ type: 'stop' })));
-      await Promise.all([...writers.entries()].map(async ([sessionId, writer]) => {
-        const [source, asr] = await Promise.all([writer.source.finalize().catch(() => null), writer.asr.finalize().catch(() => null)]);
-        if (source && source.byteLength > 0) store.registerAudioAsset({ id: `audio-source-${sessionId}`, sessionId, path: source.path, encoding: 'pcm_s16le_source', byteLength: source.byteLength, durationMs: source.durationMs, sampleRate: source.sampleRate, channels: source.channels });
-        if (asr && asr.byteLength > 0) store.registerAudioAsset({ id: `audio-asr-${sessionId}`, sessionId, path: asr.path, encoding: 'pcm_s16le_asr', byteLength: asr.byteLength, durationMs: asr.durationMs, sampleRate: asr.sampleRate, channels: asr.channels });
-      }));
-      await Promise.all([...productProfileTasks]);
+      await shutdown.stop();
       store.close();
     },
   };

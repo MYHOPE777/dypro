@@ -240,12 +240,12 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
     try { runtime.authorization.assertServiceReview(identity(request)); const kind = request.body?.kind === 'term' || request.body?.kind === 'sentence' || request.body?.kind === 'context' ? request.body.kind : null; if (!kind) return response.status(400).json({ message: '规则单元类型无效' }); response.status(201).json(runtime.rulePackages.addUnit(routeParam(request, 'packageId'), actorId(request), { kind, pattern: typeof request.body?.pattern === 'string' ? request.body.pattern : undefined, instruction: typeof request.body?.instruction === 'string' ? request.body.instruction : undefined, contextWindow: typeof request.body?.contextWindow === 'string' ? request.body.contextWindow : undefined, title: bodyString(request.body?.title, '规则标题'), reason: bodyString(request.body?.reason, '规则原因'), alternative: bodyString(request.body?.alternative, '替代表达'), policyRef: bodyString(request.body?.policyRef, '规则依据'), risk: request.body?.risk === 'blocked' || request.body?.risk === 'warning' ? request.body.risk : 'safe', confidence: typeof request.body?.confidence === 'number' ? request.body.confidence : undefined, evidenceText: typeof request.body?.evidenceText === 'string' ? request.body.evidenceText : undefined, matchedTerms: Array.isArray(request.body?.matchedTerms) ? request.body.matchedTerms.filter((item: unknown): item is string => typeof item === 'string') : undefined, source: request.body?.source === 'doubao' || request.body?.source === 'document' ? request.body.source : 'manual' })); } catch (error) { jsonError(response, error, 403); }
   });
   app.post('/api/v2/rule-units/:unitId/review', (request, response) => {
-    try { const unit = runtime.store.getRuleUnit(routeParam(request, 'unitId')); if (!unit) return response.status(404).json({ message: '规则单元不存在' }); const pkg = runtime.store.getRulePackage(unit.packageId); if (!pkg) return response.status(404).json({ message: '规则包不存在' }); if (pkg.roomId) runtime.authorization.assert(identity(request), pkg.roomId, 'control'); else runtime.authorization.assertServiceReview(identity(request)); const decision = ['approved', 'rejected', 'deferred', 'discarded'].includes(request.body?.decision) ? request.body.decision : null; if (!decision) return response.status(400).json({ message: '规则单元审核决定无效' }); response.json(runtime.rulePackages.reviewUnit(routeParam(request, 'unitId'), actorId(request), decision, typeof request.body?.note === 'string' ? request.body.note : undefined)); } catch (error) { jsonError(response, error, 403); }
+    try { const unit = runtime.rulePackages.getUnit(routeParam(request, 'unitId')); if (!unit) return response.status(404).json({ message: '规则单元不存在' }); const pkg = runtime.rulePackages.getPackage(unit.packageId); if (!pkg) return response.status(404).json({ message: '规则包不存在' }); if (pkg.roomId) runtime.authorization.assert(identity(request), pkg.roomId, 'control'); else runtime.authorization.assertServiceReview(identity(request)); const decision = ['approved', 'rejected', 'deferred', 'discarded'].includes(request.body?.decision) ? request.body.decision : null; if (!decision) return response.status(400).json({ message: '规则单元审核决定无效' }); response.json(runtime.rulePackages.reviewUnit(routeParam(request, 'unitId'), actorId(request), decision, typeof request.body?.note === 'string' ? request.body.note : undefined)); } catch (error) { jsonError(response, error, 403); }
   });
   app.post('/api/v2/rule-units/:unitId/public-submit', (request, response) => {
     try {
-      const unit = runtime.store.getRuleUnit(routeParam(request, 'unitId')); if (!unit) return response.status(404).json({ message: '规则单元不存在' });
-      const pkg = runtime.store.getRulePackage(unit.packageId); if (!pkg) return response.status(404).json({ message: '规则包不存在' });
+      const unit = runtime.rulePackages.getUnit(routeParam(request, 'unitId')); if (!unit) return response.status(404).json({ message: '规则单元不存在' });
+      const pkg = runtime.rulePackages.getPackage(unit.packageId); if (!pkg) return response.status(404).json({ message: '规则包不存在' });
       if (!pkg.roomId) return response.status(403).json({ message: '只有商家直播间规则单元可以提交公共审核' });
       runtime.authorization.assert(identity(request), pkg.roomId, 'control');
       return response.json(runtime.rulePackages.submitPublicUnit(unit.id, actorId(request)));
@@ -317,7 +317,7 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
   });
   app.patch('/api/v2/rules/:ruleId', (request, response) => {
     try {
-      const ruleId = routeParam(request, 'ruleId'); const rule = runtime.store.getRule(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assert(identity(request), rule.roomId, 'control');
+      const ruleId = routeParam(request, 'ruleId'); const rule = runtime.rules.get(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assert(identity(request), rule.roomId, 'control');
       const patch = request.body && typeof request.body === 'object' ? request.body as Record<string, unknown> : {};
       return response.json(runtime.rules.update(ruleId, actorId(request), {
         ...(typeof patch.name === 'string' ? { name: patch.name } : {}), ...(typeof patch.pattern === 'string' ? { pattern: patch.pattern } : {}),
@@ -328,24 +328,24 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
   });
   app.post('/api/v2/rules/:ruleId/review', (request, response) => {
     try {
-      const ruleId = routeParam(request, 'ruleId'); const rule = runtime.store.getRule(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assert(identity(request), rule.roomId, 'control');
+      const ruleId = routeParam(request, 'ruleId'); const rule = runtime.rules.get(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assert(identity(request), rule.roomId, 'control');
       if (request.body?.decision !== 'approved' && request.body?.decision !== 'rejected') return response.status(400).json({ message: '审核决定无效' });
       return response.json(runtime.rules.review(ruleId, actorId(request), request.body.decision));
     } catch (error) { return jsonError(response, error); }
   });
   app.post('/api/v2/rules/:ruleId/rollback', (request, response) => {
     try {
-      const ruleId = routeParam(request, 'ruleId'); const rule = runtime.store.getRule(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assert(identity(request), rule.roomId, 'control');
+      const ruleId = routeParam(request, 'ruleId'); const rule = runtime.rules.get(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assert(identity(request), rule.roomId, 'control');
       const version = Number(request.body?.version); if (!Number.isInteger(version) || version < 1) return response.status(400).json({ message: '目标版本无效' });
       return response.json(runtime.rules.rollback(ruleId, actorId(request), version));
     } catch (error) { return jsonError(response, error); }
   });
   app.post('/api/v2/rules/:ruleId/public-submit', (request, response) => {
-    try { const ruleId = routeParam(request, 'ruleId'); const rule = runtime.store.getRule(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assert(identity(request), rule.roomId, 'control'); return response.json(runtime.rules.submitPublic(ruleId, actorId(request))); } catch (error) { return jsonError(response, error); }
+    try { const ruleId = routeParam(request, 'ruleId'); const rule = runtime.rules.get(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assert(identity(request), rule.roomId, 'control'); return response.json(runtime.rules.submitPublic(ruleId, actorId(request))); } catch (error) { return jsonError(response, error); }
   });
   app.post('/api/v2/rules/:ruleId/public-review', (request, response) => {
     try {
-      const ruleId = routeParam(request, 'ruleId'); const rule = runtime.store.getRule(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assertServiceReview(identity(request));
+      const ruleId = routeParam(request, 'ruleId'); const rule = runtime.rules.get(ruleId); if (!rule) return response.status(404).json({ message: '规则不存在' }); runtime.authorization.assertServiceReview(identity(request));
       if (request.body?.decision !== 'adopted' && request.body?.decision !== 'deferred' && request.body?.decision !== 'discarded') return response.status(400).json({ message: '运营审核决定无效' });
       return response.json(runtime.rules.reviewPublic(ruleId, actorId(request), request.body.decision));
     } catch (error) { return jsonError(response, error, 403); }
@@ -376,7 +376,7 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
     } catch (error) { jsonError(response, error, 403); }
   });
   app.get('/api/v2/operations/rules', (request, response) => {
-    try { runtime.authorization.assertServiceReview(identity(request)); return response.json(runtime.store.listPublicRuleCandidates()); } catch (error) { return jsonError(response, error, 403); }
+    try { runtime.authorization.assertServiceReview(identity(request)); return response.json(runtime.rules.publicCandidates()); } catch (error) { return jsonError(response, error, 403); }
   });
   app.get('/api/v2/operations/rule-units', (request, response) => {
     try { runtime.authorization.assertServiceReview(identity(request)); return response.json(runtime.rulePackages.listPublicCandidates()); } catch (error) { return jsonError(response, error, 403); }
@@ -394,16 +394,16 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
     try { const presenterId = routeParam(request, 'presenterId'); const presenter = runtime.presenters.get(presenterId); if (!presenter) return response.status(404).json({ message: '主播不存在' }); runtime.authorization.assert(identity(request), presenter.roomId, 'control'); return response.status(201).json(runtime.presenters.savePhrase({ presenterId, productId: typeof request.body?.productId === 'string' ? request.body.productId : null, purpose: coachPurpose(request.body?.purpose), text: bodyString(request.body?.text, '话术内容'), source: 'manual', status: request.body?.status === 'reference' ? 'reference' : 'draft' })); } catch (error) { return jsonError(response, error); }
   });
   app.patch('/api/v2/phrases/:phraseId', (request, response) => {
-    try { const phraseId = routeParam(request, 'phraseId'); const phrase = runtime.store.getPhrase(phraseId); if (!phrase) return response.status(404).json({ message: '话术不存在' }); runtime.authorization.assert(identity(request), phrase.roomId, 'control'); const purpose = coachPurpose(request.body?.purpose); return response.json(runtime.presenters.updatePhrase(phraseId, { ...(typeof request.body?.text === 'string' ? { text: request.body.text } : {}), ...(purpose ? { purpose } : {}), ...(request.body?.status === 'reference' || request.body?.status === 'draft' || request.body?.status === 'retired' ? { status: request.body.status } : {}) })); } catch (error) { return jsonError(response, error); }
+    try { const phraseId = routeParam(request, 'phraseId'); const phrase = runtime.presenters.phrase(phraseId); if (!phrase) return response.status(404).json({ message: '话术不存在' }); runtime.authorization.assert(identity(request), phrase.roomId, 'control'); const purpose = coachPurpose(request.body?.purpose); return response.json(runtime.presenters.updatePhrase(phraseId, { ...(typeof request.body?.text === 'string' ? { text: request.body.text } : {}), ...(purpose ? { purpose } : {}), ...(request.body?.status === 'reference' || request.body?.status === 'draft' || request.body?.status === 'retired' ? { status: request.body.status } : {}) })); } catch (error) { return jsonError(response, error); }
   });
   app.post('/api/v2/phrases/:phraseId/sync', (request, response) => {
     try { const phrase = runtime.manualDelivery.getPhrase(routeParam(request, 'phraseId')); if (!phrase) return response.status(404).json({ message: '话术不存在' }); runtime.authorization.assert(identity(request), phrase.roomId, 'control'); response.status(201).json(runtime.manualDelivery.syncPhrase(phrase.id, syncTargets(request.body?.targets), actorId(request))); } catch (error) { jsonError(response, error); }
   });
   app.get('/api/v2/phrases/:phraseId/metrics', (request, response) => {
-    try { const phrase = runtime.store.getPhrase(routeParam(request, 'phraseId')); if (!phrase) return response.status(404).json({ message: '话术不存在' }); runtime.authorization.assert(identity(request), phrase.roomId, 'view'); response.json(runtime.store.listPhraseMetrics(phrase.id)); } catch (error) { jsonError(response, error, 403); }
+    try { const phrase = runtime.presenters.phrase(routeParam(request, 'phraseId')); if (!phrase) return response.status(404).json({ message: '话术不存在' }); runtime.authorization.assert(identity(request), phrase.roomId, 'view'); response.json(runtime.presenters.phraseMetrics(phrase.id)); } catch (error) { jsonError(response, error, 403); }
   });
   app.post('/api/v2/phrases/:phraseId/metrics', (request, response) => {
-    try { const phrase = runtime.store.getPhrase(routeParam(request, 'phraseId')); if (!phrase) return response.status(404).json({ message: '话术不存在' }); runtime.authorization.assert(identity(request), phrase.roomId, 'control'); const score = (name: string): number | undefined => typeof request.body?.[name] === 'number' && Number.isFinite(request.body[name]) ? Math.max(0, Math.min(1, request.body[name])) : undefined; const metric = { id: `phrase-metric-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, phraseId: phrase.id, sessionId: typeof request.body?.sessionId === 'string' ? request.body.sessionId : undefined, adopted: Boolean(request.body?.adopted), interactionScore: score('interactionScore'), conversionScore: score('conversionScore'), retentionScore: score('retentionScore'), riskScore: score('riskScore'), note: typeof request.body?.note === 'string' ? request.body.note.trim() : undefined, createdAt: Date.now() }; response.status(201).json(runtime.store.savePhraseMetric(metric)); } catch (error) { jsonError(response, error); }
+    try { const phrase = runtime.presenters.phrase(routeParam(request, 'phraseId')); if (!phrase) return response.status(404).json({ message: '话术不存在' }); runtime.authorization.assert(identity(request), phrase.roomId, 'control'); const score = (name: string): number | undefined => typeof request.body?.[name] === 'number' && Number.isFinite(request.body[name]) ? Math.max(0, Math.min(1, request.body[name])) : undefined; const metric = { id: `phrase-metric-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, phraseId: phrase.id, sessionId: typeof request.body?.sessionId === 'string' ? request.body.sessionId : undefined, adopted: Boolean(request.body?.adopted), interactionScore: score('interactionScore'), conversionScore: score('conversionScore'), retentionScore: score('retentionScore'), riskScore: score('riskScore'), note: typeof request.body?.note === 'string' ? request.body.note.trim() : undefined, createdAt: Date.now() }; response.status(201).json(runtime.presenters.savePhraseMetric(metric)); } catch (error) { jsonError(response, error); }
   });
   app.post('/api/v2/sessions', (request, response) => {
     try {
@@ -481,7 +481,7 @@ export function createV2Http(runtime: V2Runtime, options: { clientDir?: string }
   });
   app.get('/api/v2/sessions/:sessionId/audio', (request, response) => {
     const review = runtime.getReview(routeParam(request, 'sessionId'));
-    const asset = runtime.store.listAudioAssets(routeParam(request, 'sessionId'))[0];
+    const asset = runtime.review.audioAssets(routeParam(request, 'sessionId'))[0];
     if (!review || !asset || !existsSync(asset.path)) return response.status(404).json({ message: '本场没有音频' });
     try { runtime.authorization.assert(identity(request), review.summary.roomId, 'review'); } catch (error) { return jsonError(response, error, 403); }
     response.type('audio/wav');

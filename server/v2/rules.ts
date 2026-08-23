@@ -6,7 +6,9 @@ export type RuleDraft = { name: string; pattern: string; matchType?: 'contains' 
 
 export class RuleModule {
   constructor(private readonly store: SqliteFactStore, private readonly now: () => number = Date.now) {}
+  get(ruleId: string): ComplianceRule | null { return this.store.getRule(ruleId); }
   list(roomId: string): ComplianceRule[] { return this.store.listRules(roomId); }
+  publicCandidates(): ComplianceRule[] { return this.store.listPublicRuleCandidates(); }
   active(roomId: string, product?: Product): ComplianceRule[] {
     return [...this.store.listRules(roomId, true), ...this.store.listRules('public-library', true)].filter((rule) => {
       if (rule.scope === 'product') return Boolean(product && rule.productId === product.id);

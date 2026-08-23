@@ -37,6 +37,10 @@ export class SessionReviewModule {
     return this.store.getSessionReview(sessionId);
   }
 
+  audioAssets(sessionId: string): ReturnType<SqliteFactStore['listAudioAssets']> {
+    return this.store.listAudioAssets(sessionId);
+  }
+
   correctTranscript(sessionId: string, segmentId: string, text: string, actorId: string): { contentRevision: number; segment: TranscriptSegment } {
     const review = this.requireReview(sessionId);
     const original = review.transcripts.find((segment) => segment.id === segmentId);

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { CoachPurpose, PresenterPhrase, PresenterPhraseStatus, PresenterProfile, TranscriptSegment } from '../../src/shared/types';
+import type { CoachPurpose, PhraseMetric, PresenterPhrase, PresenterPhraseStatus, PresenterProfile, TranscriptSegment } from '../../src/shared/types';
 import { SqliteFactStore } from './store';
 
 export class PresenterModule {
@@ -9,6 +9,9 @@ export class PresenterModule {
   get(presenterId: string): PresenterProfile | null { return this.store.getPresenter(presenterId); }
   create(roomId: string, name: string, accountName: string): PresenterProfile { if (!name.trim()) throw new Error('主播名称不能为空'); return this.store.ensurePresenter({ id: `presenter-${randomUUID()}`, roomId, name: name.trim(), accountName: accountName.trim() || '本地账号', now: this.now() }); }
   phrases(presenterId: string, productId?: string): PresenterPhrase[] { return this.store.listPhrases(presenterId, productId); }
+  phrase(phraseId: string): PresenterPhrase | null { return this.store.getPhrase(phraseId); }
+  phraseMetrics(phraseId: string): PhraseMetric[] { return this.store.listPhraseMetrics(phraseId); }
+  savePhraseMetric(metric: PhraseMetric): PhraseMetric { return this.store.savePhraseMetric(metric); }
   references(presenterId: string, productId?: string): PresenterPhrase[] { return this.phrases(presenterId, productId).filter((phrase) => phrase.status === 'reference'); }
 
   savePhrase(input: { presenterId: string; productId?: string | null; purpose?: CoachPurpose; text: string; source?: PresenterPhrase['source']; status?: PresenterPhraseStatus; sourceSessionId?: string; sourceSegmentId?: string }): PresenterPhrase {
